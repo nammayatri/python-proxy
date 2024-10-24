@@ -1,6 +1,7 @@
 import os
 import requests
 import time
+import json
 from rediscluster import RedisCluster
 from confluent_kafka import Producer
 
@@ -13,7 +14,6 @@ INTERVAL = int(os.getenv('INTERVAL', '10'))
 REDIS_NODES = os.getenv('REDIS_NODES', 'localhost:7000').split(',')
 
 startup_nodes = [{"host": node.split(":")[0], "port": node.split(":")[1]} for node in REDIS_NODES]
-
 
 # Setup Kafka producer
 producer_config = {
@@ -50,8 +50,8 @@ def scrape_and_send_to_kafka():
                         if route_id != None:
                             producer.produce(KAFKA_TOPIC, key=str(entity['vehicleid']), value=str(entity), callback=delivery_report)
                             vehicle_id = str(entity['vehicleid'])
-                            entity_data = {k: str(v) for k, v in entity.items() if k not in ('vehicleid', 'routeId')}
-                            redis_client.hset(f"route:{route_id}", mapping={vehicle_id: str(entity_data)})
+                            entity_data = {k: v for k, v in entity.items() if k not in ('vehicleid', 'routeId')}
+                            redis_client.hset(f"route:{route_id}", mapping={vehicle_id: json.dumps(entity_data)})
                         else:
                             print("got null routeId")
                 else:
