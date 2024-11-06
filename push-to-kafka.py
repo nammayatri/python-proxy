@@ -47,7 +47,8 @@ def scrape_and_send_to_kafka():
                     for entity in data['entity']:
                         # Send each entity as a message to Kafka
                         route_id = entity.get('routeId', None)
-                        if route_id != None:
+                        trip_id = entity.get('tripId', None)
+                        if route_id != None or trip_id != None:
                             producer.produce(KAFKA_TOPIC, key=str(entity['vehicleid']), value=str(entity), callback=delivery_report)
                             vehicle_id = str(entity['vehicleid'])
                             entity_data = {k: v for k, v in entity.items() if k not in ('vehicleid', 'routeId')}
@@ -56,7 +57,10 @@ def scrape_and_send_to_kafka():
                             reqData['longitude'] = entity_data['longitude']
                             reqData['tripId'] = entity_data['tripId']
                             reqData['speed'] = str(entity_data['speed'])
-                            redis_client.hset(f"route:{route_id}", mapping={vehicle_id: json.dumps(reqData)})
+                            if route_id == None:
+                                redis_client.hset(f"trip:{trip_id}", mapping={vehicle_id: json.dumps(reqData)})
+                            else:
+                                redis_client.hset(f"route:{route_id}", mapping={vehicle_id: json.dumps(reqData)})
                         else:
                             print("got null routeId")
                 else:

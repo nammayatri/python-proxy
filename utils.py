@@ -58,24 +58,53 @@ def convert_timestamp_to_utc(timestamp):
 def transform_entity(input_entity):
     transformed_entities = []
     for entity in input_entity['entity']:
-        vehicle_info = entity['vehicle']
-        trip_info = vehicle_info['trip']
-        position_info = vehicle_info['position']
-        timestamp = convert_timestamp_to_utc(vehicle_info['timestamp'])
+        vehicle_info = entity.get('vehicle', {})
+        id_ = entity.get('id', None)
+        trip_info = vehicle_info.get('trip', {})
+        position_info = vehicle_info.get('position', {})
+        timestamp = convert_timestamp_to_utc(vehicle_info.get('timestamp', None))
 
-        # Create the new format
         transformed_entity = {
-            "vehicleid": vehicle_info['vehicle']['id'],
-            "routeId": trip_info['routeId'],
-            "startTime": trip_info['startTime'],
-            "startDate": trip_info['startDate'],
-            "scheduleRelationship": trip_info['scheduleRelationship'],
-            "tripId": trip_info['tripId'],
-            "latitude": position_info['latitude'],
-            "longitude": position_info['longitude'],
-            "speed": position_info['speed'],
+            "vehicleid": vehicle_info.get('vehicle', {}).get('id', id_),  
+            "routeId": trip_info.get('routeId', None),
+            "startTime": trip_info.get('startTime', None),
+            "startDate": trip_info.get('startDate', None),
+            "scheduleRelationship": trip_info.get('scheduleRelationship', None),
+            "tripId": trip_info.get('tripId', None),
+            "latitude": position_info.get('latitude', None),
+            "longitude": position_info.get('longitude', None),
+            "speed": position_info.get('speed', None),
             "timestamp": timestamp
         }
         transformed_entities.append(transformed_entity)
     
     return {"entity": transformed_entities}
+
+# Transform the entity data
+# def transform_entity(input_entity):
+#     transformed_entities = []
+#     for entity in input_entity['entity']:
+#         vehicle_info = entity['vehicle']
+#         id_ = entity['id']
+#         trip_info = vehicle_info['trip']
+#         position_info = vehicle_info['position']
+#         timestamp = convert_timestamp_to_utc(vehicle_info['timestamp'])
+
+#         # Create the new format
+#         make all the things which are not coming as maybe
+#         transformed_entity = {
+#             "vehicleid": vehicle_info['vehicle']['id'] || id_,
+#             "routeId": trip_info['routeId'],
+#             "startTime": trip_info.get('startTime', None),
+#             "startDate": trip_info['startDate'],
+#             "scheduleRelationship": trip_info['scheduleRelationship'],
+#             "tripId": trip_info['tripId'],
+#             "latitude": position_info['latitude'],
+#             "longitude": position_info['longitude'],
+#             "speed": position_info['speed'],
+#             "timestamp": timestamp
+#         }
+#         transformed_entities.append(transformed_entity)
+    
+#     return {"entity": transformed_entities}
+
