@@ -49,7 +49,7 @@ def scrape_and_send_to_kafka():
                         route_id = entity.get('routeId', None)
                         trip_id = entity.get('tripId', None)
                         if route_id != None or trip_id != None:
-                            producer.produce(KAFKA_TOPIC, key=str(entity['vehicleid']), value=str(entity), callback=delivery_report)
+                            producer.produce(KAFKA_TOPIC, key=str(entity['vehicleid']), value=json.dumps(entity), callback=delivery_report)
                             vehicle_id = str(entity['vehicleid'])
                             entity_data = {k: v for k, v in entity.items() if k not in ('vehicleid', 'routeId')}
                             reqData = {}
