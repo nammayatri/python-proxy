@@ -3,7 +3,6 @@ blinker==1.8.2
 certifi==2024.8.30
 charset-normalizer==3.3.2
 click==8.1.7
-confluent-kafka==2.5.3
 DateTime==5.5
 Flask==3.0.3
 gtfs-realtime-bindings==1.0.0
