@@ -65,6 +65,7 @@ def get_data():
         print(f"Error fetching or processing Amnex Chennai data: {e}")
         res4 = {"entity": []}
 
+    global bearer_token
     headers = {"Authorization": f"Bearer {bearer_token}"} if bearer_token else {}
     try:
         hyderabad_response = requests.get(hyderabad_api_url, headers=headers)
