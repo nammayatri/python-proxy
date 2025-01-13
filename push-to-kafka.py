@@ -45,7 +45,6 @@ def scrape_and_send_to_kafka():
                 # Check if 'entity' exists in the response
                 if 'entity' in data:
                     for entity in data['entity']:
-                        timestamp_utc = convert_to_utc(entity.get('timestamp', None))
                         # Send each entity as a message to Kafka
                         route_id = entity.get('routeId', None)
                         trip_id = entity.get('tripId', None)
@@ -58,38 +57,13 @@ def scrape_and_send_to_kafka():
                             reqData['longitude'] = entity_data['longitude']
                             reqData['tripId'] = entity_data['tripId']
                             reqData['speed'] = str(entity_data['speed'])
-                            reqData['timestamp'] = timestamp_utc
                             if route_id == None:
-                                redis_client.hset(f"trip:{trip_id}", mapping={vehicle_id: json.dumps(reqData)})
+                                print("NOT PUSHING AGAINST TRIP ID", json.dumps(reqData))
+                                # redis_client.hset(f"trip:{trip_id}", mapping={vehicle_id: json.dumps(reqData)})
                             else:
                                 redis_client.hset(f"route:{route_id}", mapping={vehicle_id: json.dumps(reqData)})
                         else:
                             print("got null routeId")
-                elif 'data' in data:
-                    hyderabad_entities = transform_hyderabad_entity(data)
-                    for entity in hyderabad_entities['entity']:
-                        producer.produce(KAFKA_TOPIC, key=str(entity['vehicleNum']), value=json.dumps(entity), callback=delivery_report)
-                        vehicle_num = str(entity['vehicleNum'])
-                        reqData = {}
-                        reqData['latitude'] = entity['latitude']
-                        reqData['longitude'] = entity['longitude']
-                        reqData['speed'] = str(entity['speed'])
-                        reqData['timestamp'] = entity['timestamp']
-                        
-                        redis_client.hset(f"vehicle:{vehicle_num}", mapping=reqData)
-                elif 'Data' in data:
-                    amx_entities = transform_amx_entity(data)
-                    for entity in amx_entities['entity']:
-                        producer.produce(KAFKA_TOPIC, key=str(entity['vehicleid']), value=json.dumps(entity), callback=delivery_report)
-                        vehicle_id = str(entity['vehicleid'])
-                        reqData = {}
-                        reqData['latitude'] = entity['latitude'],
-                        reqData['longitude'] = entity['longitude'],
-                        reqData['tripId'] = entity['tripId']
-                        reqData['speed'] = str(entity['speed']),
-                        reqData ['timestamp'] = entity['timestamp']
-                        
-                        redis_client.hset(f"vehicle:{vehicle_id}", mapping=reqData)
                 else:
                     print(f"No 'entity' found in the response: {data}")
             else:
@@ -106,4 +80,3 @@ def scrape_and_send_to_kafka():
 if __name__ == '__main__':
     print(f"Starting scraper with endpoint: {ENDPOINT_URL}, Kafka server: {KAFKA_SERVER}, topic: {KAFKA_TOPIC}")
     scrape_and_send_to_kafka()
-
