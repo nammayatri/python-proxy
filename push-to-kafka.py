@@ -3,6 +3,7 @@ import requests
 import time
 import json
 from rediscluster import RedisCluster
+import redis
 from confluent_kafka import Producer
 
 # Read configurations from environment variables
@@ -12,8 +13,7 @@ ENDPOINT_URL = os.getenv('ENDPOINT_URL', 'https://example.com/api/vehicle_data')
 INTERVAL = int(os.getenv('INTERVAL', '10'))
 
 REDIS_NODES = os.getenv('REDIS_NODES', 'localhost:7000').split(',')
-
-startup_nodes = [{"host": node.split(":")[0], "port": node.split(":")[1]} for node in REDIS_NODES]
+IS_CLUSTER_REDIS = os.getenv('IS_CLUSTER_REDIS', 'true').lower() == 'true'
 
 # Setup Kafka producer
 producer_config = {
@@ -22,7 +22,18 @@ producer_config = {
 
 producer = Producer(producer_config)
 
-redis_client = RedisCluster(startup_nodes=startup_nodes, decode_responses=True, skip_full_coverage_check=True)
+# Redis connection setup
+if IS_CLUSTER_REDIS:
+    # Redis Cluster setup
+    startup_nodes = [{"host": node.split(":")[0], "port": int(node.split(":")[1])} for node in REDIS_NODES]
+    redis_client = RedisCluster(startup_nodes=startup_nodes, decode_responses=True, skip_full_coverage_check=True)
+    print("✅ Connected to Redis Cluster")
+else:
+    # Redis Standalone setup (assume first node for standalone)
+    STANDALONE_REDIS_DATABASE = int(os.getenv('STANDALONE_REDIS_DATABASE', '0'))
+    host, port = REDIS_NODES[0].split(":")
+    redis_client = redis.StrictRedis(host=host, port=int(port), db=STANDALONE_REDIS_DATABASE, decode_responses=True)
+    print(f"✅ Connected to Redis Standalone at {host}:{port} (DB={STANDALONE_REDIS_DATABASE})")
 
 
 # Function to deliver messages to Kafka
