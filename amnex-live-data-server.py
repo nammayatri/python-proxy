@@ -5,10 +5,10 @@ import json
 from datetime import datetime, date
 
 HOST = "0.0.0.0"  # Listen on all interfaces
-PORT = 80        # Port (normally used for HTTPS, but this is plaintext)
+PORT = 443        # Port 443 (normally used for HTTPS, but this is plaintext)
 
-KAFKA_TOPIC = os.getenv('KAFKA_TOPIC', 'default')
-KAFKA_SERVER = os.getenv('KAFKA_SERVER', 'test')
+KAFKA_TOPIC = os.getenv('KAFKA_TOPIC', 'amnex_direct_live')
+KAFKA_SERVER = os.getenv('KAFKA_SERVER', 'eks:9096')
 
 producer_config = {
             'bootstrap.servers': KAFKA_SERVER
@@ -17,7 +17,7 @@ producer_config = {
 producer = Producer(producer_config)
 
 def date_to_unix(d: date) -> int:
-    return int(datetime.combine(d, datetime.min.time()).timestamp())
+    return int(d.timestamp())
 
 def parse_coordinate(coord_str, dir_char, is_latitude):
     # Split the coordinate string and direction
@@ -41,8 +41,10 @@ def parse_coordinate(coord_str, dir_char, is_latitude):
     return decimal_deg
 
 def dd_mm_ss_to_date(date_str: str) -> datetime.date:
-    return datetime.strptime(date_str, "%d/%m/%Y").date()
-
+    try:
+        return datetime.strptime(date_str, "%d/%m/%Y-%H:%M:%S")
+    except:
+        return datetime.strptime(date_str, "%d/%m/%y-%H:%M:%S")
 
 def delivery_report(err, msg):
     if err is not None:
@@ -73,16 +75,15 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
                     timestamp = payload[8]
                     date = payload[9]
                     routeNumber = payload[17]
-                    date = dd_mm_ss_to_date(date)
+                    date = dd_mm_ss_to_date(date + "-" + timestamp)
                     dataState = payload[3]
                     entity = {
                             "lat": latitude,
                             "long": longitude,
                             "deviceId": deviceId,
-                            "timestamp": timestamp,
+                            "timestamp": date_to_unix(date),
                             "dataState": dataState,
-                            "routeNumber": routeNumber,
-                            "date": date_to_unix(date)
+                            "routeNumber": routeNumber
                     }
                     producer.produce(KAFKA_TOPIC, key=deviceId, value=json.dumps(entity), callback=delivery_report)                                                
                     print(f"device id: {entity}")
