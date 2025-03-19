@@ -3,12 +3,13 @@ from confluent_kafka import Producer
 import os
 import json
 from datetime import datetime, date
+import threading
 
 HOST = "0.0.0.0"  # Listen on all interfaces
 PORT = 443        # Port 443 (normally used for HTTPS, but this is plaintext)
 
 KAFKA_TOPIC = os.getenv('KAFKA_TOPIC', 'amnex_direct_live')
-KAFKA_SERVER = os.getenv('KAFKA_SERVER', 'eks-kurukshetra-kafka-3-e2e26d957f42486c.elb.ap-south-1.amazonaws.com:9096')
+KAFKA_SERVER = os.getenv('KAFKA_SERVER', 'eks:9096')
 
 producer_config = {
             'bootstrap.servers': KAFKA_SERVER
@@ -128,6 +129,29 @@ def parse_amnex_payload(payload):
         print(f"Error parsing Amnex payload: {e}")
         return None
 
+def handle_client_data(addr, data):
+    try:
+        decodedData = data.decode(errors='ignore')
+        payload = decodedData.split(",")
+        print(f"data fromAddress: {addr} -> {decodedData}")
+        
+        entity = None
+        
+        # Try to parse as Chalo format
+        if len(payload) > 0 and payload[0].endswith("$Header"):
+            print(f"chalo payload: {payload}")
+            entity = parse_chalo_payload(payload)
+        # Try to parse as Amnex format
+        elif len(payload) >= 14 and payload[0] == "&PEIS":
+            entity = parse_amnex_payload(payload)
+        
+        if entity:
+            deviceId = entity["deviceId"]
+            producer.produce(KAFKA_TOPIC, key=deviceId, value=json.dumps(entity), callback=delivery_report)
+            print(f"device id: {entity}")
+    except Exception as e:
+        print(f"An error occurred while processing data from {addr}: {e}")
+
 # Example Usage
 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Avoid "Address already in use" error
@@ -139,25 +163,15 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
     while True:
         conn, addr = server.accept()
         with conn:
-            data = conn.recv(4096)  # Adjust buffer size as needed
-            if data:
-                decodedData = data.decode(errors='ignore')
-                payload = decodedData.split(",")
-                print(f"data fromAddress: {addr} -> {decodedData}, \n{payload}")
-                
-                entity = None
-                
-                # Try to parse as Chalo format
-                if len(payload) > 0 and payload[0].endswith("$Header"):
-                    print(f"chalo payload: {payload}")
-                    entity = parse_chalo_payload(payload)
-                # Try to parse as Amnex format
-                elif len(payload) >= 14 and payload[0] == "&PEIS":
-                    entity = parse_amnex_payload(payload)
-                
-                if entity:
-                    deviceId = entity["deviceId"]
-                    producer.produce(KAFKA_TOPIC, key=deviceId, value=json.dumps(entity), callback=delivery_report)
-                    print(f"device id: {entity}")
-                
-                conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+            try:
+                data = conn.recv(4096)  # Adjust buffer size as needed
+                if data:
+                    # Respond to the client immediately
+                    conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+                    
+                    # Process the data in a separate thread
+                    threading.Thread(target=handle_client_data, args=(addr, data)).start()
+            except ConnectionResetError:
+                print(f"Connection reset by peer: {addr}")
+            except Exception as e:
+                print(f"An error occurred while receiving data from {addr}: {e}")
