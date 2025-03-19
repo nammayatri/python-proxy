@@ -8,7 +8,7 @@ HOST = "0.0.0.0"  # Listen on all interfaces
 PORT = 443        # Port 443 (normally used for HTTPS, but this is plaintext)
 
 KAFKA_TOPIC = os.getenv('KAFKA_TOPIC', 'amnex_direct_live')
-KAFKA_SERVER = os.getenv('KAFKA_SERVER', 'eks:9096')
+KAFKA_SERVER = os.getenv('KAFKA_SERVER', 'eks-kurukshetra-kafka-3-e2e26d957f42486c.elb.ap-south-1.amazonaws.com:9096')
 
 producer_config = {
             'bootstrap.servers': KAFKA_SERVER
@@ -57,11 +57,8 @@ def parse_chalo_payload(payload):
     Parse the payload from Chalo format.
     
     Format example:
-    $Header,iTriangle1,1_36T02B0164MAIS_6,NR,16,L,869244044490666,KA01G1234,1,18032025,200705,13.090713,N,80.291023,E,0.0,0,9,-19.0,2.00,0.90,CellOne,1,1,25.5,4.3,0,C,25,404,64,090F,6A92,29,72d9,090f,21,6a4c,090f,20,6a60,090f,17,6a9c,090f,0101,01,383149,0.000,0.000,15,()*7C
-    """
-    if payload[0] != "$Header":
-        return None
-        
+    $Header,iTriangle,1_36T02B0164MAIS_6,NR,16,L,868728039301806,KA01G1234,1,19032025,143947,12.831032,N,80.225189,E,28.0,269,17,30.0,0.00,0.68,CellOne,1,1,26.9,4.3,0,C,9,404,64,091D,8107,33,8267,091d,25,8107,091d,20,8194,091d,17,8195,091d,0101,01,492430,0.008,0.008,86,()*29
+    """ 
     try:
         # Extract required fields from payload
         dataState = payload[5]  # Data state
@@ -96,6 +93,8 @@ def parse_chalo_payload(payload):
             "dataState": dataState,
             "provider": "chalo"
         }
+
+        print(f"chalo entity: {entity}")
         
         return entity
     except Exception as e:
@@ -144,12 +143,13 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
             if data:
                 decodedData = data.decode(errors='ignore')
                 payload = decodedData.split(",")
-                print(f"data fromAddress: {addr} -> {decodedData}")
+                print(f"data fromAddress: {addr} -> {decodedData}, \n{payload}")
                 
                 entity = None
                 
                 # Try to parse as Chalo format
-                if len(payload) > 0 and payload[0] == "$Header":
+                if len(payload) > 0 and payload[0].endswith("$Header"):
+                    print(f"chalo payload: {payload}")
                     entity = parse_chalo_payload(payload)
                 # Try to parse as Amnex format
                 elif len(payload) >= 14 and payload[0] == "&PEIS":
