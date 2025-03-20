@@ -4,6 +4,8 @@ import os
 import json
 from datetime import datetime, date
 import threading
+from rediscluster import RedisCluster
+import redis
 
 HOST = "0.0.0.0"  # Listen on all interfaces
 PORT = 443        # Port 443 (normally used for HTTPS, but this is plaintext)
@@ -11,11 +13,29 @@ PORT = 443        # Port 443 (normally used for HTTPS, but this is plaintext)
 KAFKA_TOPIC = os.getenv('KAFKA_TOPIC', 'amnex_direct_live')
 KAFKA_SERVER = os.getenv('KAFKA_SERVER', 'eks:9096')
 
+# Redis connection setup
+REDIS_NODES = os.getenv('REDIS_NODES', 'localhost:7000').split(',')
+IS_CLUSTER_REDIS = os.getenv('IS_CLUSTER_REDIS', 'true').lower() == 'true'
+
+# Setup Kafka producer
 producer_config = {
             'bootstrap.servers': KAFKA_SERVER
             }
 
 producer = Producer(producer_config)
+
+# Redis connection setup
+if IS_CLUSTER_REDIS:
+    # Redis Cluster setup
+    startup_nodes = [{"host": node.split(":")[0], "port": int(node.split(":")[1])} for node in REDIS_NODES]
+    redis_client = RedisCluster(startup_nodes=startup_nodes, decode_responses=True, skip_full_coverage_check=True)
+    print("✅ Connected to Redis Cluster")
+else:
+    # Redis Standalone setup (assume first node for standalone)
+    STANDALONE_REDIS_DATABASE = int(os.getenv('STANDALONE_REDIS_DATABASE', '0'))
+    host, port = REDIS_NODES[0].split(":")
+    redis_client = redis.StrictRedis(host=host, port=int(port), db=STANDALONE_REDIS_DATABASE, decode_responses=True)
+    print(f"✅ Connected to Redis Standalone at {host}:{port} (DB={STANDALONE_REDIS_DATABASE})")
 
 def date_to_unix(d: date) -> int:
     return int(d.timestamp())
@@ -147,7 +167,32 @@ def handle_client_data(addr, data):
         
         if entity:
             deviceId = entity["deviceId"]
+            
+            # Send to Kafka
             producer.produce(KAFKA_TOPIC, key=deviceId, value=json.dumps(entity), callback=delivery_report)
+            
+            # Store in Redis similar to push-to-kafka.py
+            try:
+                # Extract route or trip ID
+                routeId = entity.get("routeNumber", None)
+                
+                if routeId:
+                    # Format data for Redis
+                    reqData = {
+                        "latitude": entity["lat"],
+                        "longitude": entity["long"],
+                        "tripId": deviceId,  # Using deviceId as tripId since we don't have specific tripId
+                        "speed": str(entity.get("speed", "0.0"))
+                    }
+                    
+                    # Store in Redis
+                    redis_client.hset(f"route:{routeId}", mapping={deviceId: json.dumps(reqData)})
+                    print(f"Stored in Redis with route:{routeId}, device:{deviceId}")
+                else:
+                    print("Not storing in Redis: No routeId found")
+            except Exception as e:
+                print(f"Redis storage error: {e}")
+            
             print(f"device id: {entity}")
     except Exception as e:
         print(f"An error occurred while processing data from {addr}: {e}")
