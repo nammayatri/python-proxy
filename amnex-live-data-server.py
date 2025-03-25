@@ -1,26 +1,35 @@
 import socket
-from confluent_kafka import Producer
+from confluent_kafka import Producer, KafkaError, KafkaException
 import os
 import json
 from datetime import datetime, date
 import threading
 from rediscluster import RedisCluster
 import redis
+import time
 
 HOST = "0.0.0.0"  # Listen on all interfaces
 PORT = 443        # Port 443 (normally used for HTTPS, but this is plaintext)
 
 KAFKA_TOPIC = os.getenv('KAFKA_TOPIC', 'amnex_direct_live')
-KAFKA_SERVER = os.getenv('KAFKA_SERVER', 'eks:9096')
+KAFKA_SERVER = os.getenv('KAFKA_SERVER', 'localhost:9096')
 
 # Redis connection setup
-REDIS_NODES = os.getenv('REDIS_NODES', 'localhost:7000').split(',')
-IS_CLUSTER_REDIS = os.getenv('IS_CLUSTER_REDIS', 'true').lower() == 'true'
+REDIS_NODES = os.getenv('REDIS_NODES', 'localhost:6379').split(',')
+IS_CLUSTER_REDIS = os.getenv('IS_CLUSTER_REDIS', 'false').lower() == 'true'
 
-# Setup Kafka producer
+# Setup Kafka producer with better config for high load
 producer_config = {
-            'bootstrap.servers': KAFKA_SERVER
-            }
+    'bootstrap.servers': KAFKA_SERVER,
+    'queue.buffering.max.messages': 1000000,  # Increase buffer size (default is 100,000)
+    'queue.buffering.max.ms': 100,  # Batch more frequently
+    'compression.type': 'snappy',  # Add compression to reduce bandwidth
+    'retry.backoff.ms': 250,  # Shorter backoff for retries
+    'message.max.bytes': 1000000,  # Allow larger messages
+    'request.timeout.ms': 30000,  # Longer timeout
+    'delivery.timeout.ms': 120000,  # Allow more time for delivery
+    'message.send.max.retries': 5  # More retries before giving up
+}
 
 producer = Producer(producer_config)
 
@@ -32,7 +41,7 @@ if IS_CLUSTER_REDIS:
     print("✅ Connected to Redis Cluster")
 else:
     # Redis Standalone setup (assume first node for standalone)
-    STANDALONE_REDIS_DATABASE = int(os.getenv('STANDALONE_REDIS_DATABASE', '0'))
+    STANDALONE_REDIS_DATABASE = int(os.getenv('STANDALONE_REDIS_DATABASE', '1'))
     host, port = REDIS_NODES[0].split(":")
     redis_client = redis.StrictRedis(host=host, port=int(port), db=STANDALONE_REDIS_DATABASE, decode_responses=True)
     print(f"✅ Connected to Redis Standalone at {host}:{port} (DB={STANDALONE_REDIS_DATABASE})")
@@ -73,7 +82,7 @@ def delivery_report(err, msg):
     else:
         print(f"Message delivered to {msg.topic()} [{msg.partition()}]")
 
-def parse_chalo_payload(payload):
+def parse_chalo_payload(payload, serverTime):
     """
     Parse the payload from Chalo format.
     
@@ -112,6 +121,7 @@ def parse_chalo_payload(payload):
             "vehicleNumber": vehicleNumber,
             "speed": speed,
             "dataState": dataState,
+            "serverTime": date_to_unix(serverTime),
             "provider": "chalo"
         }
 
@@ -122,7 +132,7 @@ def parse_chalo_payload(payload):
         print(f"Error parsing Chalo payload: {e}")
         return None
 
-def parse_amnex_payload(payload):
+def parse_amnex_payload(payload, serverTime):
     """Parse the payload from Amnex format."""
     try:
         if len(payload) >= 14 and payload[0] == "&PEIS" and payload[1] == "N" and payload[2] == "VTS" and payload[10] == 'A':
@@ -141,6 +151,7 @@ def parse_amnex_payload(payload):
                 "timestamp": date_to_unix(date),
                 "dataState": dataState,
                 "routeNumber": routeNumber,
+                "serverTime": date_to_unix(serverTime),
                 "provider": "amnex"
             }
             return entity
@@ -149,27 +160,50 @@ def parse_amnex_payload(payload):
         print(f"Error parsing Amnex payload: {e}")
         return None
 
-def handle_client_data(addr, data):
+def handle_client_data(data_decoded, serverTime, addr):
     try:
-        decodedData = data.decode(errors='ignore')
-        payload = decodedData.split(",")
-        print(f"data fromAddress: {addr} -> {decodedData}")
+        payload = data_decoded.split(",")
+        print(f"data fromAddress: {addr} -> {data_decoded}")
         
         entity = None
         
         # Try to parse as Chalo format
         if len(payload) > 0 and payload[0].endswith("$Header"):
             print(f"chalo payload: {payload}")
-            entity = parse_chalo_payload(payload)
+            entity = parse_chalo_payload(payload, serverTime)
         # Try to parse as Amnex format
         elif len(payload) >= 14 and payload[0] == "&PEIS":
-            entity = parse_amnex_payload(payload)
+            entity = parse_amnex_payload(payload, serverTime)
         
         if entity:
             deviceId = entity["deviceId"]
             
-            # Send to Kafka
-            producer.produce(KAFKA_TOPIC, key=deviceId, value=json.dumps(entity), callback=delivery_report)
+            # Send to Kafka with improved error handling and flushing logic
+            kafka_sent = False
+            max_retries = 3
+            retry_count = 0
+            
+            while not kafka_sent and retry_count < max_retries:
+                try:
+                    producer.produce(KAFKA_TOPIC, key=deviceId, value=json.dumps(entity), callback=delivery_report)
+                    producer.poll(0)  # Process any available events without blocking
+                    kafka_sent = True
+                except BufferError:
+                    # If the queue is full, flush the producer to create space
+                    print(f"Kafka queue full, flushing producer - {addr} (retry {retry_count+1}/{max_retries})")
+                    producer.flush(timeout=2.0)  # Flush with a 2-second timeout
+                    retry_count += 1
+                    # If this was our last retry, do a more aggressive poll
+                    if retry_count == max_retries - 1:
+                        print(f"Performing extended poll to clear queue - {addr}")
+                        events_processed = producer.poll(5.0)  # Poll for up to 5 seconds
+                        print(f"Extended poll processed events")
+                except Exception as kafka_err:
+                    print(f"Error producing to Kafka: {kafka_err}")
+                    retry_count = max_retries  # Exit the loop on other errors
+            
+            if not kafka_sent:
+                print(f"Failed to send message to Kafka after {max_retries} retries - {addr}")
             
             # Store in Redis similar to push-to-kafka.py
             try:
@@ -197,26 +231,133 @@ def handle_client_data(addr, data):
     except Exception as e:
         print(f"An error occurred while processing data from {addr}: {e}")
 
-# Example Usage
-with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Avoid "Address already in use" error
-    server.bind((HOST, PORT))
-    server.listen(5)
-
-    print(f"Listening for connections on {HOST}:{PORT}...")
-
-    while True:
-        conn, addr = server.accept()
-        with conn:
+def handle_connection(conn, addr):
+    """Handle a persistent client connection"""
+    print(f"New connection from {addr}")
+    
+    # Set socket options for keep-alive if using Linux
+    # These settings might not work on all platforms
+    try:
+        conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        # The following options may not be available on all systems
+        try:
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)  # Start sending keepalive after 60 seconds
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)  # Send keepalive every 10 seconds
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 5)     # Drop connection after 5 failed keepalives
+        except AttributeError:
+            # These options might not be available on some systems
+            pass
+    except Exception as e:
+        print(f"Warning: Could not set keep-alive options: {e}")
+    
+    # Set a generous timeout (5 minutes) 
+    conn.settimeout(300)
+    
+    try:
+        # Keep reading from the connection as long as it's open
+        while True:
             try:
-                data = conn.recv(4096)  # Adjust buffer size as needed
-                if data:
-                    # Respond to the client immediately
-                    conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
-                    
-                    # Process the data in a separate thread
-                    threading.Thread(target=handle_client_data, args=(addr, data)).start()
+                data = conn.recv(4096)
+                if not data:
+                    # Client closed the connection
+                    print(f"Client {addr} closed connection")
+                    break
+                
+                # Respond to the client immediately
+                conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK")
+                
+                # Process the data
+                data_decoded = data.decode(errors='ignore')
+                
+                # Clean up the data (remove any trailing characters like #)
+                data_decoded = data_decoded.rstrip('#\r\n')
+                
+                # If data contains HTTP headers, extract just the payload
+                if '\r\n\r\n' in data_decoded:
+                    data_decoded = data_decoded.split('\r\n\r\n')[-1]
+                
+                serverTime = datetime.now()
+                
+                # Process in a separate thread to avoid blocking
+                threading.Thread(
+                    target=handle_client_data,
+                    args=(data_decoded, serverTime, addr)
+                ).start()
+                
+                # Reset the timeout after each successful read
+                conn.settimeout(300)
+                
+            except socket.timeout:
+                # Just log the timeout and continue - don't close the connection
+                print(f"Connection from {addr} idle for 5 minutes, keeping open")
+                conn.settimeout(300)  # Reset the timeout
+                continue
+                
             except ConnectionResetError:
                 print(f"Connection reset by peer: {addr}")
+                break
+                
             except Exception as e:
-                print(f"An error occurred while receiving data from {addr}: {e}")
+                print(f"Error handling data from {addr}: {e}")
+                break
+    except Exception as e:
+        print(f"Connection handler error for {addr}: {e}")
+    finally:
+        # Only close the connection if we've exited the loop
+        try:
+            conn.close()
+            print(f"Connection from {addr} closed")
+        except:
+            pass
+
+def periodic_flush():
+    """Periodically flush the Kafka producer"""
+    while True:
+        try:
+            time.sleep(5)  # Flush every 5 seconds
+            producer.flush(timeout=1.0)
+            print("Performed periodic Kafka flush")
+        except Exception as e:
+            print(f"Error during periodic flush: {e}")
+
+# Start the Kafka flush thread
+flush_thread = threading.Thread(target=periodic_flush, daemon=True)
+flush_thread.start()
+
+# Main server loop
+def main_server():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Avoid "Address already in use" error
+        server.bind((HOST, PORT))
+        server.listen(100)  # Increase backlog for more pending connections
+        
+        print(f"Listening for connections on {HOST}:{PORT}...")
+        
+        # Track active connection threads
+        connection_threads = []
+        
+        while True:
+            try:
+                # Accept new connection
+                conn, addr = server.accept()
+                
+                # Start a new thread to handle this connection
+                thread = threading.Thread(target=handle_connection, args=(conn, addr))
+                thread.daemon = True  # Allow program to exit even if threads are running
+                thread.start()
+                
+                # Keep track of the thread
+                connection_threads.append((thread, addr))
+                
+                # Clean up completed connection threads
+                connection_threads = [(t, a) for t, a in connection_threads if t.is_alive()]
+                
+                print(f"Active connections: {len(connection_threads)}")
+                
+            except Exception as e:
+                print(f"Error accepting connection: {e}")
+                time.sleep(1)  # Avoid tight loop if accept is failing
+
+if __name__ == "__main__":
+    main_server()
+
