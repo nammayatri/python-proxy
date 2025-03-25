@@ -88,16 +88,16 @@ class RouteDeviceMapping(BaseModel):
         orm_mode = True
 
 # Update the SQLAlchemy models
-class FleetDeviceMapping(Base):
-    __tablename__ = "fleet_device_mapping"  
+class DeviceVehicleMapping(Base):
+    __tablename__ = "device_vehicle_mapping"  
     id = Column(Integer, primary_key=True)
-    fleet_no = Column(Text, index=True)
+    vehicle_no = Column(Text, index=True)
     device_id = Column(Text, index=True)
 
-class FleetRouteMapping(Base):
-    __tablename__ = "fleet_route_mapping"  
+class VehicleRouteMapping(Base):
+    __tablename__ = "vehicle_route_mapping"
     id = Column(Integer, primary_key=True)
-    fleet_no = Column(Text, index=True)
+    vehicle_no = Column(Text, index=True)
     route_id = Column(Text, index=True)
 
 # Don't create tables since we're using existing table
@@ -128,8 +128,8 @@ def get_route_for_device(device_id: str) -> Optional[str]:
     try:
         with SessionLocal() as db:
             # First get the fleet number for the device
-            fleet_mapping = db.query(FleetDeviceMapping)\
-                .filter(FleetDeviceMapping.device_id == device_id)\
+            fleet_mapping = db.query(DeviceVehicleMapping)\
+                .filter(DeviceVehicleMapping.device_id == device_id)\
                 .first()
             
             if not fleet_mapping:
@@ -137,8 +137,8 @@ def get_route_for_device(device_id: str) -> Optional[str]:
                 return None
 
             # Then get the route for that fleet
-            route_mapping = db.query(FleetRouteMapping)\
-                .filter(FleetRouteMapping.fleet_no == fleet_mapping.fleet_no)\
+            route_mapping = db.query(VehicleRouteMapping)\
+                .filter(VehicleRouteMapping.vehicle_no == fleet_mapping.vehicle_no)\
                 .first()
             
             route_id = route_mapping.route_id if route_mapping else None
@@ -161,8 +161,8 @@ def get_devices_for_route(route_id: str) -> List[str]:
     try:
         with SessionLocal() as db:
             # First get all fleet numbers for this route
-            fleet_numbers = db.query(FleetRouteMapping.fleet_no)\
-                .filter(FleetRouteMapping.route_id == route_id)\
+            fleet_numbers = db.query(VehicleRouteMapping.vehicle_no)\
+                .filter(VehicleRouteMapping.route_id == route_id)\
                 .all()
             
             if not fleet_numbers:
@@ -170,9 +170,9 @@ def get_devices_for_route(route_id: str) -> List[str]:
                 return []
 
             # Then get all devices for these fleet numbers
-            fleet_nos = [f[0] for f in fleet_numbers]  # Extract fleet numbers from result tuples
-            devices = db.query(FleetDeviceMapping.device_id)\
-                .filter(FleetDeviceMapping.fleet_no.in_(fleet_nos))\
+            vehicle_nos = [f[0] for f in fleet_numbers]  # Extract fleet numbers from result tuples
+            devices = db.query(DeviceVehicleMapping.device_id)\
+                .filter(DeviceVehicleMapping.vehicle_no.in_(vehicle_nos))\
                 .all()
             
             device_list = [d[0] for d in devices]  # Extract device IDs from result tuples
@@ -188,20 +188,20 @@ def get_fleet_info(device_id: str) -> dict:
     try:
         with SessionLocal() as db:
             # Get fleet number for device
-            fleet_mapping = db.query(FleetDeviceMapping)\
-                .filter(FleetDeviceMapping.device_id == device_id)\
+            fleet_mapping = db.query(DeviceVehicleMapping)\
+                .filter(DeviceVehicleMapping.device_id == device_id)\
                 .first()
             
             if not fleet_mapping:
                 return {}
 
             # Get route for fleet
-            route_mapping = db.query(FleetRouteMapping)\
-                .filter(FleetRouteMapping.fleet_no == fleet_mapping.fleet_no)\
+            route_mapping = db.query(VehicleRouteMapping)\
+                .filter(VehicleRouteMapping.vehicle_no == fleet_mapping.vehicle_no)\
                 .first()
             
             return {
-                'fleet_no': fleet_mapping.fleet_no,
+                'vehicle_no': fleet_mapping.vehicle_no,
                 'route_id': route_mapping.route_id if route_mapping else None
             }
 
@@ -344,7 +344,7 @@ def handle_client_data(data_decoded, serverTime, addr):
             # Get route_id from database
             fleet_info = get_fleet_info(deviceId)
             route_id = fleet_info.get("route_id")
-            vehicle_number = fleet_info.get("fleet_no")
+            vehicle_number = fleet_info.get("vehicle_no")
             if route_id:
                 entity["routeNumber"] = route_id
             

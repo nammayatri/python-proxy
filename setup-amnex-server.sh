@@ -5,6 +5,8 @@ set -e  # Exit on any error
 echo "🚀 Starting GPS Server Setup..."
 
 # Environment Variables Configuration (Avoid storing secrets here)
+REDIS_HOST="localhost"
+REDIS_PORT="6379"
 export KAFKA_TOPIC="amnex_direct_live"
 export KAFKA_SERVER="localhost:9096"
 export REDIS_HOST="localhost"
@@ -12,11 +14,13 @@ export REDIS_PORT="6379"
 export REDIS_NODES="localhost:6379"
 export IS_CLUSTER_REDIS="false"
 export STANDALONE_REDIS_DATABASE="1"
-export DB_USER="postgres"
-export DB_PASS="postgres"
+
+# Database config should be injected securely, e.g., via AWS Secrets Manager
+export DB_USER="atlas_rw"
+export DB_PASS="password"
 export DB_HOST="localhost"
 export DB_PORT="5432"
-export DB_NAME="gps_tracking"
+export DB_NAME="atlas_app_pilot"
 
 # Install required packages
 install_package() {
@@ -29,6 +33,8 @@ install_package() {
         exit 1
     fi
 }
+mkdir -p ~/.ssh
+ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
 
 # Install Redis CLI if missing
 install_redis_cli() {
@@ -48,7 +54,7 @@ install_python_deps() {
 
     if ! command -v virtualenv &> /dev/null; then
         echo "📦 Installing virtualenv..."
-        pip3 install --upgrade virtualenv
+        python3 -m pip install --upgrade virtualenv
     fi
 
     echo "📦 Installing development tools..."
@@ -120,8 +126,8 @@ source venv/bin/activate
 
 # Install requirements
 echo "📦 Installing Python dependencies..."
-pip3 install --upgrade pip wheel
-pip3 install -r requirements.txt
+python3 -m pip install --upgrade pip wheel
+python3 -m pip install -r requirements.txt
 
 # Start the server
 echo "🚀 Starting GPS server..."
