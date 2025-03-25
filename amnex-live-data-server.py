@@ -7,6 +7,12 @@ import threading
 from rediscluster import RedisCluster
 import redis
 import time
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, select, func
+from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import QueuePool
+from pydantic import BaseModel
+from typing import Optional, List
 
 HOST = "0.0.0.0"  # Listen on all interfaces
 PORT = 443        # Port 443 (normally used for HTTPS, but this is plaintext)
@@ -45,6 +51,163 @@ else:
     host, port = REDIS_NODES[0].split(":")
     redis_client = redis.StrictRedis(host=host, port=int(port), db=STANDALONE_REDIS_DATABASE, decode_responses=True)
     print(f"✅ Connected to Redis Standalone at {host}:{port} (DB={STANDALONE_REDIS_DATABASE})")
+
+# Database configuration
+DB_USER = os.getenv('DB_USER', 'postgres')
+DB_PASS = os.getenv('DB_PASS', 'postgres')
+DB_HOST = os.getenv('DB_HOST', 'localhost')
+DB_PORT = os.getenv('DB_PORT', '5432')
+DB_NAME = os.getenv('DB_NAME', 'gps_tracking')
+
+# SQLAlchemy setup
+DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+engine = create_engine(
+    DATABASE_URL,
+    poolclass=QueuePool,
+    pool_size=20,
+    max_overflow=30,
+    pool_timeout=30,
+    pool_recycle=1800,
+    connect_args={
+        "options": "-c search_path=atlas_app"
+    }
+)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+# Pydantic model for type validation
+class RouteDeviceMapping(BaseModel):
+    id: int
+    route_id: str
+    device_id: str
+    created_at: datetime
+    updated_at: Optional[datetime]
+    is_active: bool
+
+    class Config:
+        orm_mode = True
+
+# Update the SQLAlchemy models
+class FleetDeviceMapping(Base):
+    __tablename__ = "fleet_device_mapping"  
+    id = Column(Integer, primary_key=True)
+    fleet_no = Column(Text, index=True)
+    device_id = Column(Text, index=True)
+
+class FleetRouteMapping(Base):
+    __tablename__ = "fleet_route_mapping"  
+    id = Column(Integer, primary_key=True)
+    fleet_no = Column(Text, index=True)
+    route_id = Column(Text, index=True)
+
+# Don't create tables since we're using existing table
+# Base.metadata.create_all(bind=engine)
+
+class SimpleCache:
+    def __init__(self):
+        self.cache = {}
+
+    def get(self, key: str):
+        return self.cache.get(key)
+
+    def set(self, key: str, value):
+        self.cache[key] = value
+
+# Create single cache instance
+cache = SimpleCache()
+
+def get_route_for_device(device_id: str) -> Optional[str]:
+    """Get the active route ID for a device with caching"""
+    cache_key = f"device:{device_id}"
+    
+    # Check cache first
+    cached_route = cache.get(cache_key)
+    if cached_route is not None:
+        return cached_route
+
+    try:
+        with SessionLocal() as db:
+            # First get the fleet number for the device
+            fleet_mapping = db.query(FleetDeviceMapping)\
+                .filter(FleetDeviceMapping.device_id == device_id)\
+                .first()
+            
+            if not fleet_mapping:
+                cache.set(cache_key, None)
+                return None
+
+            # Then get the route for that fleet
+            route_mapping = db.query(FleetRouteMapping)\
+                .filter(FleetRouteMapping.fleet_no == fleet_mapping.fleet_no)\
+                .first()
+            
+            route_id = route_mapping.route_id if route_mapping else None
+            cache.set(cache_key, route_id)
+            return route_id
+
+    except Exception as e:
+        print(f"Error querying route for device {device_id}: {e}")
+        return None
+
+def get_devices_for_route(route_id: str) -> List[str]:
+    """Get all active devices for a route with caching"""
+    cache_key = f"route:{route_id}"
+    
+    # Check cache first
+    cached_devices = cache.get(cache_key)
+    if cached_devices is not None:
+        return cached_devices
+
+    try:
+        with SessionLocal() as db:
+            # First get all fleet numbers for this route
+            fleet_numbers = db.query(FleetRouteMapping.fleet_no)\
+                .filter(FleetRouteMapping.route_id == route_id)\
+                .all()
+            
+            if not fleet_numbers:
+                cache.set(cache_key, [])
+                return []
+
+            # Then get all devices for these fleet numbers
+            fleet_nos = [f[0] for f in fleet_numbers]  # Extract fleet numbers from result tuples
+            devices = db.query(FleetDeviceMapping.device_id)\
+                .filter(FleetDeviceMapping.fleet_no.in_(fleet_nos))\
+                .all()
+            
+            device_list = [d[0] for d in devices]  # Extract device IDs from result tuples
+            cache.set(cache_key, device_list)
+            return device_list
+
+    except Exception as e:
+        print(f"Error querying devices for route {route_id}: {e}")
+        return []
+
+def get_fleet_info(device_id: str) -> dict:
+    """Get both fleet number and route ID for a device"""
+    try:
+        with SessionLocal() as db:
+            # Get fleet number for device
+            fleet_mapping = db.query(FleetDeviceMapping)\
+                .filter(FleetDeviceMapping.device_id == device_id)\
+                .first()
+            
+            if not fleet_mapping:
+                return {}
+
+            # Get route for fleet
+            route_mapping = db.query(FleetRouteMapping)\
+                .filter(FleetRouteMapping.fleet_no == fleet_mapping.fleet_no)\
+                .first()
+            
+            return {
+                'fleet_no': fleet_mapping.fleet_no,
+                'route_id': route_mapping.route_id if route_mapping else None
+            }
+
+    except Exception as e:
+        print(f"Error querying fleet info for device {device_id}: {e}")
+        return {}
 
 def date_to_unix(d: date) -> int:
     return int(d.timestamp())
@@ -178,6 +341,13 @@ def handle_client_data(data_decoded, serverTime, addr):
         if entity:
             deviceId = entity["deviceId"]
             
+            # Get route_id from database
+            fleet_info = get_fleet_info(deviceId)
+            route_id = fleet_info.get("route_id")
+            vehicle_number = fleet_info.get("fleet_no")
+            if route_id:
+                entity["routeNumber"] = route_id
+            
             # Send to Kafka with improved error handling and flushing logic
             kafka_sent = False
             max_retries = 3
@@ -186,46 +356,37 @@ def handle_client_data(data_decoded, serverTime, addr):
             while not kafka_sent and retry_count < max_retries:
                 try:
                     producer.produce(KAFKA_TOPIC, key=deviceId, value=json.dumps(entity), callback=delivery_report)
-                    producer.poll(0)  # Process any available events without blocking
+                    producer.poll(0)
                     kafka_sent = True
                 except BufferError:
-                    # If the queue is full, flush the producer to create space
                     print(f"Kafka queue full, flushing producer - {addr} (retry {retry_count+1}/{max_retries})")
-                    producer.flush(timeout=2.0)  # Flush with a 2-second timeout
+                    producer.flush(timeout=2.0)
                     retry_count += 1
-                    # If this was our last retry, do a more aggressive poll
                     if retry_count == max_retries - 1:
                         print(f"Performing extended poll to clear queue - {addr}")
-                        events_processed = producer.poll(5.0)  # Poll for up to 5 seconds
-                        print(f"Extended poll processed events")
+                        producer.poll(5.0)
                 except Exception as kafka_err:
                     print(f"Error producing to Kafka: {kafka_err}")
-                    retry_count = max_retries  # Exit the loop on other errors
+                    retry_count = max_retries
             
             if not kafka_sent:
                 print(f"Failed to send message to Kafka after {max_retries} retries - {addr}")
             
-            # Store in Redis similar to push-to-kafka.py
-            try:
-                # Extract route or trip ID
-                routeId = entity.get("routeNumber", None)
-                
-                if routeId:
-                    # Format data for Redis
+            # Store in Redis if we have a route_id
+            if route_id:
+                try:
                     reqData = {
                         "latitude": entity["lat"],
                         "longitude": entity["long"],
-                        "tripId": deviceId,  # Using deviceId as tripId since we don't have specific tripId
+                        "timestamp": entity["timestamp"],
                         "speed": str(entity.get("speed", "0.0"))
                     }
-                    
-                    # Store in Redis
-                    redis_client.hset(f"route:{routeId}", mapping={deviceId: json.dumps(reqData)})
-                    print(f"Stored in Redis with route:{routeId}, device:{deviceId}")
-                else:
-                    print("Not storing in Redis: No routeId found")
-            except Exception as e:
-                print(f"Redis storage error: {e}")
+                    redis_client.hset(f"route:{route_id}", mapping={vehicle_number: json.dumps(reqData)})
+                    print(f"Stored in Redis with route:{route_id}, device:{deviceId}, vehicle_number:{vehicle_number}")
+                except Exception as e:
+                    print(f"Redis storage error: {e}")
+            else:
+                print(f"No active route mapping found for device: {deviceId}")
             
             print(f"device id: {entity}")
     except Exception as e:
