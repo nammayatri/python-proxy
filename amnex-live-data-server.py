@@ -734,7 +734,10 @@ def handle_client_data(payload, session=None):
                 # Store location in Redis Geo set
                 geo_key = "bus_locations"  # Single key for all bus locations
                 logger.info(f"Storing location in Redis Geo: key={geo_key}, member={vehicle_number}")
-                redis_client.geoadd(geo_key, [vehicle_lon, vehicle_lat, vehicle_number])
+                if vehicle_lon is not None and vehicle_lat is not None and vehicle_number:
+                    redis_client.geoadd(geo_key, vehicle_lon, vehicle_lat, vehicle_number)
+                else:
+                    logger.error(f"Invalid location data: lon={vehicle_lon}, lat={vehicle_lat}, member={vehicle_number}")
                 redis_client.expire(geo_key, 86400)  # Expire after 24 hours
                 
                 logger.info(f"Successfully stored data in Redis with TTL of 24 hours")
