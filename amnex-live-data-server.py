@@ -714,7 +714,8 @@ def handle_client_data(payload, session=None):
                 "longitude": entity["long"],
                 "timestamp": entity["timestamp"],
                 "speed": entity.get("speed", 0),
-                "device_id": deviceId
+                "device_id": deviceId,
+                "route_id": route_id
             })
             
             # Add ETA data if available
@@ -724,11 +725,18 @@ def handle_client_data(payload, session=None):
                 vehicle_data_obj['eta_data'] = entity['eta_list']
                 vehicle_data = json.dumps(vehicle_data_obj)
             
-            # Store vehicle data under vehicle number in the route hash
             try:
-                logger.info(f"Storing data in Redis: key={redis_key}, field={vehicle_number}")
+                # Store vehicle data in hash
+                logger.info(f"Storing data in Redis hash: key={redis_key}, field={vehicle_number}")
                 redis_client.hset(redis_key, vehicle_number, vehicle_data)
                 redis_client.expire(redis_key, 86400)  # Expire after 24 hours
+                
+                # Store location in Redis Geo set
+                geo_key = "bus_locations"  # Single key for all bus locations
+                logger.info(f"Storing location in Redis Geo: key={geo_key}, member={vehicle_number}")
+                redis_client.geoadd(geo_key, [vehicle_lon, vehicle_lat, vehicle_number])
+                redis_client.expire(geo_key, 86400)  # Expire after 24 hours
+                
                 logger.info(f"Successfully stored data in Redis with TTL of 24 hours")
             except Exception as e:
                 logger.error(f"Error storing data in Redis: {str(e)}")
