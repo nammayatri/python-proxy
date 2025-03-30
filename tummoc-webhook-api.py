@@ -14,6 +14,8 @@ def schedule_fleet_sync():
         return jsonify({"status": "error", "message": "Unauthorized"}), 403
     
     data = request.get_json()
+    print("data from /schedule-fleet-sync:\n")
+    print(data)
     # validation
     if not data or not all(k in data for k in ["requestId", "fleetNo", "scheduleNo", "timestamp"]):
         return jsonify({"status": "error", "message": "Invalid request payload"}), 400
@@ -29,6 +31,8 @@ def schedule_trip_sync():
         return jsonify({"status": "error", "message": "Unauthorized"}), 403
     
     data = request.get_json()
+    print("data from /schedule-trip-sync:\n")
+    print(data)
     # validation
     if not data or not all(k in data for k in ["requestId", "tripEvent", "tripNo", "routeNo", "scheduleNo", "timestamp"]):
         return jsonify({"status": "error", "message": "Invalid request payload"}), 400
