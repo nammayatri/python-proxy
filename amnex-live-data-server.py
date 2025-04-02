@@ -551,7 +551,7 @@ def delivery_report(err, msg):
     else:
         print(f"Message delivered to {msg.topic()} [{msg.partition()}]")
 
-def parse_chalo_payload(payload, serverTime):
+def parse_chalo_payload(payload, serverTime, client_ip):
     """
     Parse the payload from Chalo format.
     
@@ -591,7 +591,8 @@ def parse_chalo_payload(payload, serverTime):
             "speed": speed,
             "dataState": dataState,
             "serverTime": date_to_unix(serverTime),
-            "provider": "chalo"
+            "provider": "chalo",
+            "client_ip": client_ip
         }
 
         print(f"chalo entity: {entity}")
@@ -601,7 +602,7 @@ def parse_chalo_payload(payload, serverTime):
         print(f"Error parsing Chalo payload: {e}")
         return None
 
-def parse_amnex_payload(payload, serverTime):
+def parse_amnex_payload(payload, serverTime, client_ip):
     """Parse the payload from Amnex format."""
     try:
         if len(payload) >= 14 and payload[0] == "&PEIS" and payload[1] == "N" and payload[2] == "VTS" and payload[10] == 'A':
@@ -621,7 +622,8 @@ def parse_amnex_payload(payload, serverTime):
                 "dataState": dataState,
                 "routeNumber": routeNumber,
                 "serverTime": date_to_unix(serverTime),
-                "provider": "amnex"
+                "provider": "amnex",
+                "client_ip": client_ip
             }
             return entity
         return None
@@ -629,26 +631,26 @@ def parse_amnex_payload(payload, serverTime):
         print(f"Error parsing Amnex payload: {e}")
         return None
 
-def parse_payload(data_decoded):
+def parse_payload(data_decoded, client_ip):
     """Parse payload data by determining the format"""
     try:
         payload = data_decoded.split(",")
         
         # Parse payload based on format
         if len(payload) > 0 and payload[0].endswith("$Header"):
-            return parse_chalo_payload(payload, datetime.now())
+            return parse_chalo_payload(payload, datetime.now(), client_ip)
         elif len(payload) >= 14 and payload[0] == "&PEIS":
-            return parse_amnex_payload(payload, datetime.now())
+            return parse_amnex_payload(payload, datetime.now(), client_ip)
         
         return None
     except Exception as e:
         print(f"Error parsing payload: {e}")
         return None
 
-def handle_client_data(payload, session=None):
+def handle_client_data(payload, client_ip, session=None):
     """Handle client data and send it to Kafka"""
     try:
-        entity = parse_payload(payload)
+        entity = parse_payload(payload, client_ip)
         print(f"entity: {entity}")
         if not entity:
             return
@@ -798,7 +800,7 @@ def handle_connection(conn, addr):
                 # Process in a separate thread to avoid blocking
                 threading.Thread(
                     target=handle_client_data,
-                    args=(data_decoded,)
+                    args=(data_decoded, addr)
                 ).start()
                 
                 # Reset the timeout after each successful read
