@@ -869,11 +869,13 @@ class TCPClient:
     
     def queue_message(self, message):
         """Add message to queue for sending"""
+        logger.info(f"Queueing message: {message}")
         with self._queue_lock:
             self._message_queue.append(message)
             
     def _process_message_queue(self):
         """Process queued messages in background"""
+        logger.info("Starting message processing thread...")
         while not self._stop_event.is_set():
             messages_to_send = []
             
@@ -882,12 +884,14 @@ class TCPClient:
                 if self._message_queue:
                     messages_to_send = self._message_queue.copy()
                     self._message_queue.clear()
+
+            logger.info(f"Processing {len(messages_to_send)} queued messages")
                     
             # Send all queued messages
             if messages_to_send and self.connected:
                 for message in messages_to_send:
                     self._send_message(message)
-                    
+            logger.info(f"Processed {len(messages_to_send)} messages")
             time.sleep(0.1)  # Small delay
     
     def _send_message(self, data):
