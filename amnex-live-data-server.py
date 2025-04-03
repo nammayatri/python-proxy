@@ -713,6 +713,7 @@ def parse_chalo_payload(payload, serverTime, client_ip):
             "lat": latitude,
             "long": longitude,
             "deviceId": deviceId,
+            "version": None,
             "timestamp": date_to_unix(timestamp),
             "vehicleNumber": vehicleNumber,
             "speed": speed,
@@ -735,6 +736,7 @@ def parse_amnex_payload(payload, serverTime, client_ip):
         if len(payload) >= 14 and payload[0] == "&PEIS" and payload[1] == "N" and payload[2] == "VTS" and payload[10] == 'A':
             latitude = parse_coordinate(payload[11], payload[12], True)
             longitude = parse_coordinate(payload[13], payload[14], False)
+            version = payload[4]
             deviceId = payload[5]
             timestamp = payload[8]
             date = payload[9]
@@ -744,6 +746,7 @@ def parse_amnex_payload(payload, serverTime, client_ip):
             entity = {
                 "lat": latitude,
                 "long": longitude,
+                "version": version,
                 "deviceId": deviceId,
                 "timestamp": date_to_unix(date),
                 "dataState": dataState,
