@@ -18,6 +18,7 @@ from concurrent.futures import ThreadPoolExecutor
 import math
 import traceback
 import logging
+import atexit
 
 # Configure logging
 logging.basicConfig(
@@ -925,11 +926,8 @@ def handle_connection(conn, addr):
                 
                 serverTime = datetime.now()
                 
-                # Process in a separate thread to avoid blocking
-                threading.Thread(
-                    target=handle_client_data,
-                    args=(data_decoded, addr)
-                ).start()
+                # Use the thread pool instead of creating a new thread for each message
+                executor.submit(handle_client_data, data_decoded, addr)
                 
                 # Reset the timeout after each successful read
                 conn.settimeout(300)
@@ -970,6 +968,39 @@ def periodic_flush():
 # Start the Kafka flush thread
 flush_thread = threading.Thread(target=periodic_flush, daemon=True)
 flush_thread.start()
+
+# Create a thread pool with a reasonable number of worker threads
+MAX_WORKER_THREADS = int(os.getenv('MAX_WORKER_THREADS', '50'))  # Default to 50 worker threads
+logger.info(f"Initializing thread pool with {MAX_WORKER_THREADS} worker threads")
+executor = ThreadPoolExecutor(max_workers=MAX_WORKER_THREADS)
+
+# Register a shutdown function to clean up the executor
+def shutdown_executor():
+    logger.info("Shutting down thread pool executor...")
+    executor.shutdown(wait=False)
+    logger.info("Thread pool executor shutdown complete")
+
+atexit.register(shutdown_executor)
+
+# We can also add monitoring for the thread pool
+def monitor_thread_pool():
+    """Monitor the thread pool and log its status"""
+    while True:
+        try:
+            time.sleep(60)  # Check every minute
+            # Get approximate queue size (only in Python 3.9+)
+            try:
+                queue_size = executor._work_queue.qsize()
+                logger.info(f"Thread pool status: {len(executor._threads)} active threads, ~{queue_size} queued tasks")
+            except (NotImplementedError, AttributeError):
+                # If qsize() is not available
+                logger.info(f"Thread pool status: {len(executor._threads)} active threads")
+        except Exception as e:
+            logger.error(f"Error monitoring thread pool: {e}")
+
+# Start the thread pool monitor thread
+monitor_thread = threading.Thread(target=monitor_thread_pool, daemon=True)
+monitor_thread.start()
 
 # Main server loop
 def main_server():
