@@ -143,6 +143,7 @@ class StopTracker:
         self.osrm_url = osrm_url
         self.google_api_key = google_api_key
         self.cache_ttl = cache_ttl
+        self.stop_visit_radius = float(os.getenv('STOP_VISIT_RADIUS', '0.05'))  # 50 meters in km
         print(f"StopTracker initialized with {'OSRM' if use_osrm else 'Google Maps'}")
         
     def get_route_stops(self, route_id):
@@ -184,6 +185,89 @@ class StopTracker:
             print(f"Error getting stops for route {route_id}: {e}")
             return []
     
+    def get_visited_stops(self, route_id, vehicle_id):
+        """Get list of stops already visited by this vehicle on this route"""
+        visit_key = f"visited_stops:{route_id}:{vehicle_id}"
+        try:
+            visited_stops = self.redis_client.get(visit_key)
+            if visited_stops:
+                return json.loads(visited_stops)
+            return []
+        except Exception as e:
+            logger.error(f"Error getting visited stops: {e}")
+            return []
+    
+    def update_visited_stops(self, route_id, vehicle_id, stop_id):
+        """Add a stop to the visited stops list"""
+        visit_key = f"visited_stops:{route_id}:{vehicle_id}"
+        try:
+            visited_stops = self.get_visited_stops(route_id, vehicle_id)
+            if stop_id not in visited_stops:
+                visited_stops.append(stop_id)
+                self.redis_client.setex(
+                    visit_key, 
+                    86400,  # 24 hour TTL
+                    json.dumps(visited_stops)
+                )
+                logger.info(f"Added stop {stop_id} to visited stops for vehicle {vehicle_id} on route {route_id}")
+            return visited_stops
+        except Exception as e:
+            logger.error(f"Error updating visited stops: {e}")
+            return []
+    
+    def reset_visited_stops(self, route_id, vehicle_id):
+        """Reset the visited stops list for a vehicle"""
+        visit_key = f"visited_stops:{route_id}:{vehicle_id}"
+        try:
+            self.redis_client.delete(visit_key)
+            logger.info(f"Reset visited stops for vehicle {vehicle_id} on route {route_id}")
+            return True
+        except Exception as e:
+            logger.error(f"Error resetting visited stops: {e}")
+            return False
+    
+    def check_if_at_stop(self, stop, vehicle_lat, vehicle_lon):
+        """Check if vehicle is within radius of a stop"""
+        # Calculate distance using haversine formula
+        lat1, lon1 = math.radians(vehicle_lat), math.radians(vehicle_lon)
+        lat2, lon2 = math.radians(float(stop['stop_lat'])), math.radians(float(stop['stop_lon']))
+        
+        # Haversine formula
+        dlon = lon2 - lon1
+        dlat = lat2 - lat1
+        a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+        c = 2 * math.asin(math.sqrt(a))
+        distance = 6371 * c  # Radius of earth in kilometers
+        
+        return distance <= self.stop_visit_radius, distance
+    
+    def find_next_stop(self, stops, visited_stops):
+        """Find the next stop in sequence after the last visited stop"""
+        if not visited_stops:
+            # If no stops visited yet, the next stop is the first in sequence
+            return stops[0] if stops else None
+        
+        # Get the last visited stop ID
+        last_visited_id = visited_stops[-1]
+        
+        # Find its index in the stops list
+        last_index = -1
+        for i, stop in enumerate(stops):
+            if stop['stop_id'] == last_visited_id:
+                last_index = i
+                break
+                
+        # If we found the last stop and it's not the last in the route
+        if last_index >= 0 and last_index < len(stops) - 1:
+            return stops[last_index + 1]
+        elif last_index == len(stops) - 1:
+            # We're at the last stop of the route
+            return None
+            
+        # If we couldn't find the last visited stop in the list
+        # (this shouldn't happen but just in case)
+        return stops[0] if stops else None
+        
     def find_closest_stop(self, stops, vehicle_lat, vehicle_lon):
         """Find the closest stop to the given coordinates"""
         if not stops:
@@ -289,20 +373,61 @@ class StopTracker:
             print(f"Error calculating travel duration: {e}")
             return None
     
-    def calculate_eta(self, route_id, vehicle_lat, vehicle_lon, current_time):
+    def calculate_eta(self, route_id, vehicle_lat, vehicle_lon, current_time, vehicle_id=None):
         """Calculate ETA for all upcoming stops from current position"""
         # Get all stops for the route
         stops = self.get_route_stops(route_id)
         logger.info(f"route_id: {route_id}, stops: {stops}")
         if not stops:
             return None
+        
+        visited_stops = []
+        next_stop = None
+        closest_stop = None
+        distance = float('inf')
+        calculation_method = "realtime"
+        
+        # If we have a vehicle ID, use visited stops logic
+        if vehicle_id:
+            visited_stops = self.get_visited_stops(route_id, vehicle_id)
+            logger.info(f"Vehicle {vehicle_id} has visited stops: {visited_stops}")
             
-        # Find the closest stop
-        closest_stop, distance = self.find_closest_stop(stops, vehicle_lat, vehicle_lon)
+            # Check if the vehicle is at a stop now
+            for stop in stops:
+                is_at_stop, stop_distance = self.check_if_at_stop(stop, vehicle_lat, vehicle_lon)
+                if is_at_stop:
+                    # Vehicle is at this stop
+                    if stop['stop_id'] not in visited_stops:
+                        # Add to visited stops if not already there
+                        logger.info(f"Vehicle {vehicle_id} is at stop {stop['stop_id']}")
+                        visited_stops = self.update_visited_stops(route_id, vehicle_id, stop['stop_id'])
+                        calculation_method = "visited_stops"
+                    break
+                        
+            # Find next stop based on visited stops
+            next_stop = self.find_next_stop(stops, visited_stops)
+            
+            if next_stop:
+                # Calculate distance to next stop
+                _, distance = self.check_if_at_stop(next_stop, vehicle_lat, vehicle_lon)
+                closest_stop = next_stop
+                calculation_method = "sequence_based"
+            else:
+                # We're at the end of the route, reset visited stops
+                self.reset_visited_stops(route_id, vehicle_id)
+                # Fall back to closest stop method
+                closest_stop, distance = self.find_closest_stop(stops, vehicle_lat, vehicle_lon)
+                calculation_method = "distance_based_fallback"
+        
+        # If no vehicle ID or no next stop found, fall back to closest stop method
+        if not vehicle_id or not closest_stop:
+            closest_stop, distance = self.find_closest_stop(stops, vehicle_lat, vehicle_lon)
+            calculation_method = "distance_based"
+            
         if not closest_stop:
             return None
             
-        # Find the index of the closest stop in the route
+        # Find the index of the closest/next stop in the route
         closest_index = -1
         for i, stop in enumerate(stops):
             if stop['stop_id'] == closest_stop['stop_id']:
@@ -310,22 +435,20 @@ class StopTracker:
                 break
                 
         if closest_index == -1:
-            # Something went wrong, closest stop not found in the list
+            # Something went wrong, stop not found in the list
             return None
             
         # Calculate ETAs for the closest stop and all upcoming stops
         eta_list = []
         cumulative_time = 0
         current_lat, current_lon = vehicle_lat, vehicle_lon
-        calculation_method = "realtime"  # Default method
         
-        # First, calculate ETA for the closest stop
-        # Only set arrival time to current time if we're extremely close (within 10 meters)
-        if distance <= 0.01:  # 10 meters in km
+        # First, calculate ETA for the closest/next stop
+        if distance <= 0.01:  # 10 meters in km - we're practically at the stop
             arrival_time = current_time
-            calculation_method = "immediate"  # We're already there
+            calculation_method = "immediate"
         else:
-            # Calculate time to reach the closest stop
+            # Calculate time to reach the stop
             duration = self.get_travel_duration(
                 0, closest_stop['stop_id'],
                 current_lat, current_lon,
@@ -334,19 +457,16 @@ class StopTracker:
             
             if duration:
                 arrival_time = current_time + timedelta(seconds=duration)
-                cumulative_time = duration  # Set initial cumulative time
-                if self.use_osrm:
-                    calculation_method = "osrm"
-                else:
-                    calculation_method = "google_maps"
+                cumulative_time = duration
+                calculation_method = "osrm" if self.use_osrm else "google_maps"
             else:
-                # Fallback: estimate based on distance and average speed (30 km/h)
+                # Fallback estimation
                 duration = distance / 8.33  # distance / (30 km/h in m/s)
                 arrival_time = current_time + timedelta(seconds=duration)
                 cumulative_time = duration
                 calculation_method = "estimated"
         
-        # Add closest stop to the ETA list
+        # Add closest/next stop to the ETA list
         eta_list.append({
             'stop_id': closest_stop['stop_id'],
             'stop_seq': closest_stop['sequence'],
@@ -357,7 +477,7 @@ class StopTracker:
             'calculation_method': calculation_method
         })
         
-        # Then calculate ETAs for all remaining stops
+        # Then calculate ETAs for all remaining stops (everything after closest_index)
         for i in range(closest_index + 1, len(stops)):
             prev_stop = stops[i-1]
             current_stop = stops[i]
@@ -390,9 +510,7 @@ class StopTracker:
                 })
             else:
                 # If we couldn't calculate duration, use estimated method
-                # This would happen if API calls failed or weren't available
                 calculation_method = "estimated"
-                # You might want to add some default duration estimation here
         
         return {
             'route_id': route_id,
@@ -402,7 +520,7 @@ class StopTracker:
                 'stop_name': closest_stop['name'],
                 'distance': distance
             },
-            'calculation_method': calculation_method,  # Overall method used
+            'calculation_method': calculation_method,
             'eta': eta_list
         }
 
@@ -665,11 +783,21 @@ def handle_client_data(payload, client_ip, session=None):
             
             # Use the timestamp from the entity instead of current_time
             entity_timestamp = datetime.fromtimestamp(entity['timestamp'])
-            eta_data = stop_tracker.calculate_eta(route_id, vehicle_lat, vehicle_lon, entity_timestamp)
+            
+            # Pass vehicle_id (deviceId) to track visited stops
+            eta_data = stop_tracker.calculate_eta(
+                route_id, 
+                vehicle_lat, 
+                vehicle_lon, 
+                entity_timestamp,
+                vehicle_id=deviceId
+            )
+            
             if eta_data:
                 entity['closest_stop'] = eta_data['closest_stop']
                 entity['distance_to_stop'] = eta_data['closest_stop']['distance']
                 entity['eta_list'] = eta_data['eta']
+                entity['calculation_method'] = eta_data['calculation_method']
                 
         # Try to send to Kafka with retries
         max_retries = 3
