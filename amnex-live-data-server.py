@@ -43,6 +43,7 @@ CHALO_PORT = int(os.getenv('CHALO_PORT', '1544'))
 FORWARD_TCP = os.getenv('FORWARD_TCP', 'true').lower() == 'true'
 TCP_FORWARD_TIMEOUT = int(os.getenv('TCP_FORWARD_TIMEOUT', '5'))  # Socket timeout in seconds
 TCP_MAX_RETRIES = int(os.getenv('TCP_MAX_RETRIES', '3'))  # Maximum retry attempts
+TCP_RECONNECT_INTERVAL = int(os.getenv('TCP_RECONNECT_INTERVAL', '2555'))  # Seconds between reconnection attempts
 
 # Setup Kafka producer with better config for high load
 producer_config = {
@@ -773,61 +774,169 @@ def parse_payload(data_decoded, client_ip):
         print(f"Error parsing payload: {e}")
         return None
 
-def forward_to_tcp(data_str):
-    """
-    Forward raw data to a TCP server
+# Persistent TCP connection handler
+class TCPClient:
+    _instance = None
     
-    Args:
-        data_str: String data to forward
+    @classmethod
+    def get_instance(cls):
+        if cls._instance is None:
+            cls._instance = TCPClient(CHALO_URL, CHALO_PORT)
+        return cls._instance
     
-    Returns:
-        bool: True if successful, False otherwise
-    """
-    if not FORWARD_TCP:
-        return False
+    def __init__(self, host, port, reconnect_interval=5):
+        self.host = host
+        self.port = port
+        self.reconnect_interval = reconnect_interval
+        self.socket = None
+        self.connected = False
+        self.lock = threading.Lock()
+        self.connect_thread = None
+        self._stop_event = threading.Event()
+        self._message_queue = []
+        self._queue_lock = threading.Lock()
         
-    # Make sure data ends with a newline
-    if not data_str.endswith('\n'):
-        data_str += '\n'
-    
-    retries = 0
-    while retries < TCP_MAX_RETRIES:
-        try:
-            # Create a socket
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                # Set timeout
-                sock.settimeout(TCP_FORWARD_TIMEOUT)
-                
-                # Connect to server
-                logger.info(f"Connecting to {CHALO_URL}:{CHALO_PORT}")
-                sock.connect((CHALO_URL, CHALO_PORT))
-                
-                # Send data
-                sock.sendall(data_str.encode())
-                
-                # Wait for acknowledgement (optional - remove if not needed)
-                response = sock.recv(1024)
-                logger.info(f"TCP forward response: {response.decode('utf-8', errors='ignore')}")
-                
-                return True
-                
-        except socket.timeout:
-            logger.error(f"TCP forward timeout (attempt {retries+1}/{TCP_MAX_RETRIES})")
-            retries += 1
-            time.sleep(1)
+    def start(self):
+        """Start connection manager and message sender threads"""
+        if self.connect_thread and self.connect_thread.is_alive():
+            return  # Already running
             
-        except ConnectionRefusedError:
-            logger.error(f"TCP connection refused to {CHALO_URL}:{CHALO_PORT} (attempt {retries+1}/{TCP_MAX_RETRIES})")
-            retries += 1
-            time.sleep(2)
+        self._stop_event.clear()
+        self.connect_thread = threading.Thread(target=self._connection_manager, daemon=True)
+        self.connect_thread.start()
+        
+        # Start message processor thread
+        self.message_thread = threading.Thread(target=self._process_message_queue, daemon=True)
+        self.message_thread.start()
+        
+        logger.info(f"TCP Client started for {self.host}:{self.port}")
+        
+    def stop(self):
+        """Stop connection manager gracefully"""
+        self._stop_event.set()
+        if self.connect_thread and self.connect_thread.is_alive():
+            self.connect_thread.join(timeout=5)
+        self._close_socket()
+        
+    def _connection_manager(self):
+        """Maintains persistent TCP connection, reconnecting as needed"""
+        while not self._stop_event.is_set():
+            if not self.connected:
+                self._establish_connection()
+            time.sleep(0.1)  # Small delay to avoid tight loop
+                
+    def _establish_connection(self):
+        """Establish connection with retry logic"""
+        try:
+            self._close_socket()  # Close any existing socket
+            
+            # Create new socket
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.socket.settimeout(10)  # Connection timeout
+            logger.info(f"Connecting to {self.host}:{self.port}...")
+            self.socket.connect((self.host, self.port))
+            self.socket.settimeout(None)  # Remove timeout for normal operation
+            
+            # Set keepalive options
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            try:
+                # These options may not be available on all systems
+                self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
+                self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 10)
+                self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 5)
+            except (AttributeError, OSError):
+                pass  # Ignore if these options are not available
+                
+            logger.info(f"✅ Successfully connected to {self.host}:{self.port}")
+            self.connected = True
             
         except Exception as e:
-            logger.error(f"TCP forward error: {str(e)} (attempt {retries+1}/{TCP_MAX_RETRIES})")
-            retries += 1
-            time.sleep(1)
+            logger.error(f"Failed to connect to {self.host}:{self.port}: {str(e)}")
+            self.connected = False
+            time.sleep(self.reconnect_interval)
     
-    logger.error(f"Failed to forward data to TCP server after {TCP_MAX_RETRIES} attempts")
-    return False
+    def _close_socket(self):
+        """Close the socket connection"""
+        with self.lock:
+            if self.socket:
+                try:
+                    self.socket.close()
+                except Exception as e:
+                    logger.error(f"Error closing socket: {str(e)}")
+                finally:
+                    self.socket = None
+                    self.connected = False
+    
+    def queue_message(self, message):
+        """Add message to queue for sending"""
+        with self._queue_lock:
+            self._message_queue.append(message)
+            
+    def _process_message_queue(self):
+        """Process queued messages in background"""
+        while not self._stop_event.is_set():
+            messages_to_send = []
+            
+            # Get all queued messages
+            with self._queue_lock:
+                if self._message_queue:
+                    messages_to_send = self._message_queue.copy()
+                    self._message_queue.clear()
+                    
+            # Send all queued messages
+            if messages_to_send and self.connected:
+                for message in messages_to_send:
+                    self._send_message(message)
+                    
+            time.sleep(0.1)  # Small delay
+    
+    def _send_message(self, data):
+        """Send a single message over TCP connection"""
+        with self.lock:
+            if not self.connected or not self.socket:
+                logger.error("Not connected, queuing message for later")
+                with self._queue_lock:
+                    self._message_queue.append(data)
+                return False
+                
+            try:
+                # Make sure data ends with newline
+                if not data.endswith('\n'):
+                    data += '\n'
+                
+                self.socket.sendall(data.encode())
+                return True
+            except Exception as e:
+                logger.error(f"Error sending data: {str(e)}")
+                self.connected = False  # Mark as disconnected for reconnection
+                
+                # Re-queue the message
+                with self._queue_lock:
+                    self._message_queue.append(data)
+                return False
+
+# Create and start singleton TCP client
+tcp_client = None
+if FORWARD_TCP:
+    tcp_client = TCPClient.get_instance()
+    tcp_client.start()
+    
+    # Register shutdown handler
+    def shutdown_tcp_client():
+        if tcp_client:
+            logger.info("Shutting down TCP client...")
+            tcp_client.stop()
+            
+    atexit.register(shutdown_tcp_client)
+
+def forward_to_tcp(data_str):
+    """Forward data using persistent TCP connection"""
+    if not FORWARD_TCP or not tcp_client:
+        return False
+        
+    # Queue the message for sending
+    tcp_client.queue_message(data_str)
+    return True
 
 def handle_client_data(payload, client_ip, session=None):
     """Handle client data and send it to Kafka"""
@@ -863,9 +972,9 @@ def handle_client_data(payload, client_ip, session=None):
                 entity['eta_list'] = eta_data['eta']
                 entity['calculation_method'] = eta_data['calculation_method']
         
-        # Forward the raw payload to TCP server asynchronously
+        # Forward the raw payload to TCP server using persistent connection
         if FORWARD_TCP:
-            executor.submit(forward_to_tcp, payload)
+            forward_to_tcp(payload)
                 
         # Try to send to Kafka with retries
         max_retries = 3
