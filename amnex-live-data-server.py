@@ -37,6 +37,13 @@ KAFKA_SERVER = os.getenv('KAFKA_SERVER', 'localhost:9096')
 REDIS_NODES = os.getenv('REDIS_NODES', 'localhost:6379').split(',')
 IS_CLUSTER_REDIS = os.getenv('IS_CLUSTER_REDIS', 'false').lower() == 'true'
 
+# TCP forwarding configuration
+CHALO_URL = os.getenv('CHALO_URL', "chennai-gps.chalo.com")
+CHALO_PORT = int(os.getenv('CHALO_PORT', '1544'))
+FORWARD_TCP = os.getenv('FORWARD_TCP', 'true').lower() == 'true'
+TCP_FORWARD_TIMEOUT = int(os.getenv('TCP_FORWARD_TIMEOUT', '5'))  # Socket timeout in seconds
+TCP_MAX_RETRIES = int(os.getenv('TCP_MAX_RETRIES', '3'))  # Maximum retry attempts
+
 # Setup Kafka producer with better config for high load
 producer_config = {
     'bootstrap.servers': KAFKA_SERVER,
@@ -766,6 +773,62 @@ def parse_payload(data_decoded, client_ip):
         print(f"Error parsing payload: {e}")
         return None
 
+def forward_to_tcp(data_str):
+    """
+    Forward raw data to a TCP server
+    
+    Args:
+        data_str: String data to forward
+    
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    if not FORWARD_TCP:
+        return False
+        
+    # Make sure data ends with a newline
+    if not data_str.endswith('\n'):
+        data_str += '\n'
+    
+    retries = 0
+    while retries < TCP_MAX_RETRIES:
+        try:
+            # Create a socket
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                # Set timeout
+                sock.settimeout(TCP_FORWARD_TIMEOUT)
+                
+                # Connect to server
+                logger.info(f"Connecting to {CHALO_URL}:{CHALO_PORT}")
+                sock.connect((CHALO_URL, CHALO_PORT))
+                
+                # Send data
+                sock.sendall(data_str.encode())
+                
+                # Wait for acknowledgement (optional - remove if not needed)
+                response = sock.recv(1024)
+                logger.info(f"TCP forward response: {response.decode('utf-8', errors='ignore')}")
+                
+                return True
+                
+        except socket.timeout:
+            logger.error(f"TCP forward timeout (attempt {retries+1}/{TCP_MAX_RETRIES})")
+            retries += 1
+            time.sleep(1)
+            
+        except ConnectionRefusedError:
+            logger.error(f"TCP connection refused to {CHALO_URL}:{CHALO_PORT} (attempt {retries+1}/{TCP_MAX_RETRIES})")
+            retries += 1
+            time.sleep(2)
+            
+        except Exception as e:
+            logger.error(f"TCP forward error: {str(e)} (attempt {retries+1}/{TCP_MAX_RETRIES})")
+            retries += 1
+            time.sleep(1)
+    
+    logger.error(f"Failed to forward data to TCP server after {TCP_MAX_RETRIES} attempts")
+    return False
+
 def handle_client_data(payload, client_ip, session=None):
     """Handle client data and send it to Kafka"""
     try:
@@ -799,6 +862,10 @@ def handle_client_data(payload, client_ip, session=None):
                 entity['distance_to_stop'] = eta_data['closest_stop']['distance']
                 entity['eta_list'] = eta_data['eta']
                 entity['calculation_method'] = eta_data['calculation_method']
+        
+        # Forward the raw payload to TCP server asynchronously
+        if FORWARD_TCP:
+            executor.submit(forward_to_tcp, payload)
                 
         # Try to send to Kafka with retries
         max_retries = 3
