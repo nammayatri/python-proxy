@@ -764,16 +764,16 @@ def parse_amnex_payload(payload, serverTime, client_ip):
         print(f"Error parsing Amnex payload: {e}")
         return None
 
-def parse_payload(data_decoded, client_ip):
+def parse_payload(data_decoded, client_ip, serverTime):
     """Parse payload data by determining the format"""
     try:
         payload = data_decoded.split(",")
         
         # Parse payload based on format
         if len(payload) > 0 and payload[0].endswith("$Header"):
-            return parse_chalo_payload(payload, datetime.now(), client_ip)
+            return parse_chalo_payload(payload, serverTime, client_ip)
         elif len(payload) >= 14 and payload[0] == "&PEIS":
-            return parse_amnex_payload(payload, datetime.now(), client_ip)
+            return parse_amnex_payload(payload, serverTime, client_ip)
         
         return None
     except Exception as e:
@@ -948,10 +948,10 @@ def forward_to_tcp(data_str):
     tcp_client.queue_message(data_str)
     return True
 
-def handle_client_data(payload, client_ip, session=None):
+def handle_client_data(payload, client_ip, serverTime,session=None):
     """Handle client data and send it to Kafka"""
     try:
-        entity = parse_payload(payload, client_ip)
+        entity = parse_payload(payload, client_ip, serverTime)
         print(f"entity: {entity}")
         if not entity:
             return
@@ -1113,7 +1113,7 @@ def handle_connection(conn, addr):
                 serverTime = datetime.now()
                 
                 # Use the thread pool instead of creating a new thread for each message
-                executor.submit(handle_client_data, data_decoded, addr)
+                executor.submit(handle_client_data, data_decoded, addr, serverTime)
                 
                 # Reset the timeout after each successful read
                 conn.settimeout(300)
@@ -1156,7 +1156,7 @@ flush_thread = threading.Thread(target=periodic_flush, daemon=True)
 flush_thread.start()
 
 # Create a thread pool with a reasonable number of worker threads
-MAX_WORKER_THREADS = int(os.getenv('MAX_WORKER_THREADS', '50'))  # Default to 50 worker threads
+MAX_WORKER_THREADS = int(os.getenv('MAX_WORKER_THREADS', '100'))  # Default to 50 worker threads
 logger.info(f"Initializing thread pool with {MAX_WORKER_THREADS} worker threads")
 executor = ThreadPoolExecutor(max_workers=MAX_WORKER_THREADS)
 
