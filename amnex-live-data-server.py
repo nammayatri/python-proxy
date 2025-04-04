@@ -386,7 +386,6 @@ class StopTracker:
         """Calculate ETA for all upcoming stops from current position"""
         # Get all stops for the route
         stops = self.get_route_stops(route_id)
-        logger.info(f"route_id: {route_id}, stops: {stops}")
         if not stops:
             return None
         
@@ -399,7 +398,6 @@ class StopTracker:
         # If we have a vehicle ID, use visited stops logic
         if vehicle_id:
             visited_stops = self.get_visited_stops(route_id, vehicle_id)
-            logger.info(f"Vehicle {vehicle_id} has visited stops: {visited_stops}")
             
             # Check if the vehicle is at a stop now
             for stop in stops:
@@ -717,14 +715,13 @@ def parse_chalo_payload(payload, serverTime, client_ip):
             "timestamp": date_to_unix(timestamp),
             "vehicleNumber": vehicleNumber,
             "speed": speed,
+            "pushedToKafkaAt": date_to_unix(datetime.now()),
             "dataState": dataState,
             "serverTime": date_to_unix(serverTime),
             "provider": "chalo",
             "raw": payload,
             "client_ip": client_ip
         }
-
-        print(f"chalo entity: {entity}")
         
         return entity
     except Exception as e:
@@ -753,6 +750,7 @@ def parse_amnex_payload(payload, serverTime, client_ip):
                 "timestamp": date_to_unix(date),
                 "dataState": dataState,
                 "routeNumber": routeNumber,
+                "pushedToKafkaAt": date_to_unix(datetime.now()),
                 "serverTime": date_to_unix(serverTime),
                 "raw": raw,
                 "provider": "amnex",
@@ -875,7 +873,6 @@ class TCPClient:
     
     def queue_message(self, message):
         """Add message to queue for sending"""
-        logger.info(f"Queueing message: {message}")
         with self._queue_lock:
             self._message_queue.append(message)
             
@@ -980,12 +977,7 @@ def handle_client_data(payload, client_ip, serverTime,session=None):
                 entity['closest_stop'] = eta_data['closest_stop']
                 entity['distance_to_stop'] = eta_data['closest_stop']['distance']
                 entity['eta_list'] = eta_data['eta']
-                entity['calculation_method'] = eta_data['calculation_method']
-        
-        # Forward the raw payload to TCP server using persistent connection
-        if FORWARD_TCP:
-            forward_to_tcp(payload)
-                
+                entity['calculation_method'] = eta_data['calculation_method']        
         # Try to send to Kafka with retries
         max_retries = 3
         retries = 0
@@ -993,7 +985,6 @@ def handle_client_data(payload, client_ip, serverTime,session=None):
         
         while retries < max_retries and not success:
             try:
-                logger.info(f"Sending data to Kafka topic {KAFKA_TOPIC}")
                 # For confluent_kafka.Producer, we need to provide the data as a string
                 producer.produce(KAFKA_TOPIC, json.dumps(entity).encode('utf-8'), callback=delivery_report)
                 producer.poll(0)  # Trigger any callbacks
@@ -1012,12 +1003,11 @@ def handle_client_data(payload, client_ip, serverTime,session=None):
         if success:
             try:
                 producer.flush(timeout=5.0)
-                logger.info(f"Successfully sent data to Kafka topic {KAFKA_TOPIC}")
             except Exception as e:
                 logger.error(f"Error flushing Kafka producer: {str(e)}")
-                
+        if FORWARD_TCP:
+            forward_to_tcp(payload)
         # Store in Redis
-        print(f"fleet_info: {fleet_info}")
         if fleet_info and 'route_id' in fleet_info and fleet_info["route_id"] != None:
             route_id = fleet_info['route_id']
             redis_key = f"route:{route_id}"
@@ -1037,30 +1027,26 @@ def handle_client_data(payload, client_ip, serverTime,session=None):
             
             # Add ETA data if available
             if 'eta_list' in entity:
-                logger.info(f"redis_key: {redis_key}, entity['eta_list']: {entity['eta_list']}")
                 vehicle_data_obj = json.loads(vehicle_data)
                 vehicle_data_obj['eta_data'] = entity['eta_list']
                 vehicle_data = json.dumps(vehicle_data_obj)
             
             try:
                 # Store vehicle data in hash
-                logger.info(f"Storing data in Redis hash: key={redis_key}, field={vehicle_number}")
                 redis_client.hset(redis_key, vehicle_number, vehicle_data)
                 redis_client.expire(redis_key, 86400)  # Expire after 24 hours
                 
                 # Store location in Redis Geo set
                 geo_key = "bus_locations"  # Single key for all bus locations
-                logger.info(f"Storing location in Redis Geo: key={geo_key}, member={vehicle_number}")
                 if vehicle_lon is not None and vehicle_lat is not None and vehicle_number:
                     redis_client.geoadd(geo_key, vehicle_lon, vehicle_lat, vehicle_number)
                 else:
                     logger.error(f"Invalid location data: lon={vehicle_lon}, lat={vehicle_lat}, member={vehicle_number}")
                 redis_client.expire(geo_key, 86400)  # Expire after 24 hours
                 
-                logger.info(f"Successfully stored data in Redis with TTL of 24 hours")
+                logger.info(f"Success")
             except Exception as e:
                 logger.error(f"Error storing data in Redis: {str(e)}")
-                
     except Exception as e:
         logger.error(f"Error handling client data: {str(e)}")
         traceback.print_exc()
@@ -1156,7 +1142,7 @@ flush_thread = threading.Thread(target=periodic_flush, daemon=True)
 flush_thread.start()
 
 # Create a thread pool with a reasonable number of worker threads
-MAX_WORKER_THREADS = int(os.getenv('MAX_WORKER_THREADS', '100'))  # Default to 50 worker threads
+MAX_WORKER_THREADS = int(os.getenv('MAX_WORKER_THREADS', '1000'))  # Default to 50 worker threads
 logger.info(f"Initializing thread pool with {MAX_WORKER_THREADS} worker threads")
 executor = ThreadPoolExecutor(max_workers=MAX_WORKER_THREADS)
 
