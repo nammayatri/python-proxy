@@ -873,6 +873,8 @@ class TCPClient:
     
     def queue_message(self, message):
         """Add message to queue for sending"""
+        message = message.strip()
+        message = message +'#'
         with self._queue_lock:
             self._message_queue.append(message)
             
