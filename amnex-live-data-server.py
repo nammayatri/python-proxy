@@ -720,6 +720,7 @@ def parse_chalo_payload(payload, serverTime, client_ip):
             "dataState": dataState,
             "serverTime": date_to_unix(serverTime),
             "provider": "chalo",
+            "raw": payload.join(","),
             "client_ip": client_ip
         }
 
@@ -743,6 +744,7 @@ def parse_amnex_payload(payload, serverTime, client_ip):
             routeNumber = payload[17]
             date = dd_mm_ss_to_date(date + "-" + timestamp)
             dataState = payload[3]
+            raw = payload.join(",")
             entity = {
                 "lat": latitude,
                 "long": longitude,
@@ -752,6 +754,7 @@ def parse_amnex_payload(payload, serverTime, client_ip):
                 "dataState": dataState,
                 "routeNumber": routeNumber,
                 "serverTime": date_to_unix(serverTime),
+                "raw": raw,
                 "provider": "amnex",
                 "client_ip": client_ip
             }
