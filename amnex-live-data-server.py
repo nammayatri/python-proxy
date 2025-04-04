@@ -876,6 +876,7 @@ class TCPClient:
         message = message.strip()
         message = message +'#'
         with self._queue_lock:
+            logger.info(f"Queueing message: {message}")
             self._message_queue.append(message)
             
     def _process_message_queue(self):
