@@ -1101,8 +1101,12 @@ def handle_connection(conn, addr):
                 
                 serverTime = datetime.now()
                 
+                threading.Thread(
+                    target=handle_client_data,
+                    args=(data_decoded, addr, serverTime)
+                ).start()
                 # Use the thread pool instead of creating a new thread for each message
-                executor.submit(handle_client_data, data_decoded, addr, serverTime)
+                # executor.submit(handle_client_data, data_decoded, addr, serverTime)
                 
                 # Reset the timeout after each successful read
                 conn.settimeout(300)
