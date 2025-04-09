@@ -318,7 +318,7 @@ class StopTracker:
         # Not in cache, calculate using routing API
         try:
             duration = None
-            
+            return 0
             if self.use_osrm:
                 # OSRM API
                 url = f"{self.osrm_url}/route/v1/driving/{origin_lon},{origin_lat};{dest_lon},{dest_lat}"
