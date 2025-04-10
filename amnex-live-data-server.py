@@ -185,8 +185,8 @@ def get_route_id_from_waybills(vehicle_no: str) -> Optional[str]:
             waybill = db.query(Waybill)\
                 .filter(
                     Waybill.vehicle_no == vehicle_no,
-                    Waybill.deleted == False,
-                    Waybill.status != 'Closed'
+                    Waybill.deleted == False
+                    # Waybill.status != 'Closed'
                 )\
                 .order_by(Waybill.updated_at.desc())\
                 .first()
