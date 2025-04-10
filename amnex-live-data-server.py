@@ -7,7 +7,7 @@ import threading
 from rediscluster import RedisCluster
 import redis
 import time
-from sqlalchemy import create_engine, Column, Integer, String, DateTime, Text, select, func
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean, BigInteger, Text, select, func
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import QueuePool
@@ -80,7 +80,14 @@ DB_HOST = os.getenv('DB_HOST', 'localhost')
 DB_PORT = os.getenv('DB_PORT', '5432')
 DB_NAME = os.getenv('DB_NAME', 'gps_tracking')
 
-# SQLAlchemy setup
+# Waybills database configuration
+WAYBILLS_DB_USER = os.getenv('WAYBILLS_DB_USER', 'postgres')
+WAYBILLS_DB_PASS = os.getenv('WAYBILLS_DB_PASS', 'postgres')
+WAYBILLS_DB_HOST = os.getenv('WAYBILLS_DB_HOST', 'localhost')
+WAYBILLS_DB_PORT = os.getenv('WAYBILLS_DB_PORT', '5432')
+WAYBILLS_DB_NAME = os.getenv('WAYBILLS_DB_NAME', 'waybills')
+
+# SQLAlchemy setup for main database
 DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 print(f"DATABASE_URL: {DATABASE_URL}")
 engine = create_engine(
@@ -97,6 +104,20 @@ engine = create_engine(
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
+# SQLAlchemy setup for waybills database
+WAYBILLS_DATABASE_URL = f"postgresql://{WAYBILLS_DB_USER}:{WAYBILLS_DB_PASS}@{WAYBILLS_DB_HOST}:{WAYBILLS_DB_PORT}/{WAYBILLS_DB_NAME}"
+print(f"WAYBILLS_DATABASE_URL: {WAYBILLS_DATABASE_URL}")
+waybills_engine = create_engine(
+    WAYBILLS_DATABASE_URL,
+    poolclass=QueuePool,
+    pool_size=20,
+    max_overflow=30,
+    pool_timeout=30,
+    pool_recycle=1800
+)
+WaybillsSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=waybills_engine)
+WaybillsBase = declarative_base()
+
 # Pydantic model for type validation
 class RouteDeviceMapping(BaseModel):
     id: int
@@ -107,7 +128,7 @@ class RouteDeviceMapping(BaseModel):
     is_active: bool
 
     class Config:
-        orm_mode = True
+        from_attributes = True
 
 # Update the SQLAlchemy models
 class DeviceVehicleMapping(Base):
@@ -133,8 +154,66 @@ class RouteStopMapping(Base):
     stop_lon = Column(Text)
     stop_name = Column(Text)
 
-# Don't create tables since we're using existing table
+# Waybills database models
+class Waybill(Base):
+    __tablename__ = "waybills"
+    waybill_id = Column(BigInteger, primary_key=True)
+    schedule_id = Column(BigInteger)
+    deleted = Column(Boolean, nullable=False, default=False)
+    schedule_no = Column(Text)
+    schedule_trip_name = Column(Text)
+    schedule_type = Column(Text)
+    service_type = Column(Text)
+    updated_at = Column(DateTime)
+    status = Column(Text)
+    vehicle_no = Column(Text)
+
+class BusSchedule(Base):
+    __tablename__ = "bus_schedule"
+    
+    schedule_id = Column(BigInteger, primary_key=True)
+    deleted = Column(Boolean, nullable=False, default=False)
+    route_code = Column(Text)
+    status = Column(Text)
+    route_id = Column(BigInteger, nullable=False)
+
+def get_route_id_from_waybills(vehicle_no: str) -> Optional[str]:
+    """Get the route_id from waybills database for a given vehicle number"""
+    try:
+        with WaybillsSessionLocal() as db:
+            # First get the active waybill for the vehicle
+            waybill = db.query(Waybill)\
+                .filter(
+                    Waybill.vehicle_no == vehicle_no,
+                    Waybill.deleted == False,
+                    Waybill.status != 'Closed'
+                )\
+                .order_by(Waybill.updated_at.desc())\
+                .first()
+            
+            if not waybill:
+                return None
+                
+            # Then get the route_id from bus_schedule
+            schedule = db.query(BusSchedule)\
+                .filter(
+                    BusSchedule.schedule_id == waybill.schedule_id,
+                    BusSchedule.deleted == False
+                )\
+                .first()
+                
+            if schedule:
+                return str(schedule.route_id)  # Convert to string to match existing format
+                
+            return None
+            
+    except Exception as e:
+        logger.error(f"Error querying waybills database for vehicle {vehicle_no}: {e}")
+        return None
+
+# Don't create tables since we're using existing tables
 # Base.metadata.create_all(bind=engine)
+# WaybillsBase.metadata.create_all(bind=waybills_engine)
 
 # Environment variables for route data configuration
 USE_OSRM = os.getenv('USE_OSRM', 'true').lower() == 'true'
@@ -218,7 +297,6 @@ class StopTracker:
                     86400,  # 24 hour TTL
                     json.dumps(visited_stops)
                 )
-                logger.info(f"Added stop {stop_id} to visited stops for vehicle {vehicle_id} on route {route_id}")
             return visited_stops
         except Exception as e:
             logger.error(f"Error updating visited stops: {e}")
@@ -515,88 +593,19 @@ class SimpleCache:
 
     def set(self, key: str, value):
         self.cache[key] = value
-        redis_client.set(f"simpleCache:{key}", json.dumps(value))
+        redis_client.setex(f"simpleCache:{key}", 3600, json.dumps(value))
 # Create single cache instance
 cache = SimpleCache()
-
-def get_route_for_device(device_id: str) -> Optional[str]:
-    """Get the active route ID for a device with caching"""
-    cache_key = f"device:{device_id}"
-    
-    # Check cache first
-    cached_route = cache.get(cache_key)
-    if cached_route is not None:
-        if cached_route == "NOT_AVAILABLE":
-            return None
-        return cached_route
-
-    try:
-        with SessionLocal() as db:
-            # First get the fleet number for the device
-            fleet_mapping = db.query(DeviceVehicleMapping)\
-                .filter(DeviceVehicleMapping.device_id == device_id)\
-                .first()
-            
-            if not fleet_mapping:
-                cache.set(cache_key, "NOT_AVAILABLE")
-                return None
-
-            # Then get the route for that fleet
-            route_mapping = db.query(VehicleRouteMapping)\
-                .filter(VehicleRouteMapping.vehicle_no == fleet_mapping.vehicle_no)\
-                .first()
-            
-            route_id = route_mapping.route_id if route_mapping else "NOT_AVAILABLE"
-            cache.set(cache_key, route_id)
-            return route_id
-
-    except Exception as e:
-        print(f"Error querying route for device {device_id}: {e}")
-        return None
-
-def get_devices_for_route(route_id: str) -> List[str]:
-    """Get all active devices for a route with caching"""
-    cache_key = f"route:{route_id}"
-    
-    # Check cache first
-    cached_devices = cache.get(cache_key)
-    if cached_devices is not None:
-        return cached_devices
-
-    try:
-        with SessionLocal() as db:
-            # First get all fleet numbers for this route
-            fleet_numbers = db.query(VehicleRouteMapping.vehicle_no)\
-                .filter(VehicleRouteMapping.route_id == route_id)\
-                .all()
-            
-            if not fleet_numbers:
-                cache.set(cache_key, [])
-                return []
-
-            # Then get all devices for these fleet numbers
-            vehicle_nos = [f[0] for f in fleet_numbers]  # Extract fleet numbers from result tuples
-            devices = db.query(DeviceVehicleMapping.device_id)\
-                .filter(DeviceVehicleMapping.vehicle_no.in_(vehicle_nos))\
-                .all()
-            
-            device_list = [d[0] for d in devices]  # Extract device IDs from result tuples
-            cache.set(cache_key, device_list)
-            return device_list
-
-    except Exception as e:
-        print(f"Error querying devices for route {route_id}: {e}")
-        return []
 
 def get_fleet_info(device_id: str) -> dict:
     """Get both fleet number and route ID for a device"""
     cache_key = f"fleetInfo:{device_id}"
     
     # Check cache first
-    fleet_info = cache.get(cache_key)
-    if fleet_info is not None:
+    fleet_info_str = redis_client.get(cache_key)
+    if fleet_info_str is not None:
+        fleet_info = json.loads(fleet_info_str)
         return fleet_info
-
     try:
         with SessionLocal() as db:
             # Get fleet number for device
@@ -605,19 +614,17 @@ def get_fleet_info(device_id: str) -> dict:
                 .first()
             
             if not fleet_mapping:
-                cache.set(cache_key, {})
+                redis_client.setex(cache_key, 600, json.dumps({}))
                 return {}
 
             # Get route for fleet
-            route_mapping = db.query(VehicleRouteMapping)\
-                .filter(VehicleRouteMapping.vehicle_no == fleet_mapping.vehicle_no)\
-                .first()
-            
+            route_id = get_route_id_from_waybills(fleet_mapping.vehicle_no)
+            logger.info(f"Route ID: {fleet_mapping.vehicle_no}, {route_id}")
             val = {
                 'vehicle_no': fleet_mapping.vehicle_no,
-                'route_id': route_mapping.route_id if route_mapping else None
+                'route_id': route_id
             }
-            cache.set(cache_key, val)
+            redis_client.setex(cache_key, 600, json.dumps(val))
             return val
 
     except Exception as e:
@@ -657,8 +664,6 @@ def dd_mm_ss_to_date(date_str: str) -> datetime.date:
 def delivery_report(err, msg):
     if err is not None:
         print(f"Message delivery failed: {err}")
-    else:
-        print(f"Message delivered to {msg.topic()} [{msg.partition()}]")
 
 def parse_chalo_payload(payload, serverTime, client_ip):
     """
@@ -821,7 +826,6 @@ class TCPClient:
             # Create new socket
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket.settimeout(10)  # Connection timeout
-            logger.info(f"Connecting to {self.host}:{self.port}...")
             self.socket.connect((self.host, self.port))
             self.socket.settimeout(None)  # Remove timeout for normal operation
             
@@ -860,12 +864,10 @@ class TCPClient:
         message = message.strip()
         message = message +'#'
         with self._queue_lock:
-            logger.info(f"Queueing message: {message}")
             self._message_queue.append(message)
             
     def _process_message_queue(self):
         """Process queued messages in background"""
-        logger.info("Starting message processing thread...")
         while not self._stop_event.is_set():
             messages_to_send = []
             
@@ -875,13 +877,11 @@ class TCPClient:
                     messages_to_send = self._message_queue.copy()
                     self._message_queue.clear()
 
-            logger.info(f"Processing {len(messages_to_send)} queued messages")
                     
             # Send all queued messages
             if messages_to_send and self.connected:
                 for message in messages_to_send:
                     self._send_message(message)
-            logger.info(f"Processed {len(messages_to_send)} messages")
             time.sleep(0.1)  # Small delay
     
     def _send_message(self, data):
@@ -936,7 +936,6 @@ def handle_client_data(payload, client_ip, serverTime,session=None):
     """Handle client data and send it to Kafka"""
     try:
         entity = parse_payload(payload, client_ip, serverTime)
-        print(f"entity: {entity}")
         if not entity:
             return
             
@@ -1031,7 +1030,6 @@ def handle_client_data(payload, client_ip, serverTime,session=None):
                     logger.error(f"Invalid location data: lon={vehicle_lon}, lat={vehicle_lat}, member={vehicle_number}")
                 redis_client.expire(geo_key, 86400)  # Expire after 24 hours
                 
-                logger.info(f"Success")
             except Exception as e:
                 logger.error(f"Error storing data in Redis: {str(e)}")
     except Exception as e:
@@ -1151,10 +1149,9 @@ def monitor_thread_pool():
             # Get approximate queue size (only in Python 3.9+)
             try:
                 queue_size = executor._work_queue.qsize()
-                logger.info(f"Thread pool status: {len(executor._threads)} active threads, ~{queue_size} queued tasks")
             except (NotImplementedError, AttributeError):
                 # If qsize() is not available
-                logger.info(f"Thread pool status: {len(executor._threads)} active threads")
+                pass
         except Exception as e:
             logger.error(f"Error monitoring thread pool: {e}")
 
