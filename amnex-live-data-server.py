@@ -185,8 +185,8 @@ def get_route_id_from_waybills(vehicle_no: str) -> Optional[str]:
             waybill = db.query(Waybill)\
                 .filter(
                     Waybill.vehicle_no == vehicle_no,
-                    Waybill.deleted == False
-                    # Waybill.status != 'Closed'
+                    Waybill.deleted == False,
+                    Waybill.status != 'Closed'
                 )\
                 .order_by(Waybill.updated_at.desc())\
                 .first()
@@ -423,10 +423,9 @@ class StopTracker:
             print(f"Error calculating travel duration: {e}")
             return None
     
-    def calculate_eta(self, route_id, vehicle_lat, vehicle_lon, current_time, vehicle_id=None):
+    def calculate_eta(self, stops, route_id, vehicle_lat, vehicle_lon, current_time, vehicle_id=None):
         """Calculate ETA for all upcoming stops from current position"""
         # Get all stops for the route
-        stops = self.get_route_stops(route_id)
         if not stops:
             return None
         
@@ -932,6 +931,44 @@ def forward_to_tcp(data_str):
     tcp_client.queue_message(data_str)
     return True
 
+def is_bus_on_route(stops, route_id: str, lat: float, lon: float, max_distance_km: float = 1.0) -> bool:
+    """
+    Check if a bus is within a reasonable distance of any stop on its route.
+    Args:
+        route_id: The route ID to check
+        lat: Bus latitude
+        lon: Bus longitude
+        max_distance_km: Maximum distance (in km) from any stop to consider the bus on route
+    Returns:
+        bool: True if bus is within max_distance_km of any stop on the route
+    """
+    try:
+        for stop in stops:
+            try:
+                stop_lat = float(stop["stop_lat"])
+                stop_lon = float(stop["stop_lon"])
+                
+                # Calculate distance using haversine formula
+                lat1, lon1 = math.radians(lat), math.radians(lon)
+                lat2, lon2 = math.radians(stop_lat), math.radians(stop_lon)
+                
+                dlon = lon2 - lon1
+                dlat = lat2 - lat1
+                a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+                c = 2 * math.asin(math.sqrt(a))
+                distance = 6371 * c  # Radius of earth in kilometers
+                
+                if distance <= max_distance_km:
+                    return True
+                    
+            except (ValueError, TypeError) as e:
+                logger.error(f"Error calculating distance for stop {stop.stop_code}: {e}")
+                continue    
+        return False   
+    except Exception as e:
+        logger.error(f"Error checking if bus is on route {route_id}: {e}")
+        return False
+
 def handle_client_data(payload, client_ip, serverTime,session=None):
     """Handle client data and send it to Kafka"""
     try:
@@ -949,9 +986,10 @@ def handle_client_data(payload, client_ip, serverTime,session=None):
             
             # Use the timestamp from the entity instead of current_time
             entity_timestamp = datetime.fromtimestamp(entity['timestamp'])
-            
+            stops = stop_tracker.get_route_stops(route_id)
             # Pass vehicle_id (deviceId) to track visited stops
             eta_data = stop_tracker.calculate_eta(
+                stops,
                 route_id, 
                 vehicle_lat, 
                 vehicle_lon, 
@@ -963,7 +1001,7 @@ def handle_client_data(payload, client_ip, serverTime,session=None):
                 entity['closest_stop'] = eta_data['closest_stop']
                 entity['distance_to_stop'] = eta_data['closest_stop']['distance']
                 entity['eta_list'] = eta_data['eta']
-                entity['calculation_method'] = eta_data['calculation_method']        
+                entity['calculation_method'] = eta_data['calculation_method']
         # Try to send to Kafka with retries
         max_retries = 3
         retries = 0
@@ -1019,8 +1057,12 @@ def handle_client_data(payload, client_ip, serverTime,session=None):
             
             try:
                 # Store vehicle data in hash
-                redis_client.hset(redis_key, vehicle_number, vehicle_data)
-                redis_client.expire(redis_key, 86400)  # Expire after 24 hours
+                if is_bus_on_route(stops, route_id, vehicle_lat, vehicle_lon):
+                    logger.info(f"Route ID: Bus vehicle {vehicle_number} is on route, {route_id}")
+                    redis_client.hset(redis_key, vehicle_number, vehicle_data)
+                    redis_client.expire(redis_key, 86400)  # Expire after 24 hours
+                else:
+                    logger.info(f"Bus {deviceId} is not on route {route_id}, skipping location update")
                 
                 # Store location in Redis Geo set
                 geo_key = "bus_locations"  # Single key for all bus locations
