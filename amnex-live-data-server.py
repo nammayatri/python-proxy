@@ -539,11 +539,17 @@ class SimpleCache:
         self.cache = {}
 
     def get(self, key: str):
-        return self.cache.get(key)
+        res = self.cache.get(key)
+        if res == None:
+            res_from_redis = redis_client.get(f"simpleCache:{key}")
+            parsed_res = json.loads(res_from_redis)
+            self.cache[key] = parsed_res
+            return parsed_res
+        return res
 
     def set(self, key: str, value):
         self.cache[key] = value
-
+        redis_client.set(f"simpleCache:{key}", json.dumps(value))
 # Create single cache instance
 cache = SimpleCache()
 
