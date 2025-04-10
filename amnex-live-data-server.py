@@ -318,7 +318,7 @@ class StopTracker:
         # Not in cache, calculate using routing API
         try:
             duration = None
-            return 0
+            # return 0
             if self.use_osrm:
                 # OSRM API
                 url = f"{self.osrm_url}/route/v1/driving/{origin_lon},{origin_lat};{dest_lon},{dest_lat}"
@@ -554,6 +554,8 @@ def get_route_for_device(device_id: str) -> Optional[str]:
     # Check cache first
     cached_route = cache.get(cache_key)
     if cached_route is not None:
+        if cached_route == "NOT_AVAILABLE":
+            return None
         return cached_route
 
     try:
@@ -564,7 +566,7 @@ def get_route_for_device(device_id: str) -> Optional[str]:
                 .first()
             
             if not fleet_mapping:
-                cache.set(cache_key, None)
+                cache.set(cache_key, "NOT_AVAILABLE")
                 return None
 
             # Then get the route for that fleet
@@ -572,7 +574,7 @@ def get_route_for_device(device_id: str) -> Optional[str]:
                 .filter(VehicleRouteMapping.vehicle_no == fleet_mapping.vehicle_no)\
                 .first()
             
-            route_id = route_mapping.route_id if route_mapping else None
+            route_id = route_mapping.route_id if route_mapping else "NOT_AVAILABLE"
             cache.set(cache_key, route_id)
             return route_id
 
@@ -1101,10 +1103,7 @@ def handle_connection(conn, addr):
                 
                 serverTime = datetime.now()
                 
-                threading.Thread(
-                    target=handle_client_data,
-                    args=(data_decoded, addr, serverTime)
-                ).start()
+                executor.submit(handle_client_data, data_decoded, addr, serverTime)
                 # Use the thread pool instead of creating a new thread for each message
                 # executor.submit(handle_client_data, data_decoded, addr, serverTime)
                 
