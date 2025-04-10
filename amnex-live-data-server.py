@@ -317,44 +317,7 @@ class StopTracker:
         
         # Not in cache, calculate using routing API
         try:
-            duration = None
-            # return 0
-            if self.use_osrm:
-                # OSRM API
-                url = f"{self.osrm_url}/route/v1/driving/{origin_lon},{origin_lat};{dest_lon},{dest_lat}"
-                response = requests.get(url, params={"overview": "false"}, timeout=5)
-                
-                if response.status_code == 200:
-                    data = response.json()
-                    if data["code"] == "Ok":
-                        duration = data["routes"][0]["duration"]  # seconds
-            else:
-                # Google Maps API
-                if self.google_api_key:
-                    url = "https://maps.googleapis.com/maps/api/directions/json"
-                    params = {
-                        "origin": f"{origin_lat},{origin_lon}",
-                        "destination": f"{dest_lat},{dest_lon}",
-                        "mode": "driving",
-                        "key": self.google_api_key
-                    }
-                    response = requests.get(url, params=params, timeout=5)
-                    
-                    if response.status_code == 200:
-                        data = response.json()
-                        if data["status"] == "OK":
-                            duration = data["routes"][0]["legs"][0]["duration"]["value"]  # seconds
-            
-            # If we got a duration, cache it
-            if duration:
-                # Store in Redis with TTL
-                cache_data = {
-                    'duration': duration,
-                    'timestamp': datetime.now().isoformat()
-                }
-                self.redis_client.setex(cache_key, self.cache_ttl, json.dumps(cache_data))
-                return duration
-                
+            duration = None    
             # Fallback to simple estimation (30 km/h)
             # Calculate distance using haversine
             lat1, lon1 = math.radians(origin_lat), math.radians(origin_lon)
@@ -542,9 +505,12 @@ class SimpleCache:
         res = self.cache.get(key)
         if res == None:
             res_from_redis = redis_client.get(f"simpleCache:{key}")
-            parsed_res = json.loads(res_from_redis)
-            self.cache[key] = parsed_res
-            return parsed_res
+            if res_from_redis:
+                parsed_res = json.loads(res_from_redis)
+                self.cache[key] = parsed_res
+                return parsed_res
+            else:
+                return None
         return res
 
     def set(self, key: str, value):
