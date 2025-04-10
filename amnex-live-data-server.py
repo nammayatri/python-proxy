@@ -618,6 +618,13 @@ def get_devices_for_route(route_id: str) -> List[str]:
 
 def get_fleet_info(device_id: str) -> dict:
     """Get both fleet number and route ID for a device"""
+    cache_key = f"fleetInfo:{device_id}"
+    
+    # Check cache first
+    fleet_info = cache.get(cache_key)
+    if fleet_info is not None:
+        return fleet_info
+
     try:
         with SessionLocal() as db:
             # Get fleet number for device
@@ -626,6 +633,7 @@ def get_fleet_info(device_id: str) -> dict:
                 .first()
             
             if not fleet_mapping:
+                cache.set(cache_key, {})
                 return {}
 
             # Get route for fleet
@@ -633,10 +641,12 @@ def get_fleet_info(device_id: str) -> dict:
                 .filter(VehicleRouteMapping.vehicle_no == fleet_mapping.vehicle_no)\
                 .first()
             
-            return {
+            val = {
                 'vehicle_no': fleet_mapping.vehicle_no,
                 'route_id': route_mapping.route_id if route_mapping else None
             }
+            cache.set(cache_key, val)
+            return val
 
     except Exception as e:
         print(f"Error querying fleet info for device {device_id}: {e}")
