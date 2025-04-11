@@ -86,6 +86,7 @@ WAYBILLS_DB_PASS = os.getenv('WAYBILLS_DB_PASS', 'postgres')
 WAYBILLS_DB_HOST = os.getenv('WAYBILLS_DB_HOST', 'localhost')
 WAYBILLS_DB_PORT = os.getenv('WAYBILLS_DB_PORT', '5432')
 WAYBILLS_DB_NAME = os.getenv('WAYBILLS_DB_NAME', 'waybills')
+INTEGRATED_BPP_CONFIG_ID = os.getenv('INTEGRATED_BPP_CONFIG_ID', '9a4d28f2-f564-4a29-bceb-7c5efdb4a524')
 
 # SQLAlchemy setup for main database
 DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
@@ -118,30 +119,12 @@ waybills_engine = create_engine(
 WaybillsSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=waybills_engine)
 WaybillsBase = declarative_base()
 
-# Pydantic model for type validation
-class RouteDeviceMapping(BaseModel):
-    id: int
-    route_id: str
-    device_id: str
-    created_at: datetime
-    updated_at: Optional[datetime]
-    is_active: bool
-
-    class Config:
-        from_attributes = True
-
 # Update the SQLAlchemy models
 class DeviceVehicleMapping(Base):
     __tablename__ = "device_vehicle_mapping"
     __table_args__ = {'schema': 'atlas_app'}
     vehicle_no = Column(Text, index=True)
     device_id = Column(Text, index=True, primary_key=True)
-
-class VehicleRouteMapping(Base):
-    __tablename__ = "vehicle_route_mapping"
-    __table_args__ = {'schema': 'atlas_app'}
-    vehicle_no = Column(Text, index=True, primary_key=True)
-    route_id = Column(Text, index=True)
 
 class RouteStopMapping(Base):
     __tablename__ = "route_stop_mapping"
@@ -151,6 +134,7 @@ class RouteStopMapping(Base):
     route_code = Column(Text, index=True)
     sequence_num = Column(Integer)
     stop_lat = Column(Text)
+    integrated_bpp_config_id = Column(Text)
     stop_lon = Column(Text)
     stop_name = Column(Text)
 
@@ -159,6 +143,7 @@ class Waybill(Base):
     __tablename__ = "waybills"
     waybill_id = Column(BigInteger, primary_key=True)
     schedule_id = Column(BigInteger)
+    schedule_trip_id = Column(BigInteger)
     deleted = Column(Boolean, nullable=False, default=False)
     schedule_no = Column(Text)
     schedule_trip_name = Column(Text)
@@ -177,7 +162,15 @@ class BusSchedule(Base):
     status = Column(Text)
     route_id = Column(BigInteger, nullable=False)
 
-def get_route_id_from_waybills(vehicle_no: str) -> Optional[str]:
+class BusScheduleTripDetail(Base):
+    __tablename__ = "bus_schedule_trip_detail"
+    
+    schedule_trip_detail_id = Column(BigInteger, primary_key=True)
+    schedule_trip_id = Column(BigInteger)
+    deleted = Column(Boolean, nullable=False, default=False)
+    route_number_id = Column(BigInteger, nullable=False)
+
+def get_route_id_from_waybills(vehicle_no: str, current_lat: float = None, current_lon: float = None) -> Optional[str]:
     """Get the route_id from waybills database for a given vehicle number"""
     try:
         with WaybillsSessionLocal() as db:
@@ -185,25 +178,57 @@ def get_route_id_from_waybills(vehicle_no: str) -> Optional[str]:
             waybill = db.query(Waybill)\
                 .filter(
                     Waybill.vehicle_no == vehicle_no,
-                    Waybill.deleted == False,
-                    Waybill.status != 'Closed'
+                    Waybill.deleted == False
+                    # Waybill.status != 'Closed'
                 )\
                 .order_by(Waybill.updated_at.desc())\
                 .first()
             
             if not waybill:
+                print(f"Route ID: Bus {vehicle_no} No active waybill")
                 return None
                 
-            # Then get the route_id from bus_schedule
-            schedule = db.query(BusSchedule)\
+            # Add current location to history if provided
+            if current_lat is not None and current_lon is not None:
+                store_vehicle_location_history(vehicle_no, current_lat, current_lon)
+            location_history = get_vehicle_location_history(vehicle_no)
+            if len(location_history) < 5:
+                print(f"Route ID: Bus {vehicle_no} Not enough location history {len(location_history)}")
+                return None
+
+            # Then get all possible routes from bus_schedule
+            schedules = db.query(BusScheduleTripDetail)\
                 .filter(
-                    BusSchedule.schedule_id == waybill.schedule_id,
-                    BusSchedule.deleted == False
+                    BusScheduleTripDetail.schedule_trip_id == waybill.schedule_trip_id,
+                    BusScheduleTripDetail.deleted == False
                 )\
-                .first()
+                .all()  # Execute the query to get results
+            print(f"Route ID: Bus scheudle len {len(schedules)}")
+            
+            if len(schedules) == 0:
+                print(f"Route ID: Bus {vehicle_no} No schedules found")
+                return None
+
+            best_route_id = None
+            best_score = 0.0
+            
+            for schedule in schedules:
+                route_stops = stop_tracker.get_route_stops(str(schedule.route_number_id))
+                if not route_stops:
+                    print(f"Route ID: Bus route_stops not found {schedule.route_number_id}")
+                    continue
+                    
+                # Calculate match score using location history
+                score = calculate_route_match_score(route_stops, location_history)
+                print(f"Route ID: Bus score {vehicle_no} Score for route {schedule.route_number_id}: {score}")
                 
-            if schedule:
-                return str(schedule.route_id)  # Convert to string to match existing format
+                if score > best_score:
+                    best_score = score
+                    best_route_id = str(schedule.route_number_id)
+            
+            # Only return a route if it has a good match score
+            if best_score >= 0.3:  # Adjust this threshold as needed
+                return best_route_id
                 
             return None
             
@@ -247,7 +272,7 @@ class StopTracker:
         try:
             with SessionLocal() as db:
                 stops = db.query(RouteStopMapping)\
-                    .filter(RouteStopMapping.route_code == route_id)\
+                    .filter(RouteStopMapping.route_code == route_id, RouteStopMapping.integrated_bpp_config_id == INTEGRATED_BPP_CONFIG_ID)\
                     .order_by(RouteStopMapping.sequence_num)\
                     .all()
                 
@@ -354,7 +379,7 @@ class StopTracker:
         # If we couldn't find the last visited stop in the list
         # (this shouldn't happen but just in case)
         return stops[0] if stops else None
-        
+    
     def find_closest_stop(self, stops, vehicle_lat, vehicle_lon):
         """Find the closest stop to the given coordinates"""
         if not stops:
@@ -395,7 +420,7 @@ class StopTracker:
         
         # Not in cache, calculate using routing API
         try:
-            duration = None    
+            duration = None
             # Fallback to simple estimation (30 km/h)
             # Calculate distance using haversine
             lat1, lon1 = math.radians(origin_lat), math.radians(origin_lon)
@@ -428,7 +453,7 @@ class StopTracker:
         # Get all stops for the route
         if not stops:
             return None
-        
+            
         visited_stops = []
         next_stop = None
         closest_stop = None
@@ -596,7 +621,7 @@ class SimpleCache:
 # Create single cache instance
 cache = SimpleCache()
 
-def get_fleet_info(device_id: str) -> dict:
+def get_fleet_info(device_id: str, current_lat: float = None, current_lon: float = None) -> dict:
     """Get both fleet number and route ID for a device"""
     cache_key = f"fleetInfo:{device_id}"
     
@@ -613,17 +638,17 @@ def get_fleet_info(device_id: str) -> dict:
                 .first()
             
             if not fleet_mapping:
-                redis_client.setex(cache_key, 600, json.dumps({}))
                 return {}
 
             # Get route for fleet
-            route_id = get_route_id_from_waybills(fleet_mapping.vehicle_no)
+            route_id = get_route_id_from_waybills(fleet_mapping.vehicle_no, current_lat, current_lon)
             logger.info(f"Route ID: {fleet_mapping.vehicle_no}, {route_id}")
             val = {
                 'vehicle_no': fleet_mapping.vehicle_no,
                 'route_id': route_id
             }
-            redis_client.setex(cache_key, 600, json.dumps(val))
+            if route_id:
+                redis_client.setex(cache_key, 600, json.dumps(val))
             return val
 
     except Exception as e:
@@ -969,6 +994,92 @@ def is_bus_on_route(stops, route_id: str, lat: float, lon: float, max_distance_k
         logger.error(f"Error checking if bus is on route {route_id}: {e}")
         return False
 
+def store_vehicle_location_history(device_id: str, lat: float, lon: float, max_points: int = 6):
+    """Store vehicle location history in Redis with TTL"""
+    try:
+        history_key = f"vehicle_history:{device_id}"
+        point = {
+            "lat": lat,
+            "lon": lon,
+            "timestamp": int(time.time())
+        }
+        
+        # Get existing history
+        history = redis_client.get(history_key)
+        if history:
+            points = json.loads(history)
+        else:
+            points = []
+            
+        # Add new point
+        points.append(point)
+        
+        # Keep only last max_points
+        if len(points) > max_points:
+            points = points[-max_points:]
+            
+        # Store updated history with 1 hour TTL
+        redis_client.setex(history_key, 3600, json.dumps(points))
+        
+    except Exception as e:
+        logger.error(f"Error storing vehicle history for {device_id}: {e}")
+
+def get_vehicle_location_history(device_id: str) -> List[dict]:
+    """Get vehicle location history from Redis"""
+    try:
+        history_key = f"vehicle_history:{device_id}"
+        history = redis_client.get(history_key)
+        if history:
+            return json.loads(history)
+        return []
+    except Exception as e:
+        logger.error(f"Error getting vehicle history for {device_id}: {e}")
+        return []
+
+def calculate_route_match_score(stops: List[dict], points: List[dict], max_distance_km: float = 1.0) -> float:
+    """
+    Calculate how well a route matches a series of points.
+    Returns a score between 0 and 1, where 1 is a perfect match.
+    """
+    if not points or not stops:
+        return 0.0
+        
+    total_score = 0.0
+    points_checked = 0
+    
+    for point in points:
+        min_distance = float('inf')
+        for stop in stops:
+            try:
+                stop_lat = float(stop["stop_lat"])
+                stop_lon = float(stop["stop_lon"])
+                
+                # Calculate distance using haversine formula
+                lat1, lon1 = math.radians(point["lat"]), math.radians(point["lon"])
+                lat2, lon2 = math.radians(stop_lat), math.radians(stop_lon)
+                
+                dlon = lon2 - lon1
+                dlat = lat2 - lat1
+                a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+                c = 2 * math.asin(math.sqrt(a))
+                distance = 6371 * c  # Radius of earth in kilometers
+                
+                min_distance = min(min_distance, distance)
+                
+            except (ValueError, TypeError) as e:
+                continue
+                
+        if min_distance != float('inf'):
+            # Convert distance to a score between 0 and 1
+            score = max(0, 1 - (min_distance / max_distance_km))
+            total_score += score
+            points_checked += 1
+            
+    if points_checked == 0:
+        return 0.0
+        
+    return total_score / points_checked
+
 def handle_client_data(payload, client_ip, serverTime,session=None):
     """Handle client data and send it to Kafka"""
     try:
@@ -977,16 +1088,20 @@ def handle_client_data(payload, client_ip, serverTime,session=None):
             return
             
         deviceId = entity.get("deviceId")
+        vehicle_lat = float(entity['lat'])
+        vehicle_lon = float(entity['long'])
+        
         # Get route information for this vehicle
-        fleet_info = get_fleet_info(deviceId)
+        fleet_info = get_fleet_info(deviceId, vehicle_lat, vehicle_lon)
         if fleet_info and 'route_id' in fleet_info and fleet_info["route_id"] != None:
             route_id = fleet_info['route_id']
-            vehicle_lat = float(entity['lat'])
-            vehicle_lon = float(entity['long'])
             
             # Use the timestamp from the entity instead of current_time
             entity_timestamp = datetime.fromtimestamp(entity['timestamp'])
+            
+            # Get route stops
             stops = stop_tracker.get_route_stops(route_id)
+            
             # Pass vehicle_id (deviceId) to track visited stops
             eta_data = stop_tracker.calculate_eta(
                 stops,
