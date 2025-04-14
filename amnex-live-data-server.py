@@ -245,6 +245,9 @@ USE_OSRM = os.getenv('USE_OSRM', 'true').lower() == 'true'
 OSRM_URL = os.getenv('OSRM_URL', 'http://router.project-osrm.org')
 GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY', '')
 ROUTE_CACHE_TTL = int(os.getenv('ROUTE_CACHE_TTL', '3600'))  # 1 hour default
+BUS_LOCATION_MAX_AGE = int(os.getenv('BUS_LOCATION_MAX_AGE', '120'))  # 2 minutes default
+BUS_CLEANUP_INTERVAL = int(os.getenv('BUS_CLEANUP_INTERVAL', '180'))  # 1 minute default
+CLEANUP_LOCK_TTL = 30  # 30 seconds lock TTL to prevent multiple cleanups
 
 class StopTracker:
     def __init__(self, db_engine, redis_client, use_osrm=USE_OSRM, 
@@ -1165,6 +1168,114 @@ def calculate_route_match_score(stops: List[dict], points: List[dict], max_dista
     
     return combined_score
 
+def clean_outdated_vehicle_mappings():
+    """
+    Remove outdated vehicle mappings from Redis for all routes.
+    Uses Redis lock to ensure only one instance runs cleanup at a time.
+    """
+    # Try to acquire lock
+    lock_key = "vehicle_mappings_cleanup_lock"
+    lock_acquired = redis_client.set(lock_key, "locked", nx=True, ex=CLEANUP_LOCK_TTL)
+    
+    if not lock_acquired:
+        logger.debug("Vehicle mappings cleanup already running in another pod/process")
+        return
+    
+    try:
+        current_time = int(time.time())
+        logger.info("Starting vehicle mappings cleanup")
+        
+        # Get all route keys
+        route_keys = []
+        for key in redis_client.scan_iter(match="route:*"):
+            route_keys.append(key)
+        
+        if not route_keys:
+            logger.debug("No route data found for cleanup")
+            return
+        
+        total_routes = len(route_keys)
+        total_vehicles_removed = 0
+        
+        for redis_key in route_keys:
+            try:
+                # Extract route_id from key
+                route_id = redis_key.split(":", 1)[1] if ":" in redis_key else "unknown"
+                
+                # Get all vehicles for this route
+                vehicle_data = redis_client.hgetall(redis_key)
+                if not vehicle_data:
+                    continue
+                
+                vehicles_to_remove = []
+                
+                # Check each vehicle's timestamp
+                for vehicle_id, data_json in vehicle_data.items():
+                    try:
+                        data = json.loads(data_json)
+                        # First check serverTime if available
+                        if 'serverTime' in data:
+                            timestamp = data.get('serverTime')
+                        # Otherwise use timestamp
+                        else:
+                            timestamp = data.get('timestamp')
+                        
+                        # If no valid timestamp, skip
+                        if not timestamp:
+                            continue
+                            
+                        age = current_time - int(timestamp)
+                        
+                        # If older than threshold, mark for removal
+                        if age > BUS_LOCATION_MAX_AGE:
+                            vehicles_to_remove.append(vehicle_id)
+                            logger.debug(f"Vehicle {vehicle_id} on route {route_id} outdated by {age}s, marking for removal")
+                    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+                        logger.error(f"Error parsing data for vehicle {vehicle_id}: {e}")
+                        # Mark invalid entries for removal
+                        vehicles_to_remove.append(vehicle_id)
+                
+                # Remove outdated vehicles
+                if vehicles_to_remove:
+                    redis_client.hdel(redis_key, *vehicles_to_remove)
+                    total_vehicles_removed += len(vehicles_to_remove)
+                    logger.info(f"Removed {len(vehicles_to_remove)} outdated vehicles from route {route_id}")
+            
+            except Exception as e:
+                logger.error(f"Error cleaning route {redis_key}: {e}")
+        
+        logger.info(f"Completed vehicle mappings cleanup: processed {total_routes} routes, removed {total_vehicles_removed} vehicles")
+    
+    except Exception as e:
+        logger.error(f"Error during vehicle mappings cleanup: {e}")
+    finally:
+        # Release the lock
+        try:
+            redis_client.delete(lock_key)
+        except:
+            pass
+
+def start_vehicle_cleanup_thread():
+    """Start a background thread for vehicle mapping cleanup"""
+    def cleanup_worker():
+        logger.info(f"Vehicle mappings cleanup thread started (interval: {BUS_CLEANUP_INTERVAL}s, max age: {BUS_LOCATION_MAX_AGE}s)")
+        
+        # Initial delay to allow server to fully start
+        time.sleep(30)
+        
+        while True:
+            try:
+                clean_outdated_vehicle_mappings()
+            except Exception as e:
+                logger.error(f"Error in vehicle cleanup worker: {e}")
+            
+            time.sleep(BUS_CLEANUP_INTERVAL)
+    
+    cleanup_thread = threading.Thread(target=cleanup_worker, daemon=True)
+    cleanup_thread.start()
+    
+    return cleanup_thread
+
 def handle_client_data(payload, client_ip, serverTime,session=None):
     """Handle client data and send it to Kafka"""
     try:
@@ -1252,7 +1363,8 @@ def handle_client_data(payload, client_ip, serverTime,session=None):
                 "timestamp": entity["timestamp"],
                 "speed": entity.get("speed", 0),
                 "device_id": deviceId,
-                "route_id": route_id
+                "route_id": route_id,
+                "serverTime": int(time.time())  # Add current server time
             })
             
             # Add ETA data if available
@@ -1414,6 +1526,9 @@ def main_server():
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # Avoid "Address already in use" error
         server.bind((HOST, PORT))
         server.listen(100)  # Increase backlog for more pending connections
+        
+        # Start the vehicle mappings cleanup thread
+        vehicle_cleanup_thread = start_vehicle_cleanup_thread()
         
         print(f"Listening for connections on {HOST}:{PORT}...")
         
