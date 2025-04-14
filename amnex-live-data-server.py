@@ -178,8 +178,8 @@ def get_route_id_from_waybills(vehicle_no: str, current_lat: float = None, curre
             waybill = db.query(Waybill)\
                 .filter(
                     Waybill.vehicle_no == vehicle_no,
-                    Waybill.deleted == False
-                    # Waybill.status != 'Closed'
+                    Waybill.deleted == False,
+                    Waybill.status == 'Online'
                 )\
                 .order_by(Waybill.updated_at.desc())\
                 .first()
@@ -448,13 +448,12 @@ class StopTracker:
             print(f"Error calculating travel duration: {e}")
             return None
     
-    def calculate_eta(self, stops, route_id, vehicle_lat, vehicle_lon, current_time, vehicle_id=None):
+    def calculate_eta(self, stops, route_id, vehicle_lat, vehicle_lon, current_time, vehicle_id=None, visited_stops=[]):
         """Calculate ETA for all upcoming stops from current position"""
         # Get all stops for the route
         if not stops:
             return None
             
-        visited_stops = []
         next_stop = None
         closest_stop = None
         distance = float('inf')
@@ -462,8 +461,6 @@ class StopTracker:
         
         # If we have a vehicle ID, use visited stops logic
         if vehicle_id:
-            visited_stops = self.get_visited_stops(route_id, vehicle_id)
-            
             # Check if the vehicle is at a stop now
             for stop in stops:
                 is_at_stop, stop_distance = self.check_if_at_stop(stop, vehicle_lat, vehicle_lon)
@@ -1038,13 +1035,48 @@ def get_vehicle_location_history(device_id: str) -> List[dict]:
 
 def calculate_route_match_score(stops: List[dict], points: List[dict], max_distance_km: float = 1.0) -> float:
     """
-    Calculate how well a route matches a series of points.
+    Calculate how well a route matches a series of points, considering direction.
     Returns a score between 0 and 1, where 1 is a perfect match.
     """
-    if not points or not stops:
+    if not points or not stops or len(points) < 2:
         return 0.0
         
-    total_score = 0.0
+    # Sort points by timestamp to ensure they're in chronological order
+    points = sorted(points, key=lambda x: x.get('timestamp', 0))
+    
+    # Check if any point is within max_distance_km of any stop
+    any_point_near_route = False
+    for point in points:
+        for stop in stops:
+            try:
+                stop_lat = float(stop["stop_lat"])
+                stop_lon = float(stop["stop_lon"])
+                
+                # Calculate distance using haversine formula
+                lat1, lon1 = math.radians(point["lat"]), math.radians(point["lon"])
+                lat2, lon2 = math.radians(stop_lat), math.radians(stop_lon)
+                
+                dlon = lon2 - lon1
+                dlat = lat2 - lat1
+                a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+                c = 2 * math.asin(math.sqrt(a))
+                distance = 6371 * c  # Radius of earth in kilometers
+                
+                if distance <= max_distance_km:
+                    any_point_near_route = True
+                    break
+            except (ValueError, TypeError):
+                continue
+        if any_point_near_route:
+            break
+    
+    # If no point is near the route, return 0 directly
+    if not any_point_near_route:
+        print(f"No points found within {max_distance_km}km of any stop - score: 0.0")
+        return 0.0
+    
+    # 1. Calculate basic proximity score (how close points are to any stop)
+    proximity_score = 0.0
     points_checked = 0
     
     for point in points:
@@ -1072,13 +1104,66 @@ def calculate_route_match_score(stops: List[dict], points: List[dict], max_dista
         if min_distance != float('inf'):
             # Convert distance to a score between 0 and 1
             score = max(0, 1 - (min_distance / max_distance_km))
-            total_score += score
+            proximity_score += score
             points_checked += 1
             
-    if points_checked == 0:
-        return 0.0
+    proximity_score = proximity_score / points_checked if points_checked > 0 else 0
+    
+    # 2. Calculate direction score (how well the movement follows the stop sequence)
+    
+    # Find closest stop for each point
+    point_to_nearest_stop = []
+    for point in points:
+        nearest_stop_idx = -1
+        min_distance = float('inf')
         
-    return total_score / points_checked
+        for i, stop in enumerate(stops):
+            try:
+                stop_lat = float(stop["stop_lat"])
+                stop_lon = float(stop["stop_lon"])
+                
+                # Calculate distance
+                lat1, lon1 = math.radians(point["lat"]), math.radians(point["lon"])
+                lat2, lon2 = math.radians(stop_lat), math.radians(stop_lon)
+                
+                dlon = lon2 - lon1
+                dlat = lat2 - lat1
+                a = math.sin(dlat/2)**2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon/2)**2
+                c = 2 * math.asin(math.sqrt(a))
+                distance = 6371 * c
+                
+                if distance < min_distance and distance <= max_distance_km:
+                    min_distance = distance
+                    nearest_stop_idx = i
+                    
+            except (ValueError, TypeError):
+                continue
+                
+        if nearest_stop_idx >= 0:
+            point_to_nearest_stop.append((point, nearest_stop_idx))
+    
+    # Calculate how well the movement follows the stop sequence
+    direction_score = 0.0
+    if len(point_to_nearest_stop) >= 2:
+        # Get sequence of matched stops
+        stop_sequence = [stop_idx for _, stop_idx in point_to_nearest_stop]
+        
+        # Count movements in the correct direction (increasing stop sequence)
+        correct_direction_moves = 0
+        for i in range(len(stop_sequence) - 1):
+            if stop_sequence[i+1] >= stop_sequence[i]:  # Moving forward in the route
+                correct_direction_moves += 1
+                
+        # Calculate direction score
+        if len(stop_sequence) > 1:
+            direction_score = correct_direction_moves / (len(stop_sequence) - 1)
+    
+    # 3. Combine scores (give more weight to direction)
+    combined_score = (proximity_score * 0.4) + (direction_score * 0.6)
+    
+    print(f"Direction score: {direction_score:.2f}, Proximity score: {proximity_score:.2f}, Combined: {combined_score:.2f}")
+    
+    return combined_score
 
 def handle_client_data(payload, client_ip, serverTime,session=None):
     """Handle client data and send it to Kafka"""
@@ -1103,13 +1188,18 @@ def handle_client_data(payload, client_ip, serverTime,session=None):
             stops = stop_tracker.get_route_stops(route_id)
             
             # Pass vehicle_id (deviceId) to track visited stops
+            if deviceId:
+                visited_stops = stop_tracker.get_visited_stops(route_id, deviceId)
+            else:
+                visited_stops = []
             eta_data = stop_tracker.calculate_eta(
                 stops,
                 route_id, 
                 vehicle_lat, 
                 vehicle_lon, 
                 entity_timestamp,
-                vehicle_id=deviceId
+                vehicle_id=deviceId,
+                visited_stops=visited_stops
             )
             
             if eta_data:
@@ -1117,6 +1207,7 @@ def handle_client_data(payload, client_ip, serverTime,session=None):
                 entity['distance_to_stop'] = eta_data['closest_stop']['distance']
                 entity['eta_list'] = eta_data['eta']
                 entity['calculation_method'] = eta_data['calculation_method']
+                entity['visited_stops'] = visited_stops
         # Try to send to Kafka with retries
         max_retries = 3
         retries = 0
@@ -1168,6 +1259,7 @@ def handle_client_data(payload, client_ip, serverTime,session=None):
             if 'eta_list' in entity:
                 vehicle_data_obj = json.loads(vehicle_data)
                 vehicle_data_obj['eta_data'] = entity['eta_list']
+                vehicle_data_obj['visited_stops'] = entity['visited_stops']
                 vehicle_data = json.dumps(vehicle_data_obj)
             
             try:
