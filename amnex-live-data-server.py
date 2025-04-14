@@ -645,7 +645,7 @@ def get_fleet_info(device_id: str, current_lat: float = None, current_lon: float
                 'route_id': route_id
             }
             if route_id:
-                redis_client.setex(cache_key, 600, json.dumps(val))
+                redis_client.setex(cache_key, 180, json.dumps(val))
             return val
 
     except Exception as e:
