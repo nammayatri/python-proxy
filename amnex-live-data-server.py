@@ -358,11 +358,18 @@ class StopTracker:
         
         return distance <= self.stop_visit_radius, distance
     
-    def find_next_stop(self, stops, visited_stops):
+    def find_next_stop(self, stops, visited_stops, vehicle_lat, vehicle_lon):
         """Find the next stop in sequence after the last visited stop"""
         if not visited_stops:
-            # If no stops visited yet, the next stop is the first in sequence
-            return stops[0] if stops else None
+            # If no stops visited yet, find the nearest stop as the next stop
+            nearest_stop = None
+            min_distance = float('inf')
+            for stop in stops:
+                distance, _ = self.check_if_at_stop(stop, vehicle_lat, vehicle_lon)
+                if distance < min_distance:
+                    min_distance = distance
+                    nearest_stop = stop
+            return nearest_stop
         
         # Get the last visited stop ID
         last_visited_id = visited_stops[-1]
@@ -479,7 +486,7 @@ class StopTracker:
                     break
                         
             # Find next stop based on visited stops
-            next_stop = self.find_next_stop(stops, visited_stops)
+            next_stop = self.find_next_stop(stops, visited_stops, vehicle_lat, vehicle_lon)
             
             if next_stop:
                 # Calculate distance to next stop
@@ -1320,6 +1327,7 @@ def handle_client_data(payload, client_ip, serverTime,session=None):
             forward_to_tcp(payload)
 
         if 'dataState' not in entity or entity.get('dataState') not in ['L', 'LP', 'LO'] or entity.get('provider') == 'chalo':
+            print(f"Skipping Chalo data")
             return
             
         deviceId = entity.get("deviceId")
@@ -1347,7 +1355,7 @@ def handle_client_data(payload, client_ip, serverTime,session=None):
                 route_id, 
                 vehicle_lat, 
                 vehicle_lon, 
-                entity_timestamp,
+                serverTime,
                 vehicle_id=deviceId,
                 visited_stops=visited_stops,
                 vehicle_no=fleet_info.get('vehicle_no', deviceId)
