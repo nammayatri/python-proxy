@@ -1284,8 +1284,42 @@ def start_vehicle_cleanup_thread():
 def handle_client_data(payload, client_ip, serverTime,session=None):
     """Handle client data and send it to Kafka"""
     try:
+         # Try to send to Kafka with retries
+        max_retries = 3
+        retries = 0
+        success = False
+
         entity = parse_payload(payload, client_ip, serverTime)
-        if not entity or entity.get('dataState') not in ['L', 'LP', 'LO']:
+
+        if not entity:
+            return
+
+        while retries < max_retries and not success:
+            try:
+                # For confluent_kafka.Producer, we need to provide the data as a string
+                producer.produce(KAFKA_TOPIC, json.dumps(entity).encode('utf-8'), callback=delivery_report)
+                producer.poll(0)  # Trigger any callbacks
+                success = True
+            except BufferError as e:
+                logger.error(f"Kafka buffer full, waiting before retry: {str(e)}")
+                # Wait for buffer space to free up
+                producer.poll(1)
+                retries += 1
+            except Exception as e:
+                logger.error(f"Failed to send to Kafka (attempt {retries+1}): {str(e)}")
+                retries += 1
+                time.sleep(1)
+        
+        # Flush to ensure delivery        
+        if success:
+            try:
+                producer.flush(timeout=5.0)
+            except Exception as e:
+                logger.error(f"Error flushing Kafka producer: {str(e)}")
+        if FORWARD_TCP:
+            forward_to_tcp(payload)
+
+        if 'dataState' not in entity or entity.get('dataState') not in ['L', 'LP', 'LO'] or entity.get('provider') == 'chalo':
             return
             
         deviceId = entity.get("deviceId")
@@ -1325,35 +1359,6 @@ def handle_client_data(payload, client_ip, serverTime,session=None):
                 entity['eta_list'] = eta_data['eta']
                 entity['calculation_method'] = eta_data['calculation_method']
                 entity['visited_stops'] = visited_stops
-        # Try to send to Kafka with retries
-        max_retries = 3
-        retries = 0
-        success = False
-        
-        while retries < max_retries and not success:
-            try:
-                # For confluent_kafka.Producer, we need to provide the data as a string
-                producer.produce(KAFKA_TOPIC, json.dumps(entity).encode('utf-8'), callback=delivery_report)
-                producer.poll(0)  # Trigger any callbacks
-                success = True
-            except BufferError as e:
-                logger.error(f"Kafka buffer full, waiting before retry: {str(e)}")
-                # Wait for buffer space to free up
-                producer.poll(1)
-                retries += 1
-            except Exception as e:
-                logger.error(f"Failed to send to Kafka (attempt {retries+1}): {str(e)}")
-                retries += 1
-                time.sleep(1)
-        
-        # Flush to ensure delivery        
-        if success:
-            try:
-                producer.flush(timeout=5.0)
-            except Exception as e:
-                logger.error(f"Error flushing Kafka producer: {str(e)}")
-        if FORWARD_TCP:
-            forward_to_tcp(payload)
         # Store in Redis
         if fleet_info and 'route_id' in fleet_info and fleet_info["route_id"] != None:
             route_id = fleet_info['route_id']
