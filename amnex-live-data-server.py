@@ -633,6 +633,7 @@ cache = SimpleCache()
 def get_fleet_info(device_id: str, current_lat: float = None, current_lon: float = None, timestamp: int = None) -> dict:
     """Get both fleet number and route ID for a device"""
     cache_key = f"fleetInfo:{device_id}"
+    cache_key_saved = cache_key + ":saved"
     
     # Check cache first
     fleet_info_str = redis_client.get(cache_key)
@@ -658,6 +659,15 @@ def get_fleet_info(device_id: str, current_lat: float = None, current_lon: float
                 'route_id': route_id
             }
             if route_id:
+                try:
+                    fleet_info_saved = redis_client.get(cache_key_saved)
+                    if fleet_info_saved is not None:
+                        fleet_info_saved = json.loads(fleet_info_saved)
+                        if 'route_id' in fleet_info_saved and route_id != fleet_info_saved['route_id']:
+                            clean_redis_key_for_route_info(fleet_info_saved['route_id'], "route:" + fleet_info_saved['route_id'])
+                except Exception as e:
+                    logger.error(f"Error cleaning redis key for route info: {e}")
+                redis_client.setex(cache_key_saved, BUS_LOCATION_MAX_AGE + BUS_CLEANUP_INTERVAL, json.dumps(val)) # hack for cleanup if route changes
                 redis_client.setex(cache_key, 180, json.dumps(val))
             return val
 
@@ -1180,6 +1190,46 @@ def calculate_route_match_score(stops: List[dict], points: List[dict], max_dista
     
     return combined_score
 
+def clean_redis_key_for_route_info(route_id, redis_key):
+    current_time = int(time.time())
+    vehicle_data = redis_client.hgetall(redis_key)
+    if not vehicle_data:
+        return
+    
+    vehicles_to_remove = []
+    
+    # Check each vehicle's timestamp
+    for vehicle_id, data_json in vehicle_data.items():
+        try:
+            data = json.loads(data_json)
+            # First check serverTime if available
+            if 'serverTime' in data:
+                timestamp = data.get('serverTime')
+            # Otherwise use timestamp
+            else:
+                timestamp = data.get('timestamp')
+            
+            # If no valid timestamp, skip
+            if not timestamp:
+                continue
+                
+            age = current_time - int(timestamp)
+            
+            # If older than threshold, mark for removal
+            if age > BUS_LOCATION_MAX_AGE:
+                vehicles_to_remove.append(vehicle_id)
+                logger.debug(f"Vehicle {vehicle_id} on route {route_id} outdated by {age}s, marking for removal")
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+            logger.error(f"Error parsing data for vehicle {vehicle_id}: {e}")
+            # Mark invalid entries for removal
+            vehicles_to_remove.append(vehicle_id)
+    
+    # Remove outdated vehicles
+    if vehicles_to_remove:
+        redis_client.hdel(redis_key, *vehicles_to_remove)
+        total_vehicles_removed += len(vehicles_to_remove)
+        logger.info(f"Removed {len(vehicles_to_remove)} outdated vehicles from route {route_id}")
+
 def clean_outdated_vehicle_mappings():
     """
     Remove outdated vehicle mappings from Redis for all routes.
@@ -1194,9 +1244,7 @@ def clean_outdated_vehicle_mappings():
         return
     
     try:
-        current_time = int(time.time())
         logger.info("Starting vehicle mappings cleanup")
-        
         # Get all route keys
         route_keys = []
         for key in redis_client.scan_iter(match="route:*"):
@@ -1213,45 +1261,8 @@ def clean_outdated_vehicle_mappings():
             try:
                 # Extract route_id from key
                 route_id = redis_key.split(":", 1)[1] if ":" in redis_key else "unknown"
-                
                 # Get all vehicles for this route
-                vehicle_data = redis_client.hgetall(redis_key)
-                if not vehicle_data:
-                    continue
-                
-                vehicles_to_remove = []
-                
-                # Check each vehicle's timestamp
-                for vehicle_id, data_json in vehicle_data.items():
-                    try:
-                        data = json.loads(data_json)
-                        # First check serverTime if available
-                        if 'serverTime' in data:
-                            timestamp = data.get('serverTime')
-                        # Otherwise use timestamp
-                        else:
-                            timestamp = data.get('timestamp')
-                        
-                        # If no valid timestamp, skip
-                        if not timestamp:
-                            continue
-                            
-                        age = current_time - int(timestamp)
-                        
-                        # If older than threshold, mark for removal
-                        if age > BUS_LOCATION_MAX_AGE:
-                            vehicles_to_remove.append(vehicle_id)
-                            logger.debug(f"Vehicle {vehicle_id} on route {route_id} outdated by {age}s, marking for removal")
-                    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
-                        logger.error(f"Error parsing data for vehicle {vehicle_id}: {e}")
-                        # Mark invalid entries for removal
-                        vehicles_to_remove.append(vehicle_id)
-                
-                # Remove outdated vehicles
-                if vehicles_to_remove:
-                    redis_client.hdel(redis_key, *vehicles_to_remove)
-                    total_vehicles_removed += len(vehicles_to_remove)
-                    logger.info(f"Removed {len(vehicles_to_remove)} outdated vehicles from route {route_id}")
+                clean_redis_key_for_route_info(route_id, redis_key)
             
             except Exception as e:
                 logger.error(f"Error cleaning route {redis_key}: {e}")
