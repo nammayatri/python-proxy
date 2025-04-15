@@ -189,8 +189,6 @@ def get_route_id_from_waybills(vehicle_no: str, current_lat: float = None, curre
                 return None
                 
             # Add current location to history if provided
-            if current_lat is not None and current_lon is not None:
-                store_vehicle_location_history(vehicle_no, current_lat, current_lon, timestamp)
             location_history = get_vehicle_location_history(vehicle_no)
             if len(location_history) < 5:
                 print(f"Route ID: Bus {vehicle_no} Not enough location history {len(location_history)}")
@@ -639,6 +637,8 @@ def get_fleet_info(device_id: str, current_lat: float = None, current_lon: float
     fleet_info_str = redis_client.get(cache_key)
     if fleet_info_str is not None:
         fleet_info = json.loads(fleet_info_str)
+        if current_lat is not None and current_lon is not None:
+            store_vehicle_location_history(fleet_info['vehicle_no'], current_lat, current_lon, timestamp)
         return fleet_info
     try:
         with SessionLocal() as db:
