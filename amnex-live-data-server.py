@@ -188,6 +188,8 @@ def get_route_id_from_waybills(vehicle_no: str, current_lat: float = None, curre
                 print(f"Route ID: Bus {vehicle_no} No active waybill")
                 return None
                 
+            if current_lat is not None and current_lon is not None:
+                store_vehicle_location_history(vehicle_no, current_lat, current_lon, timestamp)
             # Add current location to history if provided
             location_history = get_vehicle_location_history(vehicle_no)
             if len(location_history) < 5:
@@ -1337,8 +1339,8 @@ def handle_client_data(payload, client_ip, serverTime,session=None):
         if FORWARD_TCP:
             forward_to_tcp(payload)
 
-        if 'dataState' not in entity or entity.get('dataState') not in ['L', 'LP', 'LO']:
-            print(f"Skipping amnex data")
+        if 'dataState' not in entity or entity.get('dataState') not in ['L', 'LP', 'LO'] or entity.get('provider') == 'chalo':
+            print(f"Skipping chalo data")
             return
             
         deviceId = entity.get("deviceId")
