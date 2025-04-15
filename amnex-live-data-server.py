@@ -1326,8 +1326,8 @@ def handle_client_data(payload, client_ip, serverTime,session=None):
         if FORWARD_TCP:
             forward_to_tcp(payload)
 
-        if 'dataState' not in entity or entity.get('dataState') not in ['L', 'LP', 'LO'] or entity.get('provider') == 'chalo':
-            print(f"Skipping Chalo data")
+        if 'dataState' not in entity or entity.get('dataState') not in ['L', 'LP', 'LO'] or entity.get('provider') == 'amnex':
+            print(f"Skipping amnex data")
             return
             
         deviceId = entity.get("deviceId")
