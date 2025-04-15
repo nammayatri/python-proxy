@@ -170,7 +170,7 @@ class BusScheduleTripDetail(Base):
     deleted = Column(Boolean, nullable=False, default=False)
     route_number_id = Column(BigInteger, nullable=False)
 
-def get_route_id_from_waybills(vehicle_no: str, current_lat: float = None, current_lon: float = None, device_id: str = None) -> Optional[str]:
+def get_route_id_from_waybills(vehicle_no: str, current_lat: float = None, current_lon: float = None, timestamp: int = None) -> Optional[str]:
     """Get the route_id from waybills database for a given vehicle number"""
     try:
         with WaybillsSessionLocal() as db:
@@ -190,8 +190,8 @@ def get_route_id_from_waybills(vehicle_no: str, current_lat: float = None, curre
                 
             # Add current location to history if provided
             if current_lat is not None and current_lon is not None:
-                store_vehicle_location_history(device_id, current_lat, current_lon)
-            location_history = get_vehicle_location_history(device_id)
+                store_vehicle_location_history(vehicle_no, current_lat, current_lon, timestamp)
+            location_history = get_vehicle_location_history(vehicle_no)
             if len(location_history) < 5:
                 print(f"Route ID: Bus {vehicle_no} Not enough location history {len(location_history)}")
                 return None
@@ -203,11 +203,11 @@ def get_route_id_from_waybills(vehicle_no: str, current_lat: float = None, curre
                     BusScheduleTripDetail.deleted == False
                 )\
                 .all()  # Execute the query to get results
-            print(f"Route ID: Bus scheudle len {len(schedules)}")
             
             if len(schedules) == 0:
                 print(f"Route ID: Bus {vehicle_no} No schedules found")
                 return None
+            print(f"Route ID: Bus scheudle len {len(schedules)}")
 
             best_route_id = None
             best_score = 0.0
@@ -330,10 +330,10 @@ class StopTracker:
             logger.error(f"Error updating visited stops: {e}")
             return []
     
-    def reset_visited_stops(self, route_id, vehicle_id):
+    def reset_visited_stops(self, route_id, vehicle_id, vehicle_no):
         """Reset the visited stops list for a vehicle"""
         visit_key = f"visited_stops:{route_id}:{vehicle_id}"
-        history_key = f"vehicle_history:{vehicle_id}"
+        history_key = f"vehicle_history:{vehicle_no}"
         try:
             self.redis_client.delete(visit_key)
             self.redis_client.delete(history_key)
@@ -453,7 +453,7 @@ class StopTracker:
             print(f"Error calculating travel duration: {e}")
             return None
     
-    def calculate_eta(self, stops, route_id, vehicle_lat, vehicle_lon, current_time, vehicle_id=None, visited_stops=[]):
+    def calculate_eta(self, stops, route_id, vehicle_lat, vehicle_lon, current_time, vehicle_id=None, visited_stops=[], vehicle_no=None):
         """Calculate ETA for all upcoming stops from current position"""
         # Get all stops for the route
         if not stops:
@@ -488,7 +488,7 @@ class StopTracker:
                 calculation_method = "sequence_based"
             else:
                 # We're at the end of the route, reset visited stops
-                self.reset_visited_stops(route_id, vehicle_id)
+                self.reset_visited_stops(route_id, vehicle_id, vehicle_no)
                 # Fall back to closest stop method
                 closest_stop, distance = self.find_closest_stop(stops, vehicle_lat, vehicle_lon)
                 calculation_method = "distance_based_fallback"
@@ -623,7 +623,7 @@ class SimpleCache:
 # Create single cache instance
 cache = SimpleCache()
 
-def get_fleet_info(device_id: str, current_lat: float = None, current_lon: float = None) -> dict:
+def get_fleet_info(device_id: str, current_lat: float = None, current_lon: float = None, timestamp: int = None) -> dict:
     """Get both fleet number and route ID for a device"""
     cache_key = f"fleetInfo:{device_id}"
     
@@ -643,7 +643,7 @@ def get_fleet_info(device_id: str, current_lat: float = None, current_lon: float
                 return {}
 
             # Get route for fleet
-            route_id = get_route_id_from_waybills(fleet_mapping.vehicle_no, current_lat, current_lon, device_id)
+            route_id = get_route_id_from_waybills(fleet_mapping.vehicle_no, current_lat, current_lon, timestamp)
             logger.info(f"Route ID: {fleet_mapping.vehicle_no}, {route_id}")
             val = {
                 'vehicle_no': fleet_mapping.vehicle_no,
@@ -997,20 +997,20 @@ def is_bus_on_route(stops, route_id: str, lat: float, lon: float, max_distance_k
         logger.error(f"Error checking if bus is on route {route_id}: {e}")
         return False
 
-def store_vehicle_location_history(device_id: str, lat: float, lon: float, max_points: int = 6):
+def store_vehicle_location_history(device_id: str, lat: float, lon: float, timestamp: int, max_points: int = 6):
     """Store vehicle location history in Redis with TTL"""
     try:
         history_key = f"vehicle_history:{device_id}"
         point = {
             "lat": lat,
             "lon": lon,
-            "timestamp": int(time.time())
+            "timestamp": int(timestamp if timestamp else time.time())
         }
         
         # Get existing history
         history = redis_client.get(history_key)
         if history:
-            points = json.loads(history)
+            points = json.loads(history) or []
         else:
             points = []
             
@@ -1020,12 +1020,13 @@ def store_vehicle_location_history(device_id: str, lat: float, lon: float, max_p
         # Keep only last max_points
         if len(points) > max_points:
             points = points[-max_points:]
-            
+        
+        points.sort(key=lambda x: x['timestamp'])
         # Store updated history with 1 hour TTL
         redis_client.setex(history_key, 3600, json.dumps(points))
         
     except Exception as e:
-        logger.error(f"Error storing vehicle history for {device_id}: {e}")
+        logger.error(f"Error storing vehicle history for {device_id}: {e} - {history}")
 
 def get_vehicle_location_history(device_id: str) -> List[dict]:
     """Get vehicle location history from Redis"""
@@ -1033,7 +1034,7 @@ def get_vehicle_location_history(device_id: str) -> List[dict]:
         history_key = f"vehicle_history:{device_id}"
         history = redis_client.get(history_key)
         if history:
-            return json.loads(history)
+            return json.loads(history) or []
         return []
     except Exception as e:
         logger.error(f"Error getting vehicle history for {device_id}: {e}")
@@ -1292,7 +1293,7 @@ def handle_client_data(payload, client_ip, serverTime,session=None):
         vehicle_lon = float(entity['long'])
         
         # Get route information for this vehicle
-        fleet_info = get_fleet_info(deviceId, vehicle_lat, vehicle_lon)
+        fleet_info = get_fleet_info(deviceId, vehicle_lat, vehicle_lon, entity.get('timestamp'))
         if fleet_info and 'route_id' in fleet_info and fleet_info["route_id"] != None:
             route_id = fleet_info['route_id']
             
@@ -1314,7 +1315,8 @@ def handle_client_data(payload, client_ip, serverTime,session=None):
                 vehicle_lon, 
                 entity_timestamp,
                 vehicle_id=deviceId,
-                visited_stops=visited_stops
+                visited_stops=visited_stops,
+                vehicle_no=fleet_info.get('vehicle_no', deviceId)
             )
             
             if eta_data:
