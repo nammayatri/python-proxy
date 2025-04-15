@@ -1285,7 +1285,7 @@ def handle_client_data(payload, client_ip, serverTime,session=None):
     """Handle client data and send it to Kafka"""
     try:
         entity = parse_payload(payload, client_ip, serverTime)
-        if not entity:
+        if not entity or entity.get('dataState') not in ['L', 'LP', 'LO']:
             return
             
         deviceId = entity.get("deviceId")
