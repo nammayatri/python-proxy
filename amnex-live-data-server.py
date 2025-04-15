@@ -245,8 +245,8 @@ USE_OSRM = os.getenv('USE_OSRM', 'true').lower() == 'true'
 OSRM_URL = os.getenv('OSRM_URL', 'http://router.project-osrm.org')
 GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY', '')
 ROUTE_CACHE_TTL = int(os.getenv('ROUTE_CACHE_TTL', '3600'))  # 1 hour default
-BUS_LOCATION_MAX_AGE = int(os.getenv('BUS_LOCATION_MAX_AGE', '120'))  # 2 minutes default
-BUS_CLEANUP_INTERVAL = int(os.getenv('BUS_CLEANUP_INTERVAL', '180'))  # 1 minute default
+BUS_LOCATION_MAX_AGE = int(os.getenv('BUS_LOCATION_MAX_AGE', '1800'))  # 2 minutes default
+BUS_CLEANUP_INTERVAL = int(os.getenv('BUS_CLEANUP_INTERVAL', '180'))  # 3 minute default
 CLEANUP_LOCK_TTL = 30  # 30 seconds lock TTL to prevent multiple cleanups
 
 class StopTracker:
