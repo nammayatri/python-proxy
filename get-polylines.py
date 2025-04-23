@@ -16,21 +16,27 @@ import logging
 import itertools
 from functools import lru_cache
 import clickhouse_driver
+import time
+import socket
 
 # Set up logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 class RoutePolylineGenerator:
-    def __init__(self, date='2025-04-03', output_dir='route_polylines'):
+    def __init__(self, date='2025-04-03', output_dir='route_polylines', max_retries=3, retry_delay=5):
         """Initialize the route polyline generator.
         
         Args:
             date (str): The date for which to generate route polylines in YYYY-MM-DD format
             output_dir (str): Directory to save the output GeoJSON files
+            max_retries (int): Maximum number of retries for database operations
+            retry_delay (int): Delay in seconds between retries
         """
         self.date = date
         self.output_dir = output_dir
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay
         
         # Create output directory if it doesn't exist
         if not os.path.exists(output_dir):
@@ -60,7 +66,8 @@ class RoutePolylineGenerator:
             'port': 'your_clickhouse_port',
             'user': 'your_username',
             'password': 'your_password',
-            'database': 'atlas_kafka'
+            'database': 'atlas_kafka',
+            'connect_timeout': 10  # Add connection timeout
         }
         
         # ClickHouse client
@@ -73,19 +80,90 @@ class RoutePolylineGenerator:
         self._initialize_vehicle_route_mapping()
     
     def _initialize_clickhouse_client(self):
-        """Initialize ClickHouse client connection."""
-        try:
-            self.clickhouse_client = clickhouse_driver.Client(
-                host=self.clickhouse_conn_params['host'],
-                port=self.clickhouse_conn_params['port'],
-                user=self.clickhouse_conn_params['user'],
-                password=self.clickhouse_conn_params['password'],
-                database=self.clickhouse_conn_params['database']
-            )
-            logger.info("Successfully initialized ClickHouse client.")
-        except Exception as e:
-            logger.error(f"Error initializing ClickHouse client: {e}")
-            self.clickhouse_client = None
+        """Initialize ClickHouse client connection with retry mechanism."""
+        retry_count = 0
+        while retry_count < self.max_retries:
+            try:
+                self.clickhouse_client = clickhouse_driver.Client(
+                    host=self.clickhouse_conn_params['host'],
+                    port=self.clickhouse_conn_params['port'],
+                    user=self.clickhouse_conn_params['user'],
+                    password=self.clickhouse_conn_params['password'],
+                    database=self.clickhouse_conn_params['database'],
+                    connect_timeout=self.clickhouse_conn_params.get('connect_timeout', 10),
+                    send_receive_timeout=self.clickhouse_conn_params.get('send_receive_timeout', 30),
+                    sync_request_timeout=self.clickhouse_conn_params.get('sync_request_timeout', 30)
+                )
+                # Test the connection with a simple query
+                self.clickhouse_client.execute('SELECT 1')
+                logger.info("Successfully initialized and tested ClickHouse client connection.")
+                return
+            except Exception as e:
+                retry_count += 1
+                logger.warning(f"ClickHouse connection attempt {retry_count} failed: {str(e)}")
+                if retry_count < self.max_retries:
+                    logger.info(f"Retrying in {self.retry_delay} seconds...")
+                    time.sleep(self.retry_delay)
+                else:
+                    logger.error(f"Failed to initialize ClickHouse client after {self.max_retries} attempts.")
+                    self.clickhouse_client = None
+
+    def _reconnect_clickhouse(self):
+        """Reconnect to ClickHouse if the connection is lost."""
+        logger.info("Attempting to reconnect to ClickHouse...")
+        self._initialize_clickhouse_client()
+        return self.clickhouse_client is not None
+
+    def _execute_clickhouse_query(self, query, retries=None):
+        """Execute a ClickHouse query with retry mechanism.
+        
+        Args:
+            query (str): The query to execute
+            retries (int): Number of retries, defaults to self.max_retries
+            
+        Returns:
+            tuple: (data, columns) or (None, None) on failure
+        """
+        if retries is None:
+            retries = self.max_retries
+            
+        if not self.clickhouse_client:
+            if not self._reconnect_clickhouse():
+                logger.error("ClickHouse client not available and reconnection failed.")
+                return None, None
+        
+        retry_count = 0
+        while retry_count < retries:
+            try:
+                # Set a timeout for the query execution
+                result = self.clickhouse_client.execute(query, with_column_types=True)
+                return result
+            except (socket.timeout, socket.error, clickhouse_driver.errors.Error, EOFError) as e:
+                retry_count += 1
+                error_type = type(e).__name__
+                logger.warning(f"ClickHouse query failed with {error_type}: {str(e)}. Attempt {retry_count}/{retries}")
+                
+                # If EOF error or connection error, try to reconnect
+                if isinstance(e, EOFError) or "EOF" in str(e) or isinstance(e, socket.error):
+                    logger.info("Connection appears to be broken. Attempting to reconnect...")
+                    if not self._reconnect_clickhouse():
+                        logger.error("Reconnection failed.")
+                        if retry_count >= retries:
+                            break
+                
+                if retry_count < retries:
+                    # Exponential backoff
+                    wait_time = self.retry_delay * (2 ** (retry_count - 1))
+                    logger.info(f"Retrying in {wait_time} seconds...")
+                    time.sleep(wait_time)
+                else:
+                    logger.error(f"Query failed after {retries} attempts.")
+                    return None, None
+            except Exception as e:
+                logger.error(f"Unexpected error executing query: {str(e)}")
+                return None, None
+        
+        return None, None
 
     def _load_route_stops(self):
         """Load route stops from CSV file."""
@@ -154,22 +232,16 @@ class RoutePolylineGenerator:
         except Exception as e:
             logger.error(f"Error loading vehicle-route mapping: {e}")
 
-    def _get_gps_data_batch(self, all_device_ids):
-        """Get GPS data for all device IDs in a single query."""
-        if not all_device_ids:
-            logger.warning("No device IDs provided for GPS data retrieval.")
+    def _get_gps_data_batch(self):
+        """Get GPS data for all device IDs in a single query with batching to prevent huge queries."""
+        if not self.clickhouse_client and not self._reconnect_clickhouse():
+            logger.error("ClickHouse client not available and reconnection failed.")
             return pd.DataFrame()
             
-        if not self.clickhouse_client:
-            logger.error("ClickHouse client not initialized.")
-            return pd.DataFrame()
-            
-        logger.info(f"Fetching GPS data for {len(all_device_ids)} devices in a batch...")
+        # Process in smaller batches to avoid huge queries
+        all_results = []
+        
         try:
-            # Construct the query
-            device_ids_str = ", ".join(f"'{device_id}'" for device_id in all_device_ids if device_id)
-            
-            # Construct the query with a limit to avoid memory issues
             query = f"""
             SELECT 
                 `atlas_kafka`.`amnex_direct_data`.`lat` AS `lat`, 
@@ -180,24 +252,34 @@ class RoutePolylineGenerator:
             WHERE 
                 (`atlas_kafka`.`amnex_direct_data`.`timestamp` >= parseDateTimeBestEffort('{self.date} 00:00:00.000')) 
                 AND (`atlas_kafka`.`amnex_direct_data`.`timestamp` < parseDateTimeBestEffort('{self.date} 23:59:59.999'))
-                AND (`atlas_kafka`.`amnex_direct_data`.`deviceId` IN ({device_ids_str}))
             ORDER BY `device_id`, `timestamp`
             """
             
             # Execute query with ClickHouse client
-            result = self.clickhouse_client.execute(query, with_column_types=True)
+            data, columns = self._execute_clickhouse_query(query)
             
-            # Parse result data and column names
-            data, columns = result
-            column_names = [col[0] for col in columns]
-            
-            # Convert to DataFrame
-            df = pd.DataFrame(data, columns=column_names)
-            
-            logger.info(f"Retrieved {len(df)} GPS points for {len(all_device_ids)} devices.")
-            return df
+            if data and columns:
+                # Parse result data and column names
+                column_names = [col[0] for col in columns]
+                
+                # Convert to DataFrame
+                df = pd.DataFrame(data, columns=column_names)
+                all_results.append(df)
+                logger.info(f"Retrieved {len(df)} GPS points for batch {batch_idx+1}")
+            else:
+                logger.warning(f"No data returned for batch {batch_idx+1}")
         except Exception as e:
-            logger.error(f"Error fetching GPS data: {e}")
+            logger.error(f"Error processing batch {batch_idx+1}: {e}")
+    
+        if all_results:
+            # Combine all batch results
+            result_df = pd.concat(all_results, ignore_index=True)
+            logger.info(f"Total GPS points retrieved: {len(result_df)}")
+            for device_id, group in result_df.groupby('device_id'):
+                self.gps_data_cache[device_id] = group
+            return result_df
+        else:
+            logger.warning("No GPS data retrieved from any batch.")
             return pd.DataFrame()
 
     def _get_gps_data_for_devices(self, device_ids):
@@ -217,11 +299,7 @@ class RoutePolylineGenerator:
         
         if missing_devices:
             # Fetch data for missing devices
-            new_data = self._get_gps_data_batch(missing_devices)
-            
-            # Add to cache (individual device data)
-            for device_id, group in new_data.groupby('device_id'):
-                self.gps_data_cache[device_id] = group
+            logger.info(f"Fetching GPS data for {len(missing_devices)} devices...")
         
         # Combine cached data for requested devices
         result_data = pd.concat([self.gps_data_cache[d] for d in device_ids if d and d in self.gps_data_cache])
@@ -554,17 +632,24 @@ class RoutePolylineGenerator:
         logger.info("Starting generation of polylines for all routes...")
         
         # Get all unique device IDs for batch fetching
-        all_device_ids = set()
+        all_device_ids = []
         for devices in self.route_to_devices.values():
-            all_device_ids.update(devices)
+            all_device_ids.extend([d for d in devices if d])
+        
+        # Remove duplicates while preserving order
+        all_device_ids = list(dict.fromkeys(all_device_ids))
         
         # Fetch all GPS data at once
         logger.info(f"Prefetching GPS data for {len(all_device_ids)} devices across all routes...")
-        all_gps_data = self._get_gps_data_batch(list(all_device_ids))
+        all_gps_data = self._get_gps_data_batch()
         
         # Populate the cache
-        for device_id, group in all_gps_data.groupby('device_id'):
-            self.gps_data_cache[device_id] = group
+        if not all_gps_data.empty:
+            for device_id, group in all_gps_data.groupby('device_id'):
+                self.gps_data_cache[device_id] = group
+        else:
+            logger.error("Failed to retrieve GPS data. Check your ClickHouse connection and data availability.")
+            return
         
         route_ids = list(self.route_stops.keys())
         logger.info(f"Found {len(route_ids)} routes to process.")
