@@ -4,7 +4,6 @@ import numpy as np
 import json
 import polyline
 import sqlite3
-import psycopg2
 from sklearn.cluster import DBSCAN
 from datetime import datetime, timedelta
 from collections import defaultdict
@@ -56,14 +55,6 @@ class RoutePolylineGenerator:
         self.route_to_vehicles = defaultdict(list)
         
         # DB connection parameters - need to be set
-        self.postgres_conn_params = {
-            'dbname': 'your_postgres_db',
-            'user': 'your_username',
-            'password': 'your_password',
-            'host': 'your_host',
-            'port': 'your_port'
-        }
-        
         self.clickhouse_conn_params = {
             'host': 'your_clickhouse_host',
             'port': 'your_clickhouse_port',
@@ -80,7 +71,7 @@ class RoutePolylineGenerator:
         
         # Initialize vehicle and route mappings
         self._initialize_vehicle_route_mapping()
-
+    
     def _initialize_clickhouse_client(self):
         """Initialize ClickHouse client connection."""
         try:
@@ -136,38 +127,21 @@ class RoutePolylineGenerator:
             return {}
 
     def _initialize_vehicle_route_mapping(self):
-        """Fetch vehicle to route mapping once and create lookup tables."""
-        logger.info(f"Initializing vehicle-route mapping for date {self.date}...")
+        """Load vehicle to route mapping from CSV file."""
+        logger.info(f"Loading vehicle-route mapping from CSV...")
         try:
-            conn = psycopg2.connect(**self.postgres_conn_params)
-            cursor = conn.cursor()
+            df = pd.read_csv('vehicle_route_mapping.csv')
             
-            query = """
-            SELECT 
-                "public"."waybills"."waybill_id" AS "waybill_id", 
-                "public"."waybills"."vehicle_no" AS "vehicle_no", 
-                "public"."waybills"."schedule_trip_id" AS "schedule_trip_id", 
-                "Bus Schedule Trip Detail - Schedule Trip"."route_number_id" AS "route_id"
-            FROM "public"."waybills" 
-            INNER JOIN "public"."bus_schedule_trip_detail" AS "Bus Schedule Trip Detail - Schedule Trip" 
-                ON "public"."waybills"."schedule_trip_id" = "Bus Schedule Trip Detail - Schedule Trip"."schedule_trip_id"
-            WHERE 
-                ("public"."waybills"."duty_date" = %s) 
-                AND ("public"."waybills"."deleted" = FALSE)
-            """
-            
-            cursor.execute(query, (self.date,))
-            result = cursor.fetchall()
+            # Filter by date if needed
+            # if 'date' column exists in the CSV, uncomment the line below
+            # df = df[df['date'] == self.date]
             
             # Create mappings
-            for row in result:
-                vehicle_no = row[1]
-                route_id = row[3]
+            for _, row in df.iterrows():
+                vehicle_no = row['vehicle_no']
+                route_id = row['route_id']
                 self.vehicle_route_map[vehicle_no] = route_id
                 self.route_to_vehicles[route_id].append(vehicle_no)
-                
-            cursor.close()
-            conn.close()
             
             logger.info(f"Found {len(self.vehicle_route_map)} vehicle-route mappings for {len(self.route_to_vehicles)} routes.")
             
@@ -178,7 +152,7 @@ class RoutePolylineGenerator:
                 self.route_to_devices[route_id] = [d for d in device_ids if d]
                 
         except Exception as e:
-            logger.error(f"Error initializing vehicle-route mapping: {e}")
+            logger.error(f"Error loading vehicle-route mapping: {e}")
 
     def _get_gps_data_batch(self, all_device_ids):
         """Get GPS data for all device IDs in a single query."""
