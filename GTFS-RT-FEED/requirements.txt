@@ -1,0 +1,6 @@
+fastapi==0.109.2
+uvicorn==0.27.1
+redis==5.0.1
+gtfs-realtime-bindings==1.0.0
+protobuf==4.25.3
+python-dotenv==1.0.1 
