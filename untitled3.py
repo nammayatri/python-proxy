@@ -10,209 +10,20 @@ Original file is located at
 # prompt: write code to read json files vehicle_route_mapping.csv, route-stop-mapping.csv, vehicle_device_mapping.csv
 
 import pandas as pd
+from multiprocessing import Pool, cpu_count
+import concurrent.futures
+import multiprocessing as mp
 
-# Assuming the files are in the current working directory.
-# If not, provide the full path to the files.
+# Make sure date is defined globally
 
-try:
-  # Import necessary libraries for PostgreSQL connection
-  import psycopg2
-  from psycopg2 import sql
-  import io
-  
-  # PostgreSQL connection parameters - you'll need to replace these with your actual credentials
-  pg_params = {
-      'dbname': 'your_database',
-      'user': 'your_username',
-      'password': 'your_password',
-      'host': 'your_host',
-      'port': 'your_port'
-  }
-  
-  try:
-      # Connect to PostgreSQL
-      conn = psycopg2.connect(**pg_params)
-      cursor = conn.cursor()
-      date = "2025-04-22"
-      # Execute the query to get vehicle_route_mapping data
-      query = f"""
-      SELECT
-        "public"."waybills"."waybill_id" AS "waybill_id",
-        "public"."waybills"."vehicle_no" AS "vehicle_no",
-        "public"."waybills"."schedule_trip_id" AS "schedule_trip_id",
-        "Bus Schedule Trip Detail - Schedule Trip"."route_number_id" AS "route_id"
-      FROM
-        "public"."waybills"
-        INNER JOIN "public"."bus_schedule_trip_detail" AS "Bus Schedule Trip Detail - Schedule Trip" 
-        ON "public"."waybills"."schedule_trip_id" = "Bus Schedule Trip Detail - Schedule Trip"."schedule_trip_id"
-      WHERE
-        ("public"."waybills"."duty_date" = '{date}')
-        AND ("public"."waybills"."deleted" = FALSE)
-      ORDER BY
-        "public"."waybills"."vehicle_no" DESC
-      """
-      
-      # Create a StringIO object to store the CSV data
-      csv_data = io.StringIO()
-      
-      # Execute the query and fetch the results
-      cursor.execute(query)
-      
-      # Write header to the StringIO object
-      header = ['waybill_id', 'vehicle_no', 'schedule_trip_id', 'route_id']
-      csv_data.write(','.join(header) + '\n')
-      
-      # Write data rows to the StringIO object
-      for row in cursor.fetchall():
-          csv_data.write(','.join(str(item) for item in row) + '\n')
-      
-      # Reset the position to the beginning of the StringIO object
-      csv_data.seek(0)
-      
-      # Close the cursor and connection
-      cursor.close()
-      conn.close()
-      
-      # Read the CSV data into a pandas DataFrame
-      vehicle_route_mapping = pd.read_csv(csv_data)
-      
-  except (Exception, psycopg2.Error) as error:
-      print(f"Error connecting to PostgreSQL database: {error}")
-      # If there's an error with the PostgreSQL connection, fall back to reading from CSV file
-      print("Falling back to reading from CSV file...")
-  # vehicle_route_mapping = pd.read_csv("vehicle_route_mapping-22-april.csv")
-  route_stop_mapping = pd.read_csv("route-stop-mapping.csv")
-  vehicle_device_mapping = pd.read_csv("vehicle_device_mapping.csv")
-
-  print("vehicle_route_mapping:")
-  print(vehicle_route_mapping.head())  # Print the first few rows for verification
-
-  print("\nroute_stop_mapping:")
-  print(route_stop_mapping.head())
-
-  print("\nvehicle_device_mapping:")
-  print(vehicle_device_mapping.head())
-
-except FileNotFoundError:
-  print("One or more of the specified files were not found. Please ensure the files exist in the correct directory.")
-except pd.errors.ParserError:
-  print("Error parsing the CSV file. Please check the file format.")
-except Exception as e:
-    print(f"An unexpected error occurred: {e}")
-
-print(vehicle_device_mapping.shape, route_stop_mapping.shape, vehicle_route_mapping.shape)
-
-vehicle_route_mapping.dropna(inplace=True)
-route_stop_mapping.dropna(subset=["Stop ID"], inplace=True)
-vehicle_device_mapping.dropna(inplace=True)
-
-print(vehicle_device_mapping.shape, route_stop_mapping.shape, vehicle_route_mapping.shape)
-
-route_stop_mapping
-
-# prompt: # prompt: create a dictionary using these 3 files for mapping a device_id to a dictionary of route_id having corresponding stop lat longs
-
-# Assuming the files are in the current working directory.
-# If not, provide the full path to the files.
-
-try:
-  device_id_to_route_stops = {}
-  for index, row in vehicle_device_mapping.iterrows():
-    device_id = str(int(row['device_id']))
-    vehicle_id = row['vehicle_no']
-
-    route_ids = vehicle_route_mapping[vehicle_route_mapping['vehicle_no'] == vehicle_id]['route_id']
-
-    for route_id in route_ids:
-      if pd.notna(route_id):  # Check for NaN values in route_id
-        # Sort stops by sequence
-        route_stops = route_stop_mapping[route_stop_mapping['Route ID'] == route_id].sort_values(by='Sequence')
-        stop_lat_longs = []
-        for index2, row2 in route_stops.iterrows():
-          stop_lat = row2['LAT']
-          stop_long = row2['LON']
-          seq = row2['Sequence']
-          stop_lat_longs.append({'lat': stop_lat, 'long': stop_long, 'seq': seq})
-
-        if device_id not in device_id_to_route_stops:
-          device_id_to_route_stops[device_id] = {}
-        device_id_to_route_stops[device_id][route_id] = stop_lat_longs
-
-except FileNotFoundError:
-  print("One or more of the specified files were not found. Please ensure the files exist in the correct directory.")
-except pd.errors.ParserError:
-  print("Error parsing the CSV file. Please check the file format.")
-except KeyError as e:
-  print(f"A required column is missing: {e}")
-except Exception as e:
-  print(f"An unexpected error occurred: {e}")
-
-location_csv_file = date + "-location.csv"
-
-query = f"""
-            SELECT
-                `atlas_kafka`.`amnex_direct_data`.`lat` AS `lat`,
-                `atlas_kafka`.`amnex_direct_data`.`timestamp` AS `timestamp`,
-                `atlas_kafka`.`amnex_direct_data`.`long` AS `long`,
-                `atlas_kafka`.`amnex_direct_data`.`deviceId` AS `device_id`
-            FROM `atlas_kafka`.`amnex_direct_data`
-            WHERE
-                (`atlas_kafka`.`amnex_direct_data`.`timestamp` >= parseDateTimeBestEffort('{date} 00:00:00.000'))
-                AND (`atlas_kafka`.`amnex_direct_data`.`timestamp` < parseDateTimeBestEffort('{date} 23:59:59.999'))
-            ORDER BY `device_id`, `timestamp`
-            """
-
-import clickhouse_driver
-
-clickhouse_conn_params = {
-    'host': 'host',
-    'port': '9000',
-    'user': 'juspay_rw',
-    'password': 'pass',
-    'database': 'atlas_kafka'
-}
-clickhouse_client = clickhouse_driver.Client(
-    host=clickhouse_conn_params['host'],
-    port=clickhouse_conn_params['port'],
-    user=clickhouse_conn_params['user'],
-    password=clickhouse_conn_params['password'],
-    database=clickhouse_conn_params['database'],
-    connect_timeout=clickhouse_conn_params.get('connect_timeout', 10),
-    send_receive_timeout=clickhouse_conn_params.get('send_receive_timeout', 30),
-    sync_request_timeout=clickhouse_conn_params.get('sync_request_timeout', 30)
-)
-
-# prompt: given a clickhouse_client, create pd dataframe with the query above
-import os
-if os.path.exists(location_csv_file):
-    print(f"Loading data from existing file: {location_csv_file}")
-    df = pd.read_csv(location_csv_file)
-else:
-    print(f"File {location_csv_file} not found. Querying database...")
-
-    df = pd.DataFrame(clickhouse_client.execute(query))
-    df.columns = ['lat', 'timestamp', 'long', 'device_id']
-    print(df.head()) 
-    df.to_csv(location_csv_file)
-print("====== locationShape: ", df.shape)
-
-# Convert the timestamp field to datetime objects
-df['timestamp'] = pd.to_datetime(df['timestamp'])
-
-# Convert the datetime objects to strings in the desired format
-df['timestamp'] = df['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
-print(df.head())
-d = df.groupby('device_id')
-# prompt: convert the timestamp field in df to time strings
 
 from geopy.distance import geodesic
 import numpy as np
 import json
 
-def match_trail_to_routes(location_trail, routes_dict, processed_routes, threshold_distance=0.15):
+def match_trail_to_routes(location_trail, routes_dict, processed_routes, threshold_distance=0.2):
     # Results dictionary
     matched_routes = {}
-    print("points: ", len(location_trail))
     # Sort route stops by sequence number for each route
     sorted_routes = {}
     for route_id, stops in routes_dict.items():
@@ -246,7 +57,6 @@ def match_trail_to_routes(location_trail, routes_dict, processed_routes, thresho
         for start_idx in potential_starts:
             current_trail_idx = start_idx
             matched_stops = [0]  # Start with first stop matched
-            last_matched_stop_idx = 0
 
             # Try to match subsequent stops
             for stop_idx in range(1, len(stops)):
@@ -279,7 +89,6 @@ def match_trail_to_routes(location_trail, routes_dict, processed_routes, thresho
                 if dist_sum < 3 and best_distance < threshold_distance:
                     matched_stops.append(stop_idx)
                     current_trail_idx = best_trail_idx
-                    last_matched_stop_idx = stop_idx
                 else:
                     # Stop not found, break the search
                     break
@@ -303,31 +112,14 @@ def match_trail_to_routes(location_trail, routes_dict, processed_routes, thresho
 
         if best_match:
             matched_routes[route_id] = best_match
-            print(route_id, json.dumps(best_match))
+            print("Done with:", route_id)
 
     return matched_routes
-
-# prompt: from tqdm import tqdm
-# value = []
-# total_matched = 0
-# total_devices = len(d)
-# for i, (dId, group) in tqdm(enumerate(d), total=total_devices, desc="Processing devices"):
-#   if dId in device_id_to_route_stops.keys():
-#     print(dId)
-#     if True: #dId == '860548042892270':
-#       res = match_trail_to_routes(group.to_dict('records'), device_id_to_route_stops[dId])
-#       if res:
-#         value.append(res)
-#         total_matched += 1
-#       print("========= total_matched ============", total_matched)
-#       # break
-# add threading for this loop and put the output to a file, and on restart start from the last iteration by getting from the file what all is done, also use file to have atomic behaviour, append the result in a file instead of this variable
 
 import pandas as pd
 from geopy.distance import geodesic
 import numpy as np
 import json
-import threading
 import os
 from tqdm import tqdm
 
@@ -348,9 +140,28 @@ def process_device(dId, group, device_id_to_route_stops, output_file, processed_
     except Exception as e:
         print(f"Error processing device {dId}: {e}")
 
+def process_chunk(args):
+    chunk_id, device_chunk, device_id_to_route_stops, output_file, processed_devices_file, processed_routes, date = args
+    for dId, group_records in device_chunk:
+        try:
+            if dId in device_id_to_route_stops.keys():
+                print(dId)
+                # group_records is already a list of dictionaries, no need to call to_dict()
+                res = match_trail_to_routes(group_records, device_id_to_route_stops[dId], processed_routes)
+                if res:
+                    with open(output_file + date + str(chunk_id), 'a') as f:
+                        json.dump({dId: res}, f)
+                        f.write('\n')
+            with open(processed_devices_file + date + str(chunk_id), 'a') as f:
+                f.write(f"{dId}\n")
+        except Exception as e:
+            print(f"Error processing device {dId} in chunk {chunk_id}: {e}")
+    return f"Chunk {chunk_id} completed"
 
 # Main processing function
-def process_devices(d, device_id_to_route_stops, output_file="output-new-22-april.json", processed_devices_file="processed_devices-new-22-april.txt", processed_routes_file="routes_done", num_threads=10):
+def process_devices(d, device_id_to_route_stops, output_file="output-new-16-april.json", processed_devices_file="processed_devices-new-16-april.txt", processed_routes_file="routes_done", num_threads=100):
+    # Get date from global scope
+    global date
 
     # Load already processed devices
     processed_devices = set()
@@ -366,33 +177,260 @@ def process_devices(d, device_id_to_route_stops, output_file="output-new-22-apri
             for line in f:
                 processed_routes.add(line.strip())
     
-
-    total_devices = len(d)
     devices_to_process = []
     for i, (dId, group) in enumerate(d):
       if dId not in processed_devices:
-        devices_to_process.append((dId, group))
+        # Convert DataFrame group to list of dictionaries for better serialization
+        devices_to_process.append((dId, group.to_dict('records')))
 
-    with tqdm(total=len(devices_to_process), desc="Processing devices") as pbar:
-      threads = []
-      count = 0
-      for dId, group in devices_to_process:
-          count += 1
-          fileInx = str(count % num_threads)
-          # process_device(dId, group, device_id_to_route_stops, output_file, processed_devices_file, processed_routes)
-          thread = threading.Thread(target=process_device, args=(dId, group, device_id_to_route_stops, output_file + fileInx, processed_devices_file + fileInx, processed_routes, fileInx))
-          threads.append(thread)
-          thread.start()
-          pbar.update(1)
-          # Limit the number of active threads
-          while threading.active_count() > num_threads:
-              pass
-      # Wait for all threads to finish
-      for thread in threads:
-          thread.join()
+    
+    # Prepare arguments for multiprocessing
+    # Determine optimal number of processes based on CPU count
+    num_processes = min(num_threads, cpu_count())
+    print(f"Using {num_processes} processes for parallel processing")
+    
+    # Create output files for each process
+    for i in range(num_processes):
+        open(output_file + date + str(i), 'w').close()
+        open(processed_devices_file + date + str(i), 'w').close()
+    
+    # Distribute devices evenly across processes - manually split the list
+    # Calculate chunk size for even distribution
+    total_devices = len(devices_to_process)
+    chunk_size = total_devices // num_processes
+    remainder = total_devices % num_processes
+    
+    chunks = []
+    start_idx = 0
+    for i in range(num_processes):
+        # Add one extra item to early chunks if there's a remainder
+        extra = 1 if i < remainder else 0
+        end_idx = start_idx + chunk_size + extra
+        chunks.append(devices_to_process[start_idx:end_idx])
+        start_idx = end_idx
+    
 
-# ... (Rest of your existing code) ...
+    # Add a loading indicator to show progress
+    from tqdm import tqdm
+    
+    with mp.Pool(processes=num_processes) as pool:
+        chunk_args = [(i, chunk, device_id_to_route_stops, output_file, processed_devices_file, processed_routes, date) for i, chunk in enumerate(chunks)]
+        # Use imap to process chunks and show progress with tqdm
+        results = []
+        for result in tqdm(pool.imap(process_chunk, chunk_args), 
+                          total=len(chunk_args), 
+                          desc="Processing device chunks"):
+            results.append(result)
+            
+    print(f"All {len(results)} chunks processed successfully")
 
-# Call the function to process the data
-process_devices(d, device_id_to_route_stops)
 
+
+date = "2025-04-16"
+
+if __name__ == "__main__":
+  # Set the multiprocessing start method to 'spawn' for better cross-platform compatibility
+  try:
+    mp.set_start_method('spawn', force=True)
+  except RuntimeError:
+    # Method already set
+    pass
+
+  # Assuming the files are in the current working directory.
+  # If not, provide the full path to the files.
+  try:
+    # Import necessary libraries for PostgreSQL connection
+    import psycopg2
+    from psycopg2 import sql
+    import io
+    
+    # PostgreSQL connection parameters - you'll need to replace these with your actual credentials
+    pg_params = {
+        'dbname': 'your_database',
+        'user': 'your_username',
+        'password': 'your_password',
+        'host': 'your_host',
+        'port': 'your_port'
+    }
+    
+    try:
+        # Connect to PostgreSQL
+        conn = psycopg2.connect(**pg_params)
+        cursor = conn.cursor()
+        date = "2025-04-22"
+        # Execute the query to get vehicle_route_mapping data
+        query = f"""
+        SELECT
+          "public"."waybills"."waybill_id" AS "waybill_id",
+          "public"."waybills"."vehicle_no" AS "vehicle_no",
+          "public"."waybills"."schedule_trip_id" AS "schedule_trip_id",
+          "Bus Schedule Trip Detail - Schedule Trip"."route_number_id" AS "route_id"
+        FROM
+          "public"."waybills"
+          INNER JOIN "public"."bus_schedule_trip_detail" AS "Bus Schedule Trip Detail - Schedule Trip" 
+          ON "public"."waybills"."schedule_trip_id" = "Bus Schedule Trip Detail - Schedule Trip"."schedule_trip_id"
+        WHERE
+          ("public"."waybills"."duty_date" = '{date}')
+          AND ("public"."waybills"."deleted" = FALSE)
+        ORDER BY
+          "public"."waybills"."vehicle_no" DESC
+        """
+        
+        # Create a StringIO object to store the CSV data
+        csv_data = io.StringIO()
+        
+        # Execute the query and fetch the results
+        cursor.execute(query)
+        
+        # Write header to the StringIO object
+        header = ['waybill_id', 'vehicle_no', 'schedule_trip_id', 'route_id']
+        csv_data.write(','.join(header) + '\n')
+        
+        # Write data rows to the StringIO object
+        for row in cursor.fetchall():
+            csv_data.write(','.join(str(item) for item in row) + '\n')
+        
+        # Reset the position to the beginning of the StringIO object
+        csv_data.seek(0)
+        
+        # Close the cursor and connection
+        cursor.close()
+        conn.close()
+        
+        # Read the CSV data into a pandas DataFrame
+        vehicle_route_mapping = pd.read_csv(csv_data)
+        
+    except (Exception, psycopg2.Error) as error:
+        print(f"Error connecting to PostgreSQL database: {error}")
+        # If there's an error with the PostgreSQL connection, fall back to reading from CSV file
+        print("Falling back to reading from CSV file...")
+    # vehicle_route_mapping = pd.read_csv("vehicle_route_mapping-16-april.csv")
+    route_stop_mapping = pd.read_csv("route-stop-mapping.csv")
+    vehicle_device_mapping = pd.read_csv("vehicle_device_mapping.csv")
+
+    print("vehicle_route_mapping:")
+    print(vehicle_route_mapping.head())  # Print the first few rows for verification
+
+    print("\nroute_stop_mapping:")
+    print(route_stop_mapping.head())
+
+    print("\nvehicle_device_mapping:")
+    print(vehicle_device_mapping.head())
+
+  except FileNotFoundError:
+    print("One or more of the specified files were not found. Please ensure the files exist in the correct directory.")
+  except pd.errors.ParserError:
+    print("Error parsing the CSV file. Please check the file format.")
+  except Exception as e:
+      print(f"An unexpected error occurred: {e}")
+
+  print(vehicle_device_mapping.shape, route_stop_mapping.shape, vehicle_route_mapping.shape)
+
+  vehicle_route_mapping.dropna(inplace=True)
+  route_stop_mapping.dropna(subset=["Stop ID"], inplace=True)
+  vehicle_device_mapping.dropna(inplace=True)
+
+  print(vehicle_device_mapping.shape, route_stop_mapping.shape, vehicle_route_mapping.shape)
+
+  # prompt: # prompt: create a dictionary using these 3 files for mapping a device_id to a dictionary of route_id having corresponding stop lat longs
+
+  # Assuming the files are in the current working directory.
+  # If not, provide the full path to the files.
+
+  try:
+    device_id_to_route_stops = {}
+    for index, row in vehicle_device_mapping.iterrows():
+      device_id = str(int(row['device_id']))
+      vehicle_id = row['vehicle_no']
+
+      route_ids = vehicle_route_mapping[vehicle_route_mapping['vehicle_no'] == vehicle_id]['route_id']
+
+      for route_id in route_ids:
+        if pd.notna(route_id):  # Check for NaN values in route_id
+          # Sort stops by sequence
+          route_stops = route_stop_mapping[route_stop_mapping['Route ID'] == route_id].sort_values(by='Sequence')
+          stop_lat_longs = []
+          for index2, row2 in route_stops.iterrows():
+            stop_lat = row2['LAT']
+            stop_long = row2['LON']
+            seq = row2['Sequence']
+            stop_lat_longs.append({'lat': stop_lat, 'long': stop_long, 'seq': seq})
+
+          if device_id not in device_id_to_route_stops:
+            device_id_to_route_stops[device_id] = {}
+          device_id_to_route_stops[device_id][route_id] = stop_lat_longs
+
+  except FileNotFoundError:
+    print("One or more of the specified files were not found. Please ensure the files exist in the correct directory.")
+  except pd.errors.ParserError:
+    print("Error parsing the CSV file. Please check the file format.")
+  except KeyError as e:
+    print(f"A required column is missing: {e}")
+  except Exception as e:
+    print(f"An unexpected error occurred: {e}")
+
+  location_csv_file = date + "-location.csv"
+
+  query = f"""
+              SELECT
+                  `atlas_kafka`.`amnex_direct_data`.`lat` AS `lat`,
+                  `atlas_kafka`.`amnex_direct_data`.`timestamp` AS `timestamp`,
+                  `atlas_kafka`.`amnex_direct_data`.`long` AS `long`,
+                  `atlas_kafka`.`amnex_direct_data`.`deviceId` AS `device_id`
+              FROM `atlas_kafka`.`amnex_direct_data`
+              WHERE
+                  (`atlas_kafka`.`amnex_direct_data`.`timestamp` >= parseDateTimeBestEffort('{date} 00:00:00.000'))
+                  AND (`atlas_kafka`.`amnex_direct_data`.`timestamp` < parseDateTimeBestEffort('{date} 23:59:59.999'))
+              ORDER BY `device_id`, `timestamp`
+              """
+
+  # prompt: given a clickhouse_client, create pd dataframe with the query above
+  import os
+  if os.path.exists(location_csv_file):
+      print(f"Loading data from existing file: {location_csv_file}")
+      df = pd.read_csv(location_csv_file)
+      # The CSV likely has an index column added by pandas when it was saved
+      # Only keep the actual data columns we need
+      if len(df.columns) == 5:  # If there are 5 columns (includes index)
+          df = df.iloc[:, 1:5]  # Take columns 1-4 (skipping the first one which is likely the index)
+      # Ensure column names are set correctly
+      df.columns = ['lat', 'timestamp', 'long', 'device_id']
+  else:
+      import clickhouse_driver
+
+      clickhouse_conn_params = {
+          'host': 'host',
+          'port': '9000',
+          'user': 'juspay_rw',
+          'password': 'pass',
+          'database': 'atlas_kafka'
+      }
+      clickhouse_client = clickhouse_driver.Client(
+          host=clickhouse_conn_params['host'],
+          port=clickhouse_conn_params['port'],
+          user=clickhouse_conn_params['user'],
+          password=clickhouse_conn_params['password'],
+          database=clickhouse_conn_params['database'],
+          connect_timeout=clickhouse_conn_params.get('connect_timeout', 10),
+          send_receive_timeout=clickhouse_conn_params.get('send_receive_timeout', 30),
+          sync_request_timeout=clickhouse_conn_params.get('sync_request_timeout', 30)
+      )
+      print(f"File {location_csv_file} not found. Querying database...")
+
+      df = pd.DataFrame(clickhouse_client.execute(query))
+      df.columns = ['lat', 'timestamp', 'long', 'device_id']
+      print(df.head()) 
+      df.to_csv(location_csv_file, index=False)  # Save without index column
+  print("====== locationShape: ", df.shape)
+
+  # # Convert the timestamp field to datetime objects
+  # df['timestamp'] = pd.to_datetime(df['timestamp'])
+
+  # # Convert the datetime objects to strings in the desired format
+  # df['timestamp'] = df['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
+  print(df.head())
+  d = df.groupby('device_id')
+  # prompt: convert the timestamp field in df to time strings
+
+  # Call the function to process the data at the end of the if __name__ == "__main__" block
+  process_devices(d, device_id_to_route_stops)
