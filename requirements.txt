@@ -27,6 +27,6 @@ soupsieve==2.6
 SQLAlchemy==2.0.39
 typing_extensions==4.12.2
 urllib3==2.2.3
-Werkzeug==3.0.4
+Werkzeug==3.0.6
 zope.interface==7.0.3
 polyline==2.0.2
