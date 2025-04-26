@@ -1437,7 +1437,7 @@ def calculate_route_match_score(route_id, vehicle_no, stops: dict, vehicle_point
             return 0.0
     except Exception as e:
         error_details = traceback.format_exc()
-        logger.error(f"Error calculating route match score: {e}\nTraceback: {error_details}")
+        logger.error(f"Error calculating route match score: {stops} {e}\nTraceback: {error_details}")
         return 0.0
 
 def handle_client_data(payload, client_ip, serverTime,session=None):
