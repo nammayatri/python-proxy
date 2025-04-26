@@ -86,7 +86,7 @@ WAYBILLS_DB_PASS = os.getenv('WAYBILLS_DB_PASS', 'postgres')
 WAYBILLS_DB_HOST = os.getenv('WAYBILLS_DB_HOST', 'localhost')
 WAYBILLS_DB_PORT = os.getenv('WAYBILLS_DB_PORT', '5432')
 WAYBILLS_DB_NAME = os.getenv('WAYBILLS_DB_NAME', 'waybills')
-INTEGRATED_BPP_CONFIG_ID = os.getenv('INTEGRATED_BPP_CONFIG_ID', '9a4d28f2-f564-4a29-bceb-7c5efdb4a524')
+INTEGRATED_BPP_CONFIG_ID = os.getenv('INTEGRATED_BPP_CONFIG_ID_HD', 'b0454b15-9755-470d-a16a-71e87695e003')
 
 # SQLAlchemy setup for main database
 DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
@@ -227,10 +227,12 @@ def get_route_id_from_waybills(vehicle_no: str, current_lat: float = None, curre
                     print(f"Route ID: Bus route_stops polyline not found {schedule.route_number_id}")
                     
                 # Calculate match score using location history
-                (score, is_in_direction) = calculate_route_match_score(route_stops, location_history)
+                score = calculate_route_match_score(schedule.route_number_id, vehicle_no, route_stops, location_history)
+                # Ensure score is not None
+                if score is None:
+                    score = 0.0
                 print(f"Route ID: Bus score {vehicle_no} Score for route {schedule.route_number_id}: {score}")
-                
-                if score > best_score and is_in_direction == 1.0:
+                if score > best_score:
                     best_score = score
                     best_route_id = str(schedule.route_number_id)
             
@@ -254,7 +256,7 @@ USE_OSRM = os.getenv('USE_OSRM', 'true').lower() == 'true'
 OSRM_URL = os.getenv('OSRM_URL', 'http://router.project-osrm.org')
 GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY', '')
 ROUTE_CACHE_TTL = int(os.getenv('ROUTE_CACHE_TTL', '3600'))  # 1 hour default
-BUS_LOCATION_MAX_AGE = int(os.getenv('BUS_LOCATION_MAX_AGE', '1800'))  # 2 minutes default
+BUS_LOCATION_MAX_AGE = int(os.getenv('BUS_LOCATION_MAX_AGE', '120'))  # 2 minutes default
 BUS_CLEANUP_INTERVAL = int(os.getenv('BUS_CLEANUP_INTERVAL', '180'))  # 3 minute default
 CLEANUP_LOCK_TTL = 30  # 30 seconds lock TTL to prevent multiple cleanups
 
@@ -621,9 +623,9 @@ class StopTracker:
                     
         # Find next stop based on visited stops
         (next_stop, distance) = self.find_next_stop(stops, visited_stops, vehicle_lat, vehicle_lon)
-        if not distance:
-            _, distance = self.check_if_at_stop(next_stop, vehicle_lat, vehicle_lon)
         if next_stop:
+            if not distance:
+                _, distance = self.check_if_at_stop(next_stop, vehicle_lat, vehicle_lon)
             closest_stop = next_stop
             calculation_method = "sequence_based"
         else:
@@ -789,9 +791,12 @@ def get_fleet_info(device_id: str, current_lat: float = None, current_lon: float
                 if fleet_info_saved is not None:
                     fleet_info_saved = json.loads(fleet_info_saved)
                     print("going to delete route info")
-                    if 'route_id' in fleet_info_saved and route_id != fleet_info_saved['route_id']:
-                        print("going to delete route info", fleet_info_saved['route_id'])
-                        clean_redis_key_for_route_info(fleet_info_saved['route_id'], "route:" + fleet_info_saved['route_id'])
+                    if ('route_id' in fleet_info_saved and 
+                        fleet_info_saved['route_id'] is not None and 
+                        route_id != fleet_info_saved['route_id']):
+                        print(f"going to delete route info: {fleet_info_saved['route_id']}")
+                        route_key = "route:" + fleet_info_saved['route_id']
+                        clean_redis_key_for_route_info(fleet_info_saved['route_id'], route_key)
             except Exception as e:
                 logger.error(f"Error cleaning redis key for route info: {e}")
             redis_client.setex(cache_key_saved, BUS_LOCATION_MAX_AGE + BUS_CLEANUP_INTERVAL, json.dumps(val)) # hack for cleanup if route changes
@@ -1133,15 +1138,17 @@ def calculate_distance(lat1, lon1, lat2, lon2):
     
     return c * r
 
-def is_point_near_polyline(point_lat, point_lon, polyline_points, max_distance_meter=100):
+def is_point_near_polyline(point_lat, point_lon, polyline_points, max_distance_meter=50):
     """
     Simpler function to check if a point is within max_distance_meter of any 
     segment of the polyline.
     """
     if not polyline_points or len(polyline_points) < 2:
-        return False, float('inf')
+        return False, float('inf'), None
         
     min_distance = float('inf')
+    
+    min_segment = None
     
     # Check each segment of the polyline
     for i in range(len(polyline_points) - 1):
@@ -1191,73 +1198,12 @@ def is_point_near_polyline(point_lat, point_lon, polyline_points, max_distance_m
             
         # Update minimum distance
         if distance < min_distance:
+            min_segment = i
             min_distance = distance
             
     # Check if within threshold (convert meters to kilometers)
     max_distance_km = max_distance_meter / 1000
-    return min_distance <= max_distance_km, min_distance
-
-def analyze_route_direction(polyline_points, near_points, max_distance_meter=100):
-    """
-    Analyze if vehicle is moving in the same direction as the route polyline.
-    Returns a direction score between 0 and 1.
-    """
-    if not polyline_points:
-        return 0.0
-    
-    # If fewer than 2 points are near the polyline, can't determine direction
-    if len(near_points) < 2:
-        return 0.0
-    
-    # For each near point, find the closest polyline segment
-    point_to_segment = []
-    for point in near_points:
-        # Check if point is already a tuple (backward compatibility)
-        if isinstance(point, tuple) and len(point) == 2:
-            # Already a tuple with (point, distance), extract the point
-            point_data = point[0]
-        else:
-            # Just a point dictionary
-            point_data = point
-            
-        closest_segment = 0
-        min_distance = float('inf')
-        
-        for i in range(len(polyline_points) - 1):
-            # Simple distance check to segment
-            p1_lat, p1_lon = polyline_points[i]
-            p2_lat, p2_lon = polyline_points[i + 1]
-            
-            # Simple midpoint check (approximation)
-            mid_lat = (p1_lat + p2_lat) / 2
-            mid_lon = (p1_lon + p2_lon) / 2
-            
-            try:
-                dist = calculate_distance(point_data['lat'], point_data['lon'], mid_lat, mid_lon)
-                
-                if dist < min_distance:
-                    min_distance = dist
-                    closest_segment = i
-            except (KeyError, TypeError) as e:
-                # Skip points with missing coordinates
-                logger.debug(f"Error calculating distance in route direction analysis: {e}, point: {point_data}")
-                continue
-        
-        point_to_segment.append((point_data, closest_segment))
-    
-    # Check if points are moving forward along the polyline
-    is_forward = True
-    
-    # Use only the last 3 points (or fewer if not available)
-    recent_points = point_to_segment[-min(3, len(point_to_segment)):]
-    
-    # Check if they're in increasing segment order
-    for i in range(len(recent_points) - 1):
-        if recent_points[i+1][1] < recent_points[i][1]:
-            is_forward = False
-            break
-    
-    return 1.0 if is_forward else 0.0
+    return min_distance <= max_distance_km, min_distance, min_segment
 
 def store_vehicle_location_history(device_id: str, lat: float, lon: float, timestamp: int, max_points: int = 25):
     """Store vehicle location history in Redis with TTL"""
@@ -1276,9 +1222,10 @@ def store_vehicle_location_history(device_id: str, lat: float, lon: float, times
             points = json.loads(history) or []
         else:
             points = []
-        lastPoint = points[-1]
-        if calculate_distance(lastPoint['lat'], lastPoint['lon'], point['lat'], point['lon']) < 0.002:
-            return
+        if len(points) > 0:
+            lastPoint = points[-1]
+            if calculate_distance(lastPoint['lat'], lastPoint['lon'], point['lat'], point['lon']) < 0.002:
+                return
             
         # Add new point
         points.append(point)
@@ -1316,6 +1263,7 @@ def clean_redis_key_for_route_info(route_id, redis_key):
         return
     
     vehicles_to_remove = []
+    removed_count = 0
     
     # Check each vehicle's timestamp
     for vehicle_id, data_json in vehicle_data.items():
@@ -1333,6 +1281,7 @@ def clean_redis_key_for_route_info(route_id, redis_key):
                 continue
                 
             age = current_time - int(timestamp)
+            print("Error age", vehicle_id, route_id,age, current_time, int(timestamp), current_time - int(timestamp))
             
             # If older than threshold, mark for removal
             if age > BUS_LOCATION_MAX_AGE:
@@ -1346,8 +1295,10 @@ def clean_redis_key_for_route_info(route_id, redis_key):
     # Remove outdated vehicles
     if vehicles_to_remove:
         redis_client.hdel(redis_key, *vehicles_to_remove)
-        total_vehicles_removed += len(vehicles_to_remove)
-        logger.info(f"Removed {len(vehicles_to_remove)} outdated vehicles from route {route_id}")
+        removed_count = len(vehicles_to_remove)
+        logger.info(f"Removed {removed_count} outdated vehicles from route {route_id}")
+    
+    return removed_count
 
 def clean_outdated_vehicle_mappings():
     """
@@ -1365,10 +1316,20 @@ def clean_outdated_vehicle_mappings():
     try:
         logger.info("Starting vehicle mappings cleanup")
         # Get all route keys
+        # Use a more robust approach to get all keys matching the pattern
         route_keys = []
-        for key in redis_client.scan_iter(match="route:*"):
-            route_keys.append(key)
+        cursor = 0
+        max_iterations = 100
+        iteration_count = 0
         
+        while iteration_count < max_iterations:
+            cursor, keys = redis_client.scan(cursor, match="route:*", count=1000)
+            route_keys.extend(keys)
+            iteration_count += 1
+            if cursor == 0:
+                break
+                
+        logger.debug(f"Found {len(route_keys)} route keys for cleanup after {iteration_count} iterations")
         if not route_keys:
             logger.debug("No route data found for cleanup")
             return
@@ -1381,7 +1342,9 @@ def clean_outdated_vehicle_mappings():
                 # Extract route_id from key
                 route_id = redis_key.split(":", 1)[1] if ":" in redis_key else "unknown"
                 # Get all vehicles for this route
-                clean_redis_key_for_route_info(route_id, redis_key)
+                removed = clean_redis_key_for_route_info(route_id, redis_key)
+                if removed:
+                    total_vehicles_removed += removed
             
             except Exception as e:
                 logger.error(f"Error cleaning route {redis_key}: {e}")
@@ -1418,41 +1381,43 @@ def start_vehicle_cleanup_thread():
     
     return cleanup_thread
 
-def calculate_route_match_score(stops: dict, points: List[dict], max_distance_meter: float = 100) -> float:
+def calculate_route_match_score(route_id, vehicle_no, stops: dict, vehicle_points: List[dict], max_distance_meter: float = 100) -> float:
     """
-    Calculate how well a route matches a series of points, considering direction.
+    Calculate how well a route matches a series of vehicle_points, considering direction.
     Uses polyline for more accurate route matching when available.
     Returns a score between 0 and 1, where 1 is a perfect match.
     """
     try:
         # Check if stops is a dict with polyline and stops keys
-        if isinstance(stops, dict) and 'stops' in stops:
+        if isinstance(stops, dict) and 'stops' in stops and 'polyline' in stops:
             route_polyline = stops.get('polyline')
             polyline_points = decode_polyline(route_polyline)
             min_points_required = 4
         else:
-            polyline_points = map(lambda x: (x['stop_lat'], x['stop_lon']), stops)
+            route_polyline = ""
+            polyline_points = list(map(lambda x: (x['stop_lat'], x['stop_lon']), stops))
             min_points_required = 10
 
-        if not points or len(points) < min_points_required:
-            return 0.0, 0.0
+        if not vehicle_points or len(vehicle_points) < min_points_required:
+            return 0.0
 
-        # Sort points by timestamp to ensure they're in chronological order
-        points = sorted(points, key=lambda x: x.get('timestamp', 0))
-    
+        # Sort vehicle_points by timestamp to ensure they're in chronological order
+        vehicle_points = sorted(vehicle_points, key=lambda x: x.get('timestamp', 0))
+        print("Route ID: VERIFY_LOCALLY_WITH_THIS", vehicle_no, route_id, "polyline: ", route_polyline, "vehicle_points: ", json.dumps(vehicle_points), "polyline_points: ", json.dumps(polyline_points))
         if polyline_points:
-            # Count how many points are near the polyline
+            # Count how many vehicle_points are near the polyline
             near_points = []
             total_distance = 0.0
             
-            max_distance_km = max_distance_meter / 1000
-            
-            for point in points:
+            min_segments_list = []
+            for point in vehicle_points:
                 try:
-                    is_near, distance = is_point_near_polyline(
+                    is_near, distance, min_segment_start = is_point_near_polyline(
                         point['lat'], point['lon'], polyline_points, max_distance_meter
                     )
                     if is_near:
+                        if min_segment_start is not None:
+                            min_segments_list.append(min_segment_start)
                         near_points.append(point)
                         total_distance += distance
                 except (KeyError, ValueError, TypeError) as e:
@@ -1460,27 +1425,20 @@ def calculate_route_match_score(stops: dict, points: List[dict], max_distance_me
                     continue
             
             # Calculate proximity score (0-1)
-            proximity_ratio = len(near_points) / len(points) if len(points) > 0 else 0
+            proximity_ratio = len(near_points) / len(vehicle_points) if len(vehicle_points) > 0 else 0
             
-            # Only proceed if enough points are near the polyline
+            # Only proceed if enough vehicle_points are near the polyline
+            print(f"Route ID: {vehicle_no} {route_id} route match check ", min_segments_list, proximity_ratio)
             if proximity_ratio >= 0.3:
-                avg_distance = total_distance / len(near_points) if len(near_points) > 0 else float('inf')
-                proximity_score = 1.0 - min(1.0, avg_distance / max_distance_km)
-                
-                # Check if moving in the same direction as the route
-                direction_score = analyze_route_direction(polyline_points, near_points, max_distance_meter)
-                
-                # Combine scores with weights
-                combined_score = proximity_score * direction_score
-                
-                print(f"Polyline match - Points near: {len(near_points)}/{len(points)}, Avg distance: {avg_distance:.3f}km, Direction: {direction_score:.1f}, Score: {combined_score:.2f}")
-                
-                return combined_score, direction_score
-        return 0.0, 0.0
+                # Convert set to list and sort to check direction
+                if len(min_segments_list) >= 2 and min(min_segments_list) == min_segments_list[0]:
+                    print(f"Route ID: {vehicle_no} {len(near_points)}/{len(vehicle_points)}, Score: {proximity_ratio:.2f}")
+                    return proximity_ratio
+            return 0.0
     except Exception as e:
         error_details = traceback.format_exc()
         logger.error(f"Error calculating route match score: {e}\nTraceback: {error_details}")
-        return 0.0, 0.0
+        return 0.0
 
 def handle_client_data(payload, client_ip, serverTime,session=None):
     """Handle client data and send it to Kafka"""
