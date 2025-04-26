@@ -37,3 +37,4 @@ urllib3==2.2.3
 Werkzeug==3.0.4
 zope.interface==7.0.1
 polyline==2.0.2
+geopy==2.4.1
