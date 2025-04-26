@@ -518,11 +518,8 @@ class StopTracker:
         if dist_to_prev < threshold_meters or dist_to_curr < threshold_meters:
             return True
         
-        # 2. Second check: Is the stop between the prev and current locations?
-        # Calculate the total distance of the path
         path_distance = geodesic(prev_location, current_location).meters
         
-        # If the vehicle hasn't moved significantly, it didn't cross the stop
         if path_distance < 5:  # 5 meters threshold for significant movement
             return False
         
@@ -566,8 +563,8 @@ class StopTracker:
             """Calculate the absolute difference between two angles in degrees."""
             return min(abs(a - b), 360 - abs(a - b))
         
-        alignment_prev_to_stop = angle_diff(bearing_prev_to_curr, bearing_prev_to_stop) < 45
-        alignment_stop_to_curr = angle_diff(bearing_prev_to_curr, bearing_stop_to_curr) < 45
+        alignment_prev_to_stop = angle_diff(bearing_prev_to_curr, bearing_prev_to_stop) < 60
+        alignment_stop_to_curr = angle_diff(bearing_prev_to_curr, bearing_stop_to_curr) < 60
         
         # 4. Combine all checks:
         # - The stop should be roughly on the path
