@@ -12,12 +12,11 @@ from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import QueuePool
-from pydantic import BaseModel
 from typing import Optional, List
-import requests
 from concurrent.futures import ThreadPoolExecutor
 import math
 import traceback
+from geopy.distance import geodesic
 import logging
 import atexit
 
@@ -225,14 +224,13 @@ def get_route_id_from_waybills(vehicle_no: str, current_lat: float = None, curre
             for schedule in schedules:
                 route_stops = stop_tracker.get_route_stops(str(schedule.route_number_id))
                 if 'polyline' not in route_stops or ('polyline' in route_stops and route_stops['polyline'] is None):
-                    print(f"Route ID: Bus route_stops not found {schedule.route_number_id}")
-                    continue
+                    print(f"Route ID: Bus route_stops polyline not found {schedule.route_number_id}")
                     
                 # Calculate match score using location history
-                score = calculate_route_match_score(route_stops, location_history)
+                (score, is_in_direction) = calculate_route_match_score(route_stops, location_history)
                 print(f"Route ID: Bus score {vehicle_no} Score for route {schedule.route_number_id}: {score}")
                 
-                if score > best_score:
+                if score > best_score and is_in_direction == 1.0:
                     best_score = score
                     best_route_id = str(schedule.route_number_id)
             
@@ -397,7 +395,7 @@ class StopTracker:
                 if distance < min_distance:
                     min_distance = distance
                     nearest_stop = stop
-            return nearest_stop
+            return (nearest_stop, min_distance)
         
         # Get the last visited stop ID
         last_visited_id = visited_stops[-1]
@@ -451,10 +449,11 @@ class StopTracker:
         # Try to get from cache
         cache_key = f"route_segment:{origin_id}:{dest_id}"
         try:
-            cached = self.redis_client.get(cache_key)
-            if cached:
-                data = json.loads(cached)
-                return data.get('duration')
+            if origin_id != 0:
+                cached = self.redis_client.get(cache_key)
+                if cached:
+                    data = json.loads(cached)
+                    return data.get('duration')
         except Exception as e:
             print(f"Redis error: {e}")
         
@@ -481,14 +480,106 @@ class StopTracker:
                 'timestamp': datetime.now().isoformat(),
                 'estimated': True
             }
-            self.redis_client.setex(cache_key, self.cache_ttl, json.dumps(cache_data))
+            if origin_id != 0:
+                self.redis_client.setex(cache_key, self.cache_ttl, json.dumps(cache_data))
             
             return duration
         except Exception as e:
             print(f"Error calculating travel duration: {e}")
             return None
+        
+
+    def check_if_crossed_stop(prev_location, current_location, stop_location, threshold_meters=20):
+        """
+        Check if a vehicle has crossed a stop between its previous and current location.
+        
+        This function determines if a stop was passed by checking if the stop is near 
+        the path between the vehicle's previous and current positions.
+        
+        Args:
+            prev_location (tuple): (lat, lon) of previous vehicle location
+            current_location (tuple): (lat, lon) of current vehicle location
+            stop_location (tuple): (lat, lon) of the stop
+            threshold_meters (float): Maximum distance in meters from the path to consider the stop crossed
+            
+        Returns:
+            bool: True if the stop was crossed, False otherwise
+        """
+        # If any of the locations are None, return False
+        if any(loc is None for loc in [prev_location, current_location, stop_location]):
+            return False
+        
+        # 1. First check: Is the stop close enough to either the current or previous position?
+        # This handles the case where the vehicle might have temporarily stopped at the bus stop
+        dist_to_prev = geodesic(prev_location, stop_location).meters
+        dist_to_curr = geodesic(current_location, stop_location).meters
+        
+        if dist_to_prev < threshold_meters or dist_to_curr < threshold_meters:
+            return True
+        
+        # 2. Second check: Is the stop between the prev and current locations?
+        # Calculate the total distance of the path
+        path_distance = geodesic(prev_location, current_location).meters
+        
+        # If the vehicle hasn't moved significantly, it didn't cross the stop
+        if path_distance < 5:  # 5 meters threshold for significant movement
+            return False
+        
+        # Calculate distances from prev to stop and from stop to current
+        dist_prev_to_stop = geodesic(prev_location, stop_location).meters
+        dist_stop_to_curr = geodesic(stop_location, current_location).meters
+        
+        # Check if the stop is roughly on the path (within reasonable error margin)
+        # due to GPS inaccuracy and road curvature
+        is_on_path = abs(dist_prev_to_stop + dist_stop_to_curr - path_distance) < threshold_meters
+        
+        # 3. Third check: Direction verification
+        # We need to verify the vehicle is moving toward the stop and then away from it
+        
+        # Calculate bearings
+        def calculate_bearing(point1, point2):
+            """Calculate the bearing between two points."""
+            lat1, lon1 = math.radians(point1[0]), math.radians(point1[1])
+            lat2, lon2 = math.radians(point2[0]), math.radians(point2[1])
+            
+            dlon = lon2 - lon1
+            
+            y = math.sin(dlon) * math.cos(lat2)
+            x = math.cos(lat1) * math.sin(lat2) - math.sin(lat1) * math.cos(lat2) * math.cos(dlon)
+            
+            bearing = math.atan2(y, x)
+            # Convert to degrees
+            bearing = math.degrees(bearing)
+            # Normalize to 0-360
+            bearing = (bearing + 360) % 360
+            
+            return bearing
+        
+        # Get bearings
+        bearing_prev_to_curr = calculate_bearing(prev_location, current_location)
+        bearing_prev_to_stop = calculate_bearing(prev_location, stop_location)
+        bearing_stop_to_curr = calculate_bearing(stop_location, current_location)
+        
+        # Check if the bearings are roughly aligned
+        def angle_diff(a, b):
+            """Calculate the absolute difference between two angles in degrees."""
+            return min(abs(a - b), 360 - abs(a - b))
+        
+        alignment_prev_to_stop = angle_diff(bearing_prev_to_curr, bearing_prev_to_stop) < 45
+        alignment_stop_to_curr = angle_diff(bearing_prev_to_curr, bearing_stop_to_curr) < 45
+        
+        # 4. Combine all checks:
+        # - The stop should be roughly on the path
+        # - The bearings should be aligned
+        # - The distance from prev to stop and then to curr should be in increasing order of sequence
+        return (is_on_path and 
+                alignment_prev_to_stop and 
+                alignment_stop_to_curr and
+                dist_prev_to_stop < path_distance and 
+                dist_stop_to_curr < path_distance)
+
     
-    def calculate_eta(self, stopsInfo, route_id, vehicle_lat, vehicle_lon, current_time, vehicle_id=None, visited_stops=[], vehicle_no=None):
+    def calculate_eta(self, stopsInfo, route_id, vehicle_lat, vehicle_lon, current_time, vehicle_id, visited_stops=[], vehicle_no=None):
         """Calculate ETA for all upcoming stops from current position"""
         # Get all stops for the route
         stops = stopsInfo.get('stops')
@@ -500,39 +591,47 @@ class StopTracker:
         distance = float('inf')
         calculation_method = "realtime"
         
-        # If we have a vehicle ID, use visited stops logic
-        if vehicle_id:
             # Check if the vehicle is at a stop now
-            for stop in stops:
-                is_at_stop, stop_distance = self.check_if_at_stop(stop, vehicle_lat, vehicle_lon)
-                if is_at_stop:
-                    # Vehicle is at this stop
-                    if stop['stop_id'] not in visited_stops:
-                        # Add to visited stops if not already there
-                        logger.info(f"Vehicle {vehicle_id} is at stop {stop['stop_id']}")
-                        visited_stops = self.update_visited_stops(route_id, vehicle_id, stop['stop_id'])
-                        calculation_method = "visited_stops"
-                    break
-                        
-            # Find next stop based on visited stops
-            next_stop = self.find_next_stop(stops, visited_stops, vehicle_lat, vehicle_lon)
+        for stop in stops:
+            # Check if vehicle is at the stop based on current position
+            is_at_stop, _ = self.check_if_at_stop(stop, vehicle_lat, vehicle_lon)
             
-            if next_stop:
-                # Calculate distance to next stop
-                _, distance = self.check_if_at_stop(next_stop, vehicle_lat, vehicle_lon)
-                closest_stop = next_stop
-                calculation_method = "sequence_based"
-            else:
-                # We're at the end of the route, reset visited stops
-                self.reset_visited_stops(route_id, vehicle_id, vehicle_no)
-                # Fall back to closest stop method
-                closest_stop, distance = self.find_closest_stop(stops, vehicle_lat, vehicle_lon)
-                calculation_method = "distance_based_fallback"
+            # Get the vehicle's previous location from history                
+            # Check if we crossed the stop between last position and current position
+            if not is_at_stop:
+                location_history = get_vehicle_location_history(vehicle_no)
+                if len(location_history) > 0:
+                    last_point = location_history[-1]  # Most recent point in history
+                    # Check if the stop is between the last point and current point
+                    crossed_stop = self.check_if_crossed_stop(
+                        (last_point['lat'], last_point['lon']),
+                        (vehicle_lat, vehicle_lon),
+                        (float(stop['stop_lat']), float(stop['stop_lon']))
+                    )
+                    if crossed_stop:
+                        is_at_stop = True
+                        logger.info(f"Vehicle {vehicle_id} crossed stop {stop['stop_id']} between updates")
+            if is_at_stop:
+                # Vehicle is at this stop
+                if stop['stop_id'] not in visited_stops:
+                    # Add to visited stops if not already there
+                    logger.info(f"Vehicle {vehicle_id} is at stop {stop['stop_id']}")
+                    visited_stops = self.update_visited_stops(route_id, vehicle_id, stop['stop_id'])
+                    calculation_method = "visited_stops"
+                break
+                    
+        # Find next stop based on visited stops
+        (next_stop, distance) = self.find_next_stop(stops, visited_stops, vehicle_lat, vehicle_lon)
         
-        # If no vehicle ID or no next stop found, fall back to closest stop method
-        if not vehicle_id or not closest_stop:
+        if next_stop:
+            closest_stop = next_stop
+            calculation_method = "sequence_based"
+        else:
+            # We're at the end of the route, reset visited stops
+            self.reset_visited_stops(route_id, vehicle_id, vehicle_no)
+            # Fall back to closest stop method
             closest_stop, distance = self.find_closest_stop(stops, vehicle_lat, vehicle_lon)
-            calculation_method = "distance_based"
+            calculation_method = "distance_based_fallback"
             
         if not closest_stop:
             return None
@@ -568,7 +667,7 @@ class StopTracker:
             if duration:
                 arrival_time = current_time + timedelta(seconds=duration)
                 cumulative_time = duration
-                calculation_method = "osrm" if self.use_osrm else "google_maps"
+                calculation_method = "estimated"
             else:
                 # Fallback estimation
                 duration = distance / 8.33  # distance / (30 km/h in m/s)
@@ -603,11 +702,7 @@ class StopTracker:
                 cumulative_time += duration
                 arrival_time = current_time + timedelta(seconds=cumulative_time)
                 
-                # Determine calculation method
-                if self.use_osrm:
-                    calculation_method = "osrm"
-                else:
-                    calculation_method = "google_maps"
+                calculation_method = "estimated"
                 
                 eta_list.append({
                     'stop_id': current_stop['stop_id'],
@@ -689,19 +784,18 @@ def get_fleet_info(device_id: str, current_lat: float = None, current_lon: float
                 'device_id': device_id,
                 'route_id': route_id
             }
-            if route_id:
-                try:
-                    fleet_info_saved = redis_client.get(cache_key_saved)
-                    if fleet_info_saved is not None:
-                        fleet_info_saved = json.loads(fleet_info_saved)
-                        print("going to delete route info")
-                        if 'route_id' in fleet_info_saved and route_id != fleet_info_saved['route_id']:
-                            print("going to delete route info", fleet_info_saved['route_id'])
-                            clean_redis_key_for_route_info(fleet_info_saved['route_id'], "route:" + fleet_info_saved['route_id'])
-                except Exception as e:
-                    logger.error(f"Error cleaning redis key for route info: {e}")
-                redis_client.setex(cache_key_saved, BUS_LOCATION_MAX_AGE + BUS_CLEANUP_INTERVAL, json.dumps(val)) # hack for cleanup if route changes
-                redis_client.setex(cache_key, 180, json.dumps(val))
+            try:
+                fleet_info_saved = redis_client.get(cache_key_saved)
+                if fleet_info_saved is not None:
+                    fleet_info_saved = json.loads(fleet_info_saved)
+                    print("going to delete route info")
+                    if 'route_id' in fleet_info_saved and route_id != fleet_info_saved['route_id']:
+                        print("going to delete route info", fleet_info_saved['route_id'])
+                        clean_redis_key_for_route_info(fleet_info_saved['route_id'], "route:" + fleet_info_saved['route_id'])
+            except Exception as e:
+                logger.error(f"Error cleaning redis key for route info: {e}")
+            redis_client.setex(cache_key_saved, BUS_LOCATION_MAX_AGE + BUS_CLEANUP_INTERVAL, json.dumps(val)) # hack for cleanup if route changes
+            redis_client.setex(cache_key, BUS_CLEANUP_INTERVAL, json.dumps(val))
             return val
 
     except Exception as e:
@@ -1168,7 +1262,7 @@ def analyze_route_direction(vehicle_points, polyline_points, near_points, max_di
     
     return 1.0 if is_forward else 0.0
 
-def store_vehicle_location_history(device_id: str, lat: float, lon: float, timestamp: int, max_points: int = 15):
+def store_vehicle_location_history(device_id: str, lat: float, lon: float, timestamp: int, max_points: int = 25):
     """Store vehicle location history in Redis with TTL"""
     history = None
     try:
@@ -1185,6 +1279,9 @@ def store_vehicle_location_history(device_id: str, lat: float, lon: float, times
             points = json.loads(history) or []
         else:
             points = []
+        lastPoint = points[-1]
+        if calculate_distance(lastPoint['lat'], lastPoint['lon'], point['lat'], point['lon']) < 0.002:
+            return
             
         # Add new point
         points.append(point)
@@ -1332,139 +1429,59 @@ def calculate_route_match_score(stops: dict, points: List[dict], max_distance_me
         # Check if stops is a dict with polyline and stops keys
         if isinstance(stops, dict) and 'stops' in stops:
             route_polyline = stops.get('polyline')
-            actual_stops = stops['stops']
+            polyline_points = decode_polyline(route_polyline)
+            min_points_required = 4
         else:
-            route_polyline = None
-            actual_stops = stops
-        
-        if not points or not actual_stops or len(points) < 3:
-            return 0.0
-            
+            polyline_points = map(lambda x: (x['stop_lat'], x['stop_lon']), stops)
+            min_points_required = 10
+
+        if not points or len(points) < min_points_required:
+            return 0.0, 0.0
+
         # Sort points by timestamp to ensure they're in chronological order
         points = sorted(points, key=lambda x: x.get('timestamp', 0))
-        
-        # If we have a polyline, use it for more accurate route matching
-        if route_polyline:
-            polyline_points = decode_polyline(route_polyline)
+    
+        if polyline_points:
+            # Count how many points are near the polyline
+            near_points = []
+            total_distance = 0.0
             
-            if polyline_points:
-                # Count how many points are near the polyline
-                near_points = []
-                total_distance = 0.0
-                
-                max_distance_km = max_distance_meter / 1000
-                
-                for point in points:
-                    try:
-                        is_near, distance = is_point_near_polyline(
-                            point['lat'], point['lon'], polyline_points, max_distance_meter
-                        )
-                        if is_near:
-                            near_points.append(point)
-                            total_distance += distance
-                    except (KeyError, ValueError, TypeError) as e:
-                        logger.debug(f"Error checking if point is near polyline: {e}, point: {point}")
-                        continue
-                
-                # Calculate proximity score (0-1)
-                proximity_ratio = len(near_points) / len(points) if len(points) > 0 else 0
-                
-                # Only proceed if enough points are near the polyline
-                if proximity_ratio >= 0.3:
-                    avg_distance = total_distance / len(near_points) if len(near_points) > 0 else float('inf')
-                    proximity_score = 1.0 - min(1.0, avg_distance / max_distance_km)
-                    
-                    # Check if moving in the same direction as the route
-                    direction_score = analyze_route_direction(points, polyline_points, near_points, max_distance_meter)
-                    
-                    # Combine scores with weights
-                    combined_score = proximity_score * 0.6 + direction_score * 0.4
-                    
-                    print(f"Polyline match - Points near: {len(near_points)}/{len(points)}, Avg distance: {avg_distance:.3f}km, Direction: {direction_score:.1f}, Score: {combined_score:.2f}")
-                    
-                    return combined_score
-        
-        # Fall back to stop-based matching if no polyline or not enough points near polyline
-        print("Using stop-based matching")
-        
-        # For stop-based matching, use 1 km
-        max_distance_km = 1.0
-        
-        # Check proximity to stops
-        proximity_score = 0.0
-        points_checked = 0
-        
-        for point in points:
-            min_distance = float('inf')
-            for stop in actual_stops:
+            max_distance_km = max_distance_meter / 1000
+            
+            for point in points:
                 try:
-                    distance = calculate_distance(
-                        point['lat'], point['lon'], 
-                        float(stop['stop_lat']), float(stop['stop_lon'])
+                    is_near, distance = is_point_near_polyline(
+                        point['lat'], point['lon'], polyline_points, max_distance_meter
                     )
-                    min_distance = min(min_distance, distance)
-                except (ValueError, TypeError, KeyError) as e:
-                    logger.debug(f"Error calculating distance to stop: {e}, point: {point}, stop: {stop}")
+                    if is_near:
+                        near_points.append(point)
+                        total_distance += distance
+                except (KeyError, ValueError, TypeError) as e:
+                    logger.debug(f"Error checking if point is near polyline: {e}, point: {point}")
                     continue
-                    
-            if min_distance != float('inf'):
-                # Convert distance to a score between 0 and 1
-                score = max(0, 1 - (min_distance / max_distance_km))
-                proximity_score += score
-                points_checked += 1
+            
+            # Calculate proximity score (0-1)
+            proximity_ratio = len(near_points) / len(points) if len(points) > 0 else 0
+            
+            # Only proceed if enough points are near the polyline
+            if proximity_ratio >= 0.3:
+                avg_distance = total_distance / len(near_points) if len(near_points) > 0 else float('inf')
+                proximity_score = 1.0 - min(1.0, avg_distance / max_distance_km)
                 
-        proximity_score = proximity_score / points_checked if points_checked > 0 else 0
-        
-        # Check direction using stops
-        direction_score = 0.0
-        
-        # Find closest stop for each point
-        point_to_stop = []
-        for point in points:
-            closest_stop_idx = -1
-            min_distance = float('inf')
-            
-            for i, stop in enumerate(actual_stops):
-                try:
-                    distance = calculate_distance(
-                        point['lat'], point['lon'], 
-                        float(stop['stop_lat']), float(stop['stop_lon'])
-                    )
-                    
-                    if distance < min_distance and distance <= max_distance_km:
-                        min_distance = distance
-                        closest_stop_idx = i
-                except (ValueError, TypeError, KeyError) as e:
-                    logger.debug(f"Error finding closest stop: {e}, point: {point}, stop: {stop}")
-                    continue
-                    
-            if closest_stop_idx >= 0:
-                point_to_stop.append((point, closest_stop_idx))
-        
-        # Check if recent points show movement in the correct direction
-        if len(point_to_stop) >= 2:
-            # Use only the last 3 points (or fewer if not available)
-            recent_points = point_to_stop[-min(3, len(point_to_stop)):]
-            
-            # Check if they're in increasing stop index order
-            is_forward = True
-            for i in range(len(recent_points) - 1):
-                if recent_points[i+1][1] < recent_points[i][1]:
-                    is_forward = False
-                    break
-            
-            direction_score = 1.0 if is_forward else 0.0
-        
-        # Combine scores
-        combined_score = proximity_score * 0.6 + direction_score * 0.4
-        
-        print(f"Stop match - Proximity: {proximity_score:.2f}, Direction: {direction_score:.1f}, Score: {combined_score:.2f}")
-        
-        return combined_score
+                # Check if moving in the same direction as the route
+                direction_score = analyze_route_direction(points, polyline_points, near_points, max_distance_meter)
+                
+                # Combine scores with weights
+                combined_score = proximity_score * direction_score
+                
+                print(f"Polyline match - Points near: {len(near_points)}/{len(points)}, Avg distance: {avg_distance:.3f}km, Direction: {direction_score:.1f}, Score: {combined_score:.2f}")
+                
+                return combined_score, direction_score
+        return 0.0, 0.0
     except Exception as e:
         error_details = traceback.format_exc()
         logger.error(f"Error calculating route match score: {e}\nTraceback: {error_details}")
-        return 0.0
+        return 0.0, 0.0
 
 def handle_client_data(payload, client_ip, serverTime,session=None):
     """Handle client data and send it to Kafka"""
@@ -1517,10 +1534,6 @@ def handle_client_data(payload, client_ip, serverTime,session=None):
         if fleet_info and 'route_id' in fleet_info and fleet_info["route_id"] != None:
             route_id = fleet_info['route_id']
             
-            # Use the timestamp from the entity instead of current_time
-            entity_timestamp = datetime.fromtimestamp(entity['timestamp'])
-            
-            # Get route stops
             stopsInfo = stop_tracker.get_route_stops(route_id)
             
             # Pass vehicle_id (deviceId) to track visited stops
