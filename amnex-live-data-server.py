@@ -1395,7 +1395,8 @@ def calculate_route_match_score(route_id, vehicle_no, stops: dict, vehicle_point
             min_points_required = 4
         else:
             route_polyline = ""
-            polyline_points = list(map(lambda x: (x['stop_lat'], x['stop_lon']), stops))
+            stopsInfo = stops.get('stops')
+            polyline_points = list(map(lambda x: (x['stop_lat'], x['stop_lon']), stopsInfo))
             min_points_required = 10
 
         if not vehicle_points or len(vehicle_points) < min_points_required:
