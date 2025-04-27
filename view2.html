@@ -1,0 +1,562 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Route Visualization Tool</title>
+    <script src="https://cdn.jsdelivr.net/npm/leaflet@1.7.1/dist/leaflet.js"></script>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.7.1/dist/leaflet.css" />
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: Arial, sans-serif;
+        }
+        #container {
+            display: flex;
+            height: 100vh;
+        }
+        #sidebar {
+            width: 300px;
+            padding: 20px;
+            background-color: #f5f5f5;
+            overflow-y: auto;
+        }
+        #map {
+            flex-grow: 1;
+            height: 100%;
+        }
+        .route-item {
+            margin-bottom: 10px;
+            padding: 10px;
+            background-color: #fff;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+        .route-item:hover {
+            background-color: #e0e0e0;
+        }
+        .selected {
+            background-color: #d0e8ff;
+            border-left: 4px solid #0078ff;
+        }
+        .polyline-item {
+            margin-left: 15px;
+            padding: 5px;
+            background-color: #f9f9f9;
+            border-radius: 3px;
+            cursor: pointer;
+        }
+        .polyline-item:hover {
+            background-color: #e0e0e0;
+        }
+        .polyline-selected {
+            background-color: #d0e8ff;
+            border-left: 2px solid #0078ff;
+        }
+        #file-input-container {
+            margin-bottom: 20px;
+        }
+        #controls {
+            margin-top: 20px;
+        }
+        button {
+            padding: 8px 12px;
+            margin-right: 5px;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        button:hover {
+            background-color: #45a049;
+        }
+        #animation-controls {
+            margin-top: 10px;
+            display: none;
+        }
+        .legend {
+            padding: 10px;
+            background: white;
+            border-radius: 5px;
+            box-shadow: 0 0 15px rgba(0,0,0,0.2);
+        }
+        .legend-item {
+            margin-bottom: 5px;
+        }
+        .legend-color {
+            display: inline-block;
+            width: 15px;
+            height: 15px;
+            margin-right: 5px;
+            vertical-align: middle;
+        }
+    </style>
+</head>
+<body>
+    <div id="container">
+        <div id="sidebar">
+            <h2>Route Visualization Tool</h2>
+            <div id="file-input-container">
+                <input type="file" id="file-input" accept=".json">
+                <button id="load-button">Load JSON</button>
+            </div>
+            <div id="route-list"></div>
+            <div id="controls">
+                <button id="show-all-button">Show All Routes</button>
+                <button id="clear-button">Clear Map</button>
+                <div id="animation-controls">
+                    <button id="animate-button">Animate Selected Route</button>
+                    <button id="stop-animation-button">Stop Animation</button>
+                </div>
+            </div>
+            <div id="route-info"></div>
+        </div>
+        <div id="map"></div>
+    </div>
+
+    <script>
+        // Initialize the map
+        const map = L.map('map').setView([0, 0], 2);
+        
+        // Add OpenStreetMap tile layer
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+        }).addTo(map);
+
+        // Custom colors for different routes
+        const colors = ['red', 'blue', 'green', 'purple', 'orange', 'cyan', 'magenta'];
+        
+        // Global variables
+        let routesData = {};
+        let currentRouteId = null;
+        let currentPolylineIndex = null;
+        let animationInterval = null;
+        let routeLayers = {};
+        
+        // Function to convert timestamp string to epoch time
+        function timestampToEpoch(timestampStr) {
+            try {
+                // Try multiple timestamp formats
+                const formats = [
+                    "%Y-%m-%dT%H:%M:%S.%fZ",  // ISO format with microseconds
+                    "%Y-%m-%dT%H:%M:%SZ",     // ISO format without microseconds
+                    "%Y-%m-%d %H:%M:%S"       // Simple date-time format
+                ];
+                
+                // JavaScript Date object handles most formats automatically
+                const date = new Date(timestampStr);
+                if (!isNaN(date.getTime())) {
+                    return date.getTime() / 1000; // Convert to seconds
+                }
+                
+                return 0;
+            } catch (error) {
+                console.error(`Could not parse timestamp: ${timestampStr}`);
+                return 0;
+            }
+        }
+
+        // Function to load JSON data
+        document.getElementById('load-button').addEventListener('click', function() {
+            const fileInput = document.getElementById('file-input');
+            const file = fileInput.files[0];
+            
+            if (file) {
+                const reader = new FileReader();
+                reader.onload = function(e) {
+                    try {
+                        routesData = JSON.parse(e.target.result);
+                        populateRouteList();
+                        document.getElementById('animation-controls').style.display = 'block';
+                    } catch (error) {
+                        alert('Error parsing JSON file: ' + error.message);
+                    }
+                };
+                reader.readAsText(file);
+            } else {
+                alert('Please select a JSON file');
+            }
+        });
+
+        // Function to populate the route list
+        function populateRouteList() {
+            const routeList = document.getElementById('route-list');
+            routeList.innerHTML = '<h3>Available Routes</h3>';
+            
+            let routeCount = 0;
+            for (const routeId in routesData) {
+                const routeItem = document.createElement('div');
+                routeItem.className = 'route-item';
+                routeItem.id = `route-${routeId}`;
+                
+                const polylines = routesData[routeId];
+                const totalPolylines = polylines.length;
+                
+                routeItem.innerHTML = `
+                    <strong>Route ${routeId}</strong><br>
+                    Polylines: ${totalPolylines}
+                `;
+                
+                routeItem.addEventListener('click', function() {
+                    // Remove selected class from all route items
+                    document.querySelectorAll('.route-item').forEach(item => {
+                        item.classList.remove('selected');
+                    });
+                    
+                    // Add selected class to clicked route item
+                    this.classList.add('selected');
+                    
+                    // Set current route ID
+                    currentRouteId = routeId;
+                    
+                    // Show polyline options for this route
+                    showPolylineOptions(routeId);
+                });
+                
+                routeList.appendChild(routeItem);
+                
+                routeCount++;
+            }
+            
+            const routeInfo = document.getElementById('route-info');
+            routeInfo.innerHTML = `<p>Total Routes: ${routeCount}</p>`;
+        }
+
+        // Function to show polyline options for a route
+        function showPolylineOptions(routeId) {
+            // Clear previous polyline selections
+            document.querySelectorAll('.polyline-item').forEach(item => {
+                item.remove();
+            });
+            
+            const routeItem = document.getElementById(`route-${routeId}`);
+            const polylines = routesData[routeId];
+            
+            polylines.forEach((polyline, index) => {
+                const polylineItem = document.createElement('div');
+                polylineItem.className = 'polyline-item';
+                polylineItem.id = `polyline-${routeId}-${index}`;
+                
+                const matchPercentage = polyline.match_percentage || 'N/A';
+                polylineItem.innerHTML = `
+                    <strong>Polyline ${index + 1}</strong><br>
+                    Match: ${matchPercentage}%<br>
+                    Stops: ${(polyline.stops || []).length}<br>
+                    Trail Points: ${(polyline.trail_segment || []).length}
+                `;
+                
+                polylineItem.addEventListener('click', function() {
+                    // Remove selected class from all polyline items
+                    document.querySelectorAll('.polyline-item').forEach(item => {
+                        item.classList.remove('polyline-selected');
+                    });
+                    
+                    // Add selected class to clicked polyline item
+                    this.classList.add('polyline-selected');
+                    
+                    // Display the selected polyline
+                    currentPolylineIndex = index;
+                    displayRoute(routeId, index);
+                });
+                
+                routeItem.insertAdjacentElement('afterend', polylineItem);
+            });
+            
+            // If there's only one polyline, select it automatically
+            if (polylines.length === 1) {
+                const polylineItem = document.getElementById(`polyline-${routeId}-0`);
+                polylineItem.classList.add('polyline-selected');
+                currentPolylineIndex = 0;
+                displayRoute(routeId, 0);
+            }
+        }
+
+        // Function to display a route on the map
+        function displayRoute(routeId, polylineIndex, animate = false) {
+            // Clear previous layers if not showing all routes
+            if (!animate) {
+                clearMap();
+            }
+            
+            const polylineData = routesData[routeId][polylineIndex];
+            const colorIndex = (parseInt(routeId) * 10 + polylineIndex) % colors.length;
+            const color = colors[colorIndex];
+            
+            // Create a layer group for this route
+            const routeLayerGroup = L.layerGroup().addTo(map);
+            const layerId = `${routeId}-${polylineIndex}`;
+            routeLayers[layerId] = routeLayerGroup;
+            
+            // Plot stops if available
+            if (polylineData.stops && polylineData.stops.length > 0) {
+                // Sort stops by sequence
+                const stops = [...polylineData.stops].sort((a, b) => (a.seq || 0) - (b.seq || 0));
+                
+                // Extract coordinates
+                const stopCoords = stops.map(stop => [stop.lat || 0, stop.long || 0]);
+                
+                // Add stop markers
+                stopCoords.forEach((coord, index) => {
+                    const marker = L.circleMarker(coord, {
+                        radius: 8,
+                        fillColor: color,
+                        color: '#000',
+                        weight: 1,
+                        opacity: 1,
+                        fillOpacity: 0.8
+                    }).addTo(routeLayerGroup);
+                    
+                    marker.bindPopup(`Stop #${index + 1}`);
+                });
+                
+                // Connect stops with lines
+                const routePath = L.polyline(stopCoords, {
+                    color: color,
+                    weight: 3,
+                    opacity: 0.7,
+                    dashArray: '5, 10'
+                }).addTo(routeLayerGroup);
+                
+                // Fit map to the route bounds
+                if (!animate) {
+                    map.fitBounds(routePath.getBounds(), { padding: [50, 50] });
+                }
+            }
+            
+            // Plot trail segments if available and not in animation mode
+            if (polylineData.trail_segment && polylineData.trail_segment.length > 0 && !animate) {
+                // Sort trail points by timestamp
+                const trailPoints = polylineData.trail_segment;
+                const trailPointsWithEpoch = trailPoints
+                    .filter(point => point.timestamp)
+                    .map(point => ({
+                        point: point,
+                        epoch: timestampToEpoch(point.timestamp)
+                    }));
+                
+                // Sort by epoch time
+                trailPointsWithEpoch.sort((a, b) => a.epoch - b.epoch);
+                
+                // Extract coordinates
+                const trailCoords = trailPointsWithEpoch.map(item => [
+                    item.point.lat || 0,
+                    item.point.long || 0
+                ]);
+                
+                // Add trail line
+                L.polyline(trailCoords, {
+                    color: 'green',
+                    weight: 4,
+                    opacity: 0.8
+                }).addTo(routeLayerGroup);
+            }
+            
+            // Add legend if not already present
+            if (!document.getElementById('map-legend')) {
+                addLegend();
+            }
+            
+            // Update route info
+            updateRouteInfo(routeId, polylineIndex);
+        }
+
+        // Function to animate a route
+        function animateRoute(routeId, polylineIndex) {
+            // Stop any existing animation
+            stopAnimation();
+            
+            const polylineData = routesData[routeId][polylineIndex];
+            
+            // Check if trail segment exists
+            if (!polylineData.trail_segment || polylineData.trail_segment.length === 0) {
+                alert('No trail data available for animation');
+                return;
+            }
+            
+            // Display the route without trail
+            displayRoute(routeId, polylineIndex, true);
+            
+            // Sort trail points by timestamp
+            const trailPoints = polylineData.trail_segment;
+            const trailPointsWithEpoch = trailPoints
+                .filter(point => point.timestamp)
+                .map(point => ({
+                    point: point,
+                    epoch: timestampToEpoch(point.timestamp)
+                }));
+            
+            // Sort by epoch time
+            trailPointsWithEpoch.sort((a, b) => a.epoch - b.epoch);
+            
+            // Extract coordinates
+            const trailCoords = trailPointsWithEpoch.map(item => [
+                item.point.lat || 0,
+                item.point.long || 0
+            ]);
+            
+            // Animation variables
+            let currentIndex = 0;
+            const totalPoints = trailCoords.length;
+            const animationStep = Math.max(1, Math.floor(totalPoints / 100)); // Show about 100 steps
+            
+            const layerId = `${routeId}-${polylineIndex}`;
+            
+            // Create a layer for the animated trail
+            const animatedTrail = L.polyline([], {
+                color: 'green',
+                weight: 4,
+                opacity: 0.8
+            }).addTo(routeLayers[layerId]);
+            
+            // Create a marker for the current position
+            const currentPositionMarker = L.circleMarker(trailCoords[0], {
+                radius: 8,
+                fillColor: 'red',
+                color: '#fff',
+                weight: 2,
+                opacity: 1,
+                fillOpacity: 1
+            }).addTo(routeLayers[layerId]);
+            
+            // Animation function
+            animationInterval = setInterval(() => {
+                currentIndex += animationStep;
+                
+                if (currentIndex >= totalPoints) {
+                    stopAnimation();
+                    return;
+                }
+                
+                // Update the trail
+                animatedTrail.setLatLngs(trailCoords.slice(0, currentIndex));
+                
+                // Update the current position marker
+                currentPositionMarker.setLatLng(trailCoords[currentIndex - 1]);
+                
+                // Update info
+                const progress = Math.round((currentIndex / totalPoints) * 100);
+                document.getElementById('route-info').innerHTML = `
+                    <h3>Route ${routeId} - Polyline ${polylineIndex + 1} Animation</h3>
+                    <p>Progress: ${progress}% (${currentIndex}/${totalPoints} points)</p>
+                `;
+            }, 100);
+        }
+
+        // Function to stop animation
+        function stopAnimation() {
+            if (animationInterval) {
+                clearInterval(animationInterval);
+                animationInterval = null;
+                
+                // Redisplay the current route if one is selected
+                if (currentRouteId !== null && currentPolylineIndex !== null) {
+                    displayRoute(currentRouteId, currentPolylineIndex);
+                }
+            }
+        }
+
+        // Function to clear the map
+        function clearMap() {
+            for (const layerId in routeLayers) {
+                map.removeLayer(routeLayers[layerId]);
+            }
+            routeLayers = {};
+        }
+
+        // Function to update route info
+        function updateRouteInfo(routeId, polylineIndex) {
+            const polylineData = routesData[routeId][polylineIndex];
+            const routeInfo = document.getElementById('route-info');
+            
+            routeInfo.innerHTML = `
+                <h3>Route ${routeId} - Polyline ${polylineIndex + 1} Details</h3>
+                <p>Match Percentage: ${polylineData.match_percentage || 'N/A'}%</p>
+                <p>Number of Stops: ${(polylineData.stops || []).length}</p>
+                <p>Number of Trail Points: ${(polylineData.trail_segment || []).length}</p>
+            `;
+        }
+
+        // Function to add legend to the map
+        function addLegend() {
+            const legend = L.control({ position: 'bottomright' });
+            
+            legend.onAdd = function(map) {
+                const div = L.DomUtil.create('div', 'legend');
+                div.id = 'map-legend';
+                
+                div.innerHTML = `
+                    <h4>Legend</h4>
+                    <div class="legend-item">
+                        <span class="legend-color" style="background-color: var(--route-color); border: 1px solid black;"></span>
+                        Route Path
+                    </div>
+                    <div class="legend-item">
+                        <span class="legend-color" style="background-color: green;"></span>
+                        Trail (Completed)
+                    </div>
+                    <div class="legend-item">
+                        <span class="legend-color" style="background-color: red;"></span>
+                        Current Position
+                    </div>
+                `;
+                
+                return div;
+            };
+            
+            legend.addTo(map);
+        }
+
+        // Event listeners for buttons
+        document.getElementById('show-all-button').addEventListener('click', function() {
+            clearMap();
+            for (const routeId in routesData) {
+                const polylines = routesData[routeId];
+                polylines.forEach((_, index) => {
+                    displayRoute(routeId, index, true);
+                });
+            }
+            
+            // Fit map to all routes
+            const allBounds = [];
+            for (const layerId in routeLayers) {
+                const layerBounds = routeLayers[layerId].getBounds();
+                if (layerBounds.isValid()) {
+                    allBounds.push(layerBounds);
+                }
+            }
+            
+            if (allBounds.length > 0) {
+                const bounds = L.latLngBounds(allBounds);
+                map.fitBounds(bounds, { padding: [50, 50] });
+            }
+        });
+
+        document.getElementById('clear-button').addEventListener('click', function() {
+            clearMap();
+            document.getElementById('route-info').innerHTML = '';
+            document.querySelectorAll('.route-item').forEach(item => {
+                item.classList.remove('selected');
+            });
+            document.querySelectorAll('.polyline-item').forEach(item => {
+                item.remove();
+            });
+            currentRouteId = null;
+            currentPolylineIndex = null;
+        });
+
+        document.getElementById('animate-button').addEventListener('click', function() {
+            if (currentRouteId !== null && currentPolylineIndex !== null) {
+                animateRoute(currentRouteId, currentPolylineIndex);
+            } else {
+                alert('Please select a route and polyline to animate');
+            }
+        });
+
+        document.getElementById('stop-animation-button').addEventListener('click', function() {
+            stopAnimation();
+        });
+    </script>
+</body>
+</html>

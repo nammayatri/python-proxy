@@ -1,0 +1,22 @@
+SELECT
+  `atlas_kafka`.`fleet_device_mapping`.`fleet` AS `vehicle_no`,
+  coalesce(obu_iemi, chalo_deviceID) as device_id
+FROM
+  `atlas_kafka`.`fleet_device_mapping`
+
+
+
+SELECT
+  "public"."waybills"."waybill_id" AS "waybill_id",
+  "public"."waybills"."vehicle_no" AS "vehicle_no",
+  "public"."waybills"."schedule_trip_id" AS "schedule_trip_id",
+  "Bus Schedule Trip Detail - Schedule Trip"."route_number_id" AS "route_id"
+FROM
+  "public"."waybills"
+  INNER JOIN "public"."bus_schedule_trip_detail" AS "Bus Schedule Trip Detail - Schedule Trip" ON "public"."waybills"."schedule_trip_id" = "Bus Schedule Trip Detail - Schedule Trip"."schedule_trip_id"
+WHERE
+  ("public"."waybills"."duty_date" = '2025-04-03')
+ 
+   AND ("public"."waybills"."deleted" = FALSE)
+ORDER BY
+  "public"."waybills"."vehicle_no" DESC
