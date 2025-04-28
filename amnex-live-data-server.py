@@ -19,6 +19,7 @@ import traceback
 from geopy.distance import geodesic
 import logging
 import atexit
+import paho.mqtt.client as mqtt
 
 # Configure logging
 logging.basicConfig(
@@ -922,9 +923,52 @@ def parse_amnex_payload(payload, serverTime, client_ip):
         print(f"Error parsing Amnex payload: {e}")
         return None
 
-def parse_payload(data_decoded, client_ip, serverTime):
+def parse_mqtt_payload(data_str, serverTime, client_ip):
+    """Parse MQTT GPS data format"""
+    # Payload format: "data,<device_id>,<lat>,<long>,<speed_from_gps>,<signal_quality>,<busname>"
+    try:
+        parts = data_str.split(',')
+        
+        if len(parts) != 7 or parts[0] != "data":
+            raise Exception(f"Unknown format of payload {data_str}")
+            
+        deviceId = parts[1]
+        lat = float(parts[2])
+        lon = float(parts[3])
+        speed = float(parts[4])
+        signalQuality = parts[5]
+        busName = parts[6]
+        
+        entity = {
+            "lat": lat,
+            "long": lon,
+            "deviceId": deviceId,
+            "version": None,
+            "timestamp": date_to_unix(serverTime),
+            "vehicleNumber": busName,
+            "speed": speed,
+            "pushedToKafkaAt": int(time.time()),
+            "dataState": "L",  # Live data
+            "serverTime": date_to_unix(serverTime),
+            "provider": "nammayatri-gps-devices",
+            "raw": data_str,
+            "client_ip": client_ip,
+            "routeNumber": None,
+            "signalQuality": signalQuality
+        }
+        
+        return entity
+    except Exception as e:
+        print(f"Error parsing MQTT payload: {e} for payload: {data_str}")
+        return None
+
+def parse_payload(data_decoded, client_ip, serverTime, isNYGpsDevice):
     """Parse payload data by determining the format"""
     try:
+        # First check if it's NY GPS device mqtt server data
+        if isNYGpsDevice:
+            return parse_mqtt_payload(data_decoded, serverTime, client_ip)
+        
         payload = data_decoded.split(",")
         
         # Parse payload based on format
@@ -1462,22 +1506,26 @@ def push_to_kafka(entity):
         except Exception as e:
             logger.error(f"Error flushing Kafka producer: {str(e)}")
 
-def handle_client_data(payload, client_ip, serverTime,session=None):
+def handle_client_data(payload, client_ip, serverTime, isNYGpsDevice = False, session=None):
     """Handle client data and send it to Kafka"""
     try:
          # Try to send to Kafka with retries
-        entity = parse_payload(payload, client_ip, serverTime)
+        entity = parse_payload(payload, client_ip, serverTime, isNYGpsDevice)
 
         if not entity:
             return
 
-        if FORWARD_TCP:
+        if FORWARD_TCP and not isNYGpsDevice:
             forward_to_tcp(payload)
 
 
         if 'dataState' not in entity or entity.get('dataState') not in ['L', 'LP', 'LO'] or entity.get('provider') == 'chalo':
             push_to_kafka(entity)
             print(f"Skipping chalo data")
+            return
+        
+        if isNYGpsDevice:
+            print("Skipping NY gps device mqtt server data for other processing")
             return
             
         deviceId = entity.get("deviceId")
@@ -1682,6 +1730,62 @@ def monitor_thread_pool():
 monitor_thread = threading.Thread(target=monitor_thread_pool, daemon=True)
 monitor_thread.start()
 
+MQTT_HOST = os.getenv('MQTT_HOST', 'localhost')
+MQTT_PORT = os.getenv('MQTT_PORT', '1883')
+MQTT_USER = os.getenv('MQTT_USER', 'user123')
+MQTT_PASSWORD = os.getenv('MQTT_PASSWORD', 'abc123')
+MQTT_TOPIC = os.getenv('MQTT_TOPIC', 'gps-data')
+MQTT_CLIENT_ID = os.getenv('MQTT_CLIENT_ID', 'local-gps-fetch-server') # Pod name in Production
+
+def mqtt_client():
+    """MQTT client to consume GPS data and forward to Kafka"""
+    def on_connect(client, _userdata, _flags, rc):
+        if rc == 0:
+            logger.info("✅ Connected to MQTT broker")
+            client.subscribe(MQTT_TOPIC)
+        else:
+            logger.error(f"❌ Failed to connect to MQTT broker with code {rc}")
+    
+    def on_message(_client, _userdata, msg):
+        try:
+            # Parse the message payload
+            payload = msg.payload.decode('utf-8')
+            
+            # Use the existing handle_client_data function
+            serverTime = datetime.now()
+            logger.info(f"✅ Message received on topic: {MQTT_TOPIC}")
+            executor.submit(handle_client_data, payload, None, serverTime, True)
+            
+        except Exception as e:
+            logger.error(f"❌ Error processing MQTT message: {str(e)}")
+            traceback.print_exc()
+    
+    # Create MQTT client
+    client = mqtt.Client(client_id=MQTT_CLIENT_ID)
+    client.username_pw_set(MQTT_USER, MQTT_PASSWORD)
+    client.on_connect = on_connect
+    client.on_message = on_message
+
+    try:
+        client.connect(MQTT_HOST, int(MQTT_PORT), 60)
+        client.loop_start()
+        logger.info(f"✅ MQTT client started and connected to {MQTT_HOST}:{MQTT_PORT}")
+        return client
+    except Exception as e:
+        logger.error(f"❌ Failed to start MQTT client: {str(e)}")
+        return None
+
+mqtt_client_obj = None
+
+# Register shutdown function for MQTT client
+def shutdown_mqtt_client():
+    if mqtt_client_obj and mqtt_client_obj.is_connected():
+        mqtt_client_obj.disconnect()
+        logger.info("✅ MQTT client disconnected")
+        time.sleep(0.5)
+
+atexit.register(shutdown_mqtt_client)
+
 # Main server loop
 def main_server():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
@@ -1720,5 +1824,8 @@ def main_server():
                 time.sleep(1)  # Avoid tight loop if accept is failing
 
 if __name__ == "__main__":
+    # Start MQTT client, no separate thread required 
+    # as we already called loop_start() and we already registered a shutdown function
+    mqtt_client_obj = mqtt_client()
     main_server()
 
