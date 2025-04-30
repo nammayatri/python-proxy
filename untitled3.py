@@ -11,9 +11,7 @@ Original file is located at
 
 import pandas as pd
 from multiprocessing import Pool, cpu_count
-import concurrent.futures
 import multiprocessing as mp
-
 # Make sure date is defined globally
 
 
@@ -21,100 +19,137 @@ from geopy.distance import geodesic
 import numpy as np
 import json
 
-def match_trail_to_routes(location_trail, routes_dict, processed_routes, threshold_distance=0.2):
-    # Results dictionary
-    matched_routes = {}
-    # Sort route stops by sequence number for each route
-    sorted_routes = {}
-    for route_id, stops in routes_dict.items():
-        sorted_routes[route_id] = stops
 
+def match_stops(route_id, location_trail, stops, matched_routes, matched_routes_intermediate, finding_intermediate=False, threshold_distance=0.08, start_point_distance_threshold_km=0.02):
+  first_stop = stops[0]
+  potential_starts = []
+  last_potential_start = -10
+
+  for i, trail_point in enumerate(location_trail):
+    distance = geodesic(
+        (trail_point['lat'], trail_point['long']),
+        (first_stop['lat'], first_stop['long'])
+    ).kilometers
+    if distance < start_point_distance_threshold_km:
+      if i - last_potential_start < 5:
+        potential_starts = potential_starts[:-1]
+      last_potential_start = i
+      potential_starts.append(i)
+
+  # For each potential starting point, try to match the entire route
+  best_match = None
+  best_score = float('inf')  # Lower is better
+  for start_idx in potential_starts:
+      current_trail_idx = start_idx
+      matched_stops = [0]  # Start with first stop matched
+
+      last_stop_idx = None
+      # Try to match subsequent stops
+      for stop_idx in range(1, len(stops)):
+          current_stop = stops[stop_idx]
+          current_stop_seq = current_stop['seq']
+          best_distance = float('inf')
+          best_trail_idx = None
+          dist_sum = 0
+          # latLongs = []
+          # Search forward in the trail for the best match for this stop
+          for trail_idx in range(current_trail_idx, len(location_trail)):
+              trail_point = location_trail[trail_idx]
+              distance = geodesic(
+                  (trail_point['lat'], trail_point['long']),
+                  (current_stop['lat'], current_stop['long'])
+              ).kilometers
+              if trail_idx - 1 >= 0:
+                trail_point_prev = location_trail[trail_idx - 1]
+                trail_dist = geodesic(
+                    (trail_point['lat'], trail_point['long']),
+                    (trail_point_prev['lat'], trail_point_prev['long'])
+                ).kilometers
+                # latLongs.append({'lat': trail_point['lat'], 'long': trail_point['long']})
+                dist_sum += trail_dist
+              if distance < threshold_distance:
+                  best_distance = distance
+                  best_trail_idx = trail_idx
+                  break
+          # If we found a reasonable match
+          # print("dist_sum: ", dist_sum, json.dumps(latLongs), best_trail_idx)
+          if dist_sum < 3 and best_distance < threshold_distance:
+              matched_stops.append(current_stop_seq)
+              last_stop_idx = stop_idx
+              current_trail_idx = best_trail_idx
+          else:
+              # Stop not found, break the search
+              break
+      # Calculate match score (percentage of stops matched and average distance)
+      if len(matched_stops) > 1:  # At least two stops must match
+          end_idx = current_trail_idx
+          match_percentage = len(matched_stops) / len(stops)
+          if match_percentage < best_score and match_percentage >= 1.0:
+              segment_trail = location_trail[start_idx:end_idx+1]
+              if route_id in matched_routes_intermediate:
+                  print("found from here", route_id)
+                  oldRouteState = matched_routes_intermediate[route_id]
+                  oldRouteState['trail_segment'] = oldRouteState['trail_segment'] + segment_trail
+                  oldRouteState['stops'] = oldRouteState['stops'] + stops
+                  stops = oldRouteState['stops']
+                  segment_trail = oldRouteState['trail_segment']
+              if route_id in matched_routes_intermediate:
+                  del matched_routes_intermediate[route_id]
+              best_score = match_percentage
+              best_match = {
+                  'matched_stops': matched_stops,
+                  'stops_length': len(stops),
+                  'match_percentage': match_percentage * 100,
+                  'trail_segment': segment_trail,
+                  'stops': stops,
+                  'start_index': start_idx,
+                  'end_index': end_idx,
+                  'route_id': route_id
+              }
+          elif len(matched_stops) > 3:
+              updated_last_matching_stop = {}
+              updated_last_matching_stop['lat'] = location_trail[end_idx + 1]['lat']
+              updated_last_matching_stop['long'] = location_trail[end_idx + 1]['long']
+              updated_last_matching_stop['seq'] = stops[last_stop_idx]['seq']
+              this_stop_to_rest_missing_stops = [updated_last_matching_stop] + stops[last_stop_idx+1:]
+              if route_id not in matched_routes_intermediate:
+                matched_routes_intermediate[route_id] = {
+                  'matched_stops': matched_stops,
+                  'missing_sequences': this_stop_to_rest_missing_stops,
+                  'match_percentage': match_percentage * 100,
+                  'trail_segment': location_trail[start_idx:end_idx+1],
+                  'stops': stops,
+                }
+                print("missing 2", route_id, json.dumps(matched_routes_intermediate[route_id]))
+              else:
+                oldRouteState = matched_routes_intermediate[route_id]
+                old_matched_stops = oldRouteState['matched_stops']
+                if old_matched_stops[0] == matched_stops[0] and len(matched_stops) > len(old_matched_stops):
+                  oldRouteState['matched_stops'] = matched_stops
+                  oldRouteState['missing_sequences'] = this_stop_to_rest_missing_stops
+                  oldRouteState['trail_segment'] = location_trail[start_idx:end_idx+1]
+                  oldRouteState['stops'] = stops
+                  matched_routes_intermediate[route_id] = oldRouteState
+                  print("missing 3", route_id, json.dumps(matched_routes_intermediate[route_id])) 
+                elif matched_stops[0] >= old_matched_stops[-1]:
+                  oldRouteState['matched_stops'] = oldRouteState['matched_stops'] + matched_stops
+                  oldRouteState['missing_sequences'] = this_stop_to_rest_missing_stops
+                  oldRouteState['trail_segment'] = oldRouteState['trail_segment'] + location_trail[start_idx:end_idx+1]
+                  oldRouteState['stops'] = oldRouteState['stops'] + stops
+                  matched_routes_intermediate[route_id] = oldRouteState
+                  print("missing 4", route_id, json.dumps(matched_routes_intermediate[route_id]))
+  if best_match and not finding_intermediate:
+    matched_routes[route_id] = best_match
+
+def match_trail_to_routes(route_id, location_trail, stops, processed_routes, matched_routes, matched_routes_intermediate):
     # For each route, try to find a matching segment in the trail
-    for route_id, stops in sorted_routes.items():
-        if len(stops) < 2 or route_id in processed_routes:  # Skip routes with fewer than 2 stops
-            continue
-        print("route_id: ", route_id)
-
-        # Find potential matches for the first stop
-        first_stop = stops[0]
-        potential_starts = []
-        last_potential_start = -10
-
-        for i, trail_point in enumerate(location_trail):
-            distance = geodesic(
-                (trail_point['lat'], trail_point['long']),
-                (first_stop['lat'], first_stop['long'])
-            ).kilometers
-            if distance < threshold_distance:
-              if i - last_potential_start < 5:
-                potential_starts = potential_starts[:-1]
-              last_potential_start = i
-              potential_starts.append(i)
-
-        # For each potential starting point, try to match the entire route
-        best_match = None
-        best_score = float('inf')  # Lower is better
-        for start_idx in potential_starts:
-            current_trail_idx = start_idx
-            matched_stops = [0]  # Start with first stop matched
-
-            # Try to match subsequent stops
-            for stop_idx in range(1, len(stops)):
-                current_stop = stops[stop_idx]
-                best_distance = float('inf')
-                best_trail_idx = None
-                dist_sum = 0
-                # latLongs = []
-                # Search forward in the trail for the best match for this stop
-                for trail_idx in range(current_trail_idx, len(location_trail)):
-                    trail_point = location_trail[trail_idx]
-                    distance = geodesic(
-                        (trail_point['lat'], trail_point['long']),
-                        (current_stop['lat'], current_stop['long'])
-                    ).kilometers
-                    if trail_idx - 1 >= 0:
-                      trail_point_prev = location_trail[trail_idx - 1]
-                      trail_dist = geodesic(
-                          (trail_point['lat'], trail_point['long']),
-                          (trail_point_prev['lat'], trail_point_prev['long'])
-                      ).kilometers
-                      # latLongs.append({'lat': trail_point['lat'], 'long': trail_point['long']})
-                      dist_sum += trail_dist
-                    if distance < threshold_distance:
-                        best_distance = distance
-                        best_trail_idx = trail_idx
-                        break
-                # If we found a reasonable match
-                # print("dist_sum: ", dist_sum, json.dumps(latLongs), best_trail_idx)
-                if dist_sum < 3 and best_distance < threshold_distance:
-                    matched_stops.append(stop_idx)
-                    current_trail_idx = best_trail_idx
-                else:
-                    # Stop not found, break the search
-                    break
-            # Calculate match score (percentage of stops matched and average distance)
-            if len(stops) - 1 == matched_stops[-1] and len(matched_stops) > 1:  # At least two stops must match
-                match_percentage = len(matched_stops) / len(stops)
-                if match_percentage < best_score and match_percentage >= 0.8:  # At least 50% of stops must match
-                    best_score = match_percentage
-                    end_idx = current_trail_idx
-
-                    best_match = {
-                        'matched_stops': matched_stops,
-                        'stops_length': len(stops),
-                        'match_percentage': match_percentage * 100,
-                        'trail_segment': location_trail[start_idx:end_idx+1],
-                        'stops': stops,
-                        'start_index': start_idx,
-                        'end_index': end_idx,
-                        'route_id': route_id
-                    }
-
-        if best_match:
-            matched_routes[route_id] = best_match
-            print("Done with:", route_id)
-
-    return matched_routes
+    if len(stops) < 2 or route_id in processed_routes:  # Skip routes with fewer than 2 stops
+    if route_id in matched_routes_intermediate or route_id in matched_routes:
+    break
+        return
+    print("route_id:", route_id)
+    if route_id not in matched_routes:
+      match_stops(route_id, location_trail, stops, matched_routes, matched_routes_intermediate)
 
 import pandas as pd
 from geopy.distance import geodesic
@@ -126,40 +161,50 @@ from tqdm import tqdm
 # ... (Your existing code for data loading and preprocessing) ...
 
 # Function to process a single device
-def process_device(dId, group, device_id_to_route_stops, output_file, processed_devices_file, processed_routes, fileInx):
-    try:
-        if dId in device_id_to_route_stops.keys():
-            res = match_trail_to_routes(group.to_dict('records'), device_id_to_route_stops[dId], processed_routes)
-            if res:
-                with open(output_file, 'a') as f:
-                    json.dump({dId: res}, f)
-                    f.write('\n')  # Add newline for easy parsing later
-        with open(processed_devices_file, 'a') as f:
-            f.write(f"{dId}\n")  # Atomically mark device as processed
-
-    except Exception as e:
-        print(f"Error processing device {dId}: {e}")
-
 def process_chunk(args):
-    chunk_id, device_chunk, device_id_to_route_stops, output_file, processed_devices_file, processed_routes, date = args
-    for dId, group_records in device_chunk:
-        try:
-            if dId in device_id_to_route_stops.keys():
-                print(dId)
-                # group_records is already a list of dictionaries, no need to call to_dict()
-                res = match_trail_to_routes(group_records, device_id_to_route_stops[dId], processed_routes)
-                if res:
-                    with open(output_file + date + str(chunk_id), 'a') as f:
-                        json.dump({dId: res}, f)
-                        f.write('\n')
-            with open(processed_devices_file + date + str(chunk_id), 'a') as f:
-                f.write(f"{dId}\n")
-        except Exception as e:
-            print(f"Error processing device {dId} in chunk {chunk_id}: {e}")
+    chunk_id, d, route_id, device_details, output_file, processed_devices_file, processed_routes, date = args
+    print("chunk_id", chunk_id)
+    matched_routes = {}
+    matched_routes_intermediate = {}
+    for dId in device_details:
+      stops = device_details[dId]
+      try:
+        # Filter the dataframe for the current device_id and convert to list of dictionaries
+        device_data = d.get_group(dId).to_dict('records')
+        match_trail_to_routes(route_id, device_data, stops, processed_routes, matched_routes, matched_routes_intermediate)
+        with open(processed_devices_file + date + str(chunk_id), 'a') as f:
+          f.write(f"{dId}\n")
+        if route_id in matched_routes_intermediate or route_id in matched_routes:
+          break
+      except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Detailed error traceback for device {dId}:")
+        print(error_details)
+        print(f"Error processing device {dId} in chunk {chunk_id}: {e}")
+    beforeLoop = 0
+    while route_id in matched_routes_intermediate:
+      oldMatchedRoutesIntermediate = matched_routes_intermediate[route_id]
+      afterLoop = len(oldMatchedRoutesIntermediate['stops'])
+      print("beforeLoop", beforeLoop)
+      print("afterLoop", afterLoop)
+      if afterLoop > beforeLoop:
+        beforeLoop = len(oldMatchedRoutesIntermediate['stops'])
+        for dId in device_details:
+          stopsList = oldMatchedRoutesIntermediate['missing_sequences']
+          device_data = d.get_group(dId).to_dict('records')
+          match_trail_to_routes(route_id, device_data, stopsList, processed_routes, matched_routes, matched_routes_intermediate)
+      else:
+         break
+    res = matched_routes.get(route_id)
+    if res:
+      with open(output_file + date + '-' + str(chunk_id) + '.json', 'a') as f:
+        json.dump({dId: res}, f)
+        f.write('\n')
     return f"Chunk {chunk_id} completed"
 
 # Main processing function
-def process_devices(d, device_id_to_route_stops, output_file="output-new-16-april.json", processed_devices_file="processed_devices-new-16-april.txt", processed_routes_file="routes_done", num_threads=100):
+def process_devices(d, route_id_device_details_mapping, output_file="output-new-", processed_devices_file="processed_devices-new-", processed_routes_file="routes_done", num_threads=200):
     # Get date from global scope
     global date
 
@@ -200,36 +245,55 @@ def process_devices(d, device_id_to_route_stops, output_file="output-new-16-apri
     chunk_size = total_devices // num_processes
     remainder = total_devices % num_processes
     
-    chunks = []
-    start_idx = 0
-    for i in range(num_processes):
-        # Add one extra item to early chunks if there's a remainder
-        extra = 1 if i < remainder else 0
-        end_idx = start_idx + chunk_size + extra
-        chunks.append(devices_to_process[start_idx:end_idx])
-        start_idx = end_idx
-    
 
+    done_routes = ['1010', '1013', '1017', '1030', '1034', '1035', '1093', '1299', '136', '1389', '1440', '1447', '1458', '1486', '1490', '1556', '1569', '1572', '1592', '1620', '1676', '1711', '1735', '1750', '1771', '1772', '1779', '178', '18', '1814', '182', '1824', '1846', '1849', '1858', '1873', '1887', '1913', '1921', '1935', '1936', '1939', '1941', '1946', '1948', '1956', '1961', '1967', '1988', '1993', '200', '2016', '2044', '2046', '2047', '2048', '2050', '2051', '2053', '2055', '2056', '2058', '2061', '2064', '2067', '2068', '2100', '2101', '2104', '2113', '2117', '2119', '2120', '2122', '2125', '2126', '2139', '2146', '2147', '2149', '2154', '2155', '2156', '2158', '2159', '2168', '2169', '2187', '2189', '2194', '2196', '2199', '22', '2201', '2206', '2221', '2223', '2225', '2226', '2229', '2231', '2233', '2235', '2238', '2240', '2241', '2245', '2247', '2249', '2251', '2253', '2255', '2263', '2265', '2270', '2271', '2297', '2298', '2302', '2304', '2315', '2322', '2325', '2326', '2331', '2337', '2347', '2353', '2355', '2356', '2363', '2384', '2385', '2389', '2390', '2409', '2410', '2411', '2413', '2425', '2441', '2442', '2448', '2466', '2470', '2471', '2479', '2487', '2488', '2507', '2513', '2514', '2518', '2520', '2594', '2614', '2615', '2637', '2638', '2676', '2703', '2707', '2709', '2716', '2722', '2730', '2731', '2744', '2746', '2758', '2764', '2765', '2768', '2769', '2776', '2793', '28', '2801', '2814', '2818', '2825', '2826', '2834', '2835', '2842', '2862', '2863', '2864', '2874', '2902', '2903', '2904', '2906', '2909', '2910', '2911', '2912', '2913', '2914', '2921', '2930', '2932', '2948', '2949', '2968', '2969', '2970', '2992', '2993', '30', '3000', '3004', '3005', '3008', '3014', '3016', '3018', '3020', '3021', '3038', '3039', '3063', '3079', '3088', '3089', '3106', '3117', '3121', '3122', '3127', '3128', '3133', '3160', '3161', '3172', '3173', '3177', '319', '3204', '3213', '3214', '3221', '3222', '3226', '3229', '3230', '3239', '3240', '3248', '325', '326', '3284', '3285', '3323', '3327', '333', '3358', '337', '3384', '3385', '3397', '3398', '3399', '3401', '3407', '3408', '3409', '3412', '3413', '3417', '3418', '3419', '3428', '3432', '3434', '3438', '344', '3446', '3448', '3458', '3459', '346', '3465', '3480', '3510', '3514', '3539', '354', '3541', '3542', '3554', '3562', '3590', '3592', '3593', '3594', '3595', '3598', '3599', '3602', '3603', '3604', '3605', '3606', '3616', '3640', '3641', '3658', '3661', '3662', '3683', '3684', '3722', '3723', '3724', '3725', '3728', '3729', '3734', '3735', '3742', '3743', '3746', '3748', '3750', '3755', '3758', '3759', '3762', '3763', '3770', '3771', '3791', '3792', '3799', '38', '3800', '3805', '384', '385', '3855', '3856', '3857', '386', '3861', '3863', '3865', '3866', '3867', '3868', '3873', '3876', '3877', '3878', '3881', '3882', '3887', '3888', '3893', '3913', '3914', '3923', '3924', '3949', '3950', '3975', '3976', '3986', '3990', '3999', '40', '4001', '4006', '4008', '4012', '4017', '4021', '4025', '4027', '4036', '4056', '4060', '4062', '4080', '4082', '4084', '4089', '4090', '4092', '4094', '4096', '410', '4100', '4102', '4103', '4105', '4106', '4108', '4109', '4130', '4132', '4133', '4144', '4145', '4150', '4156', '4157', '4162', '4163', '4171', '4174', '4185', '4199', '420', '4222', '4235', '4236', '4237', '4238', '4240', '4243', '4244', '4247', '4253', '4278', '4285', '4315', '4316', '4320', '4325', '4348', '4355', '4356', '437', '4377', '4378', '44', '4412', '4413', '4419', '4429', '4430', '4435', '4436', '4437', '4438', '4439', '4444', '4463', '4464', '4465', '4466', '4473', '4475', '4477', '4479', '4480', '4496', '4497', '4498', '4503', '4506', '4508', '4510', '4515', '4517', '4519', '452', '4522', '4523', '4524', '4525', '4547', '4549', '4551', '4559', '4561', '4562', '4563', '4564', '4565', '4566', '4567', '4568', '4569', '4570', '4571', '4579', '4586', '4587', '4590', '4591', '4594', '4596', '4597', '4599', '4600', '4601', '4602', '4610', '4611', '4615', '4617', '4622', '4624', '4627', '4628', '4629', '4632', '4633', '4654', '4655', '4659', '4660', '4667', '4692', '4693', '4721', '4722', '4724', '4730', '4731', '4736', '4778', '4783', '4802', '4803', '4851', '4852', '4853', '4860', '4867', '4868', '4874', '4876', '4880', '4933', '4979', '4981', '4986', '4988', '5017', '5018', '5035', '5107', '5109', '5117', '5172', '5176', '5183', '5194', '5195', '522', '527', '542', '555', '565', '608', '650', '692', '695', '699', '701', '702', '759', '789', '8', '808', '841', '844', '845', '862', '866', '936', '942', '944', '98']
+    # with open("routes_done", "r") as f:
+    #    done_routes = f.readlines()
+    #    done_routes = list(map(lambda x: x.replace("\n", ""), done_routes))
     # Add a loading indicator to show progress
     from tqdm import tqdm
+    i = 0
+    # Create a list of arguments for parallel processing
+    process_args = []
+    print("route_id already done", done_routes)
+    for route_id in route_id_device_details_mapping:
+        if str(route_id) not in done_routes:
+          device_details = route_id_device_details_mapping[route_id]
+          process_args.append((i, d, route_id, device_details, output_file, processed_devices_file, processed_routes, date))
+          i += 1
+        else:
+           print("route_id already done 2", route_id)
     
-    with mp.Pool(processes=num_processes) as pool:
-        chunk_args = [(i, chunk, device_id_to_route_stops, output_file, processed_devices_file, processed_routes, date) for i, chunk in enumerate(chunks)]
-        # Use imap to process chunks and show progress with tqdm
-        results = []
-        for result in tqdm(pool.imap(process_chunk, chunk_args), 
-                          total=len(chunk_args), 
-                          desc="Processing device chunks"):
-            results.append(result)
-            
-    print(f"All {len(results)} chunks processed successfully")
+    # Use multiprocessing to process routes in parallel
+    total_routes = len(process_args)
+    print(f"Processing {total_routes} routes in parallel...")
 
+    chunks = []
+    for i in range(num_processes):
+      chunks.append(process_args[i::num_processes])
 
+    with Pool(processes=num_processes) as pool:
+        for _ in tqdm(
+            pool.imap_unordered(process_chunk, process_args),
+            total=len(process_args),
+            desc="Processing routes",
+            unit="route",
+            ncols=100,
+            bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{percentage:3.0f}%]'
+        ):
+            pass
 
-date = "2025-04-16"
 
 if __name__ == "__main__":
   # Set the multiprocessing start method to 'spawn' for better cross-platform compatibility
+  import argparse
+
+      # Set up argument parser for command line input
+  parser = argparse.ArgumentParser(description='Process location data for a specific date')
+  parser.add_argument('--date', type=str, required=True, help='Date in YYYY-MM-DD format')
+  args = parser.parse_args()
+
+  date = args.date
   try:
     mp.set_start_method('spawn', force=True)
   except RuntimeError:
@@ -246,65 +310,65 @@ if __name__ == "__main__":
     
     # PostgreSQL connection parameters - you'll need to replace these with your actual credentials
     pg_params = {
-        'dbname': 'your_database',
-        'user': 'your_username',
-        'password': 'your_password',
-        'host': 'your_host',
-        'port': 'your_port'
+            'dbname': 'mtc_master_prod',
+                    'user': 'mtc_root_user',
+                            'password': 'C@uM7a$2025',
+                                    'host': '10.6.156.30',
+                                            'port': '5432'
+
     }
     
-    try:
-        # Connect to PostgreSQL
-        conn = psycopg2.connect(**pg_params)
-        cursor = conn.cursor()
-        date = "2025-04-22"
-        # Execute the query to get vehicle_route_mapping data
-        query = f"""
-        SELECT
-          "public"."waybills"."waybill_id" AS "waybill_id",
-          "public"."waybills"."vehicle_no" AS "vehicle_no",
-          "public"."waybills"."schedule_trip_id" AS "schedule_trip_id",
-          "Bus Schedule Trip Detail - Schedule Trip"."route_number_id" AS "route_id"
-        FROM
-          "public"."waybills"
-          INNER JOIN "public"."bus_schedule_trip_detail" AS "Bus Schedule Trip Detail - Schedule Trip" 
-          ON "public"."waybills"."schedule_trip_id" = "Bus Schedule Trip Detail - Schedule Trip"."schedule_trip_id"
-        WHERE
-          ("public"."waybills"."duty_date" = '{date}')
-          AND ("public"."waybills"."deleted" = FALSE)
-        ORDER BY
-          "public"."waybills"."vehicle_no" DESC
-        """
+    # try:
+    #     # Connect to PostgreSQL
+    #     conn = psycopg2.connect(**pg_params)
+    #     cursor = conn.cursor()
+    #     # Execute the query to get vehicle_route_mapping data
+    #     query = f"""
+    #     SELECT
+    #       "public"."waybills"."waybill_id" AS "waybill_id",
+    #       "public"."waybills"."vehicle_no" AS "vehicle_no",
+    #       "public"."waybills"."schedule_trip_id" AS "schedule_trip_id",
+    #       "Bus Schedule Trip Detail - Schedule Trip"."route_number_id" AS "route_id"
+    #     FROM
+    #       "public"."waybills"
+    #       INNER JOIN "public"."bus_schedule_trip_detail" AS "Bus Schedule Trip Detail - Schedule Trip" 
+    #       ON "public"."waybills"."schedule_trip_id" = "Bus Schedule Trip Detail - Schedule Trip"."schedule_trip_id"
+    #     WHERE
+    #       ("public"."waybills"."duty_date" = '{date}')
+    #       AND ("public"."waybills"."deleted" = FALSE)
+    #     ORDER BY
+    #       "public"."waybills"."vehicle_no" DESC
+    #     """
         
-        # Create a StringIO object to store the CSV data
-        csv_data = io.StringIO()
+    #     # Create a StringIO object to store the CSV data
+    #     csv_data = io.StringIO()
         
-        # Execute the query and fetch the results
-        cursor.execute(query)
+    #     # Execute the query and fetch the results
+    #     cursor.execute(query)
         
-        # Write header to the StringIO object
-        header = ['waybill_id', 'vehicle_no', 'schedule_trip_id', 'route_id']
-        csv_data.write(','.join(header) + '\n')
+    #     # Write header to the StringIO object
+    #     header = ['waybill_id', 'vehicle_no', 'schedule_trip_id', 'route_id']
+    #     csv_data.write(','.join(header) + '\n')
         
-        # Write data rows to the StringIO object
-        for row in cursor.fetchall():
-            csv_data.write(','.join(str(item) for item in row) + '\n')
+    #     # Write data rows to the StringIO object
+    #     for row in cursor.fetchall():
+    #         csv_data.write(','.join(str(item) for item in row) + '\n')
         
-        # Reset the position to the beginning of the StringIO object
-        csv_data.seek(0)
+    #     # Reset the position to the beginning of the StringIO object
+    #     csv_data.seek(0)
         
-        # Close the cursor and connection
-        cursor.close()
-        conn.close()
+    #     # Close the cursor and connection
+    #     cursor.close()
+    #     conn.close()
         
-        # Read the CSV data into a pandas DataFrame
-        vehicle_route_mapping = pd.read_csv(csv_data)
+    #     # Read the CSV data into a pandas DataFrame
+    #     vehicle_route_mapping = pd.read_csv(csv_data)
         
-    except (Exception, psycopg2.Error) as error:
-        print(f"Error connecting to PostgreSQL database: {error}")
-        # If there's an error with the PostgreSQL connection, fall back to reading from CSV file
-        print("Falling back to reading from CSV file...")
-    # vehicle_route_mapping = pd.read_csv("vehicle_route_mapping-16-april.csv")
+    # except (Exception, psycopg2.Error) as error:
+    #     print(f"Error connecting to PostgreSQL database: {error}")
+    #     # If there's an error with the PostgreSQL connection, fall back to reading from CSV file
+    #     print("Falling back to reading from CSV file...")
+    vehicle_route_mapping = pd.read_csv("vehicle_route_mapping-11-april.csv")
     route_stop_mapping = pd.read_csv("route-stop-mapping.csv")
     vehicle_device_mapping = pd.read_csv("vehicle_device_mapping.csv")
 
@@ -337,38 +401,6 @@ if __name__ == "__main__":
   # Assuming the files are in the current working directory.
   # If not, provide the full path to the files.
 
-  try:
-    device_id_to_route_stops = {}
-    for index, row in vehicle_device_mapping.iterrows():
-      device_id = str(int(row['device_id']))
-      vehicle_id = row['vehicle_no']
-
-      route_ids = vehicle_route_mapping[vehicle_route_mapping['vehicle_no'] == vehicle_id]['route_id']
-
-      for route_id in route_ids:
-        if pd.notna(route_id):  # Check for NaN values in route_id
-          # Sort stops by sequence
-          route_stops = route_stop_mapping[route_stop_mapping['Route ID'] == route_id].sort_values(by='Sequence')
-          stop_lat_longs = []
-          for index2, row2 in route_stops.iterrows():
-            stop_lat = row2['LAT']
-            stop_long = row2['LON']
-            seq = row2['Sequence']
-            stop_lat_longs.append({'lat': stop_lat, 'long': stop_long, 'seq': seq})
-
-          if device_id not in device_id_to_route_stops:
-            device_id_to_route_stops[device_id] = {}
-          device_id_to_route_stops[device_id][route_id] = stop_lat_longs
-
-  except FileNotFoundError:
-    print("One or more of the specified files were not found. Please ensure the files exist in the correct directory.")
-  except pd.errors.ParserError:
-    print("Error parsing the CSV file. Please check the file format.")
-  except KeyError as e:
-    print(f"A required column is missing: {e}")
-  except Exception as e:
-    print(f"An unexpected error occurred: {e}")
-
   location_csv_file = date + "-location.csv"
 
   query = f"""
@@ -395,15 +427,18 @@ if __name__ == "__main__":
           df = df.iloc[:, 1:5]  # Take columns 1-4 (skipping the first one which is likely the index)
       # Ensure column names are set correctly
       df.columns = ['lat', 'timestamp', 'long', 'device_id']
+      df['device_id'] = df['device_id'].astype(str)
   else:
       import clickhouse_driver
 
       clickhouse_conn_params = {
-          'host': 'host',
-          'port': '9000',
-          'user': 'juspay_rw',
-          'password': 'pass',
-          'database': 'atlas_kafka'
+          
+              'host': '10.6.155.15',
+                            'port': '9000',
+                                          'user': 'juspay_rw',
+                                                        'password': '6phlcAo88qfpZrwH',
+                                                                      'database': 'atlas_kafka'
+
       }
       clickhouse_client = clickhouse_driver.Client(
           host=clickhouse_conn_params['host'],
@@ -423,14 +458,54 @@ if __name__ == "__main__":
       df.to_csv(location_csv_file, index=False)  # Save without index column
   print("====== locationShape: ", df.shape)
 
-  # # Convert the timestamp field to datetime objects
-  # df['timestamp'] = pd.to_datetime(df['timestamp'])
+  # prompt: convert the timestamp field in df to time strings
+  df['timestamp'] = pd.to_datetime(df['timestamp'])
 
   # # Convert the datetime objects to strings in the desired format
-  # df['timestamp'] = df['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
+  df['timestamp'] = df['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
   print(df.head())
   d = df.groupby('device_id')
-  # prompt: convert the timestamp field in df to time strings
-
   # Call the function to process the data at the end of the if __name__ == "__main__" block
-  process_devices(d, device_id_to_route_stops)
+  try:
+    all_devices_live_data = list(set(df['device_id'].astype(str)))
+    route_id_device_details_mapping = {}
+    count = 0
+    for index, row in vehicle_device_mapping.iterrows():
+      device_id = str(int(row['device_id']))
+      vehicle_id = row['vehicle_no']
+      if device_id not in all_devices_live_data:
+        print(f"Device ID {device_id} not found in location data, skipping...")
+        count += 1
+        continue
+
+      route_ids = vehicle_route_mapping[vehicle_route_mapping['vehicle_no'] == vehicle_id]['route_id']
+
+      for route_id in route_ids:
+        if pd.notna(route_id):  # Check for NaN values in route_id
+          # Sort stops by sequence
+          route_stops = route_stop_mapping[route_stop_mapping['Route ID'] == route_id].sort_values(by='Sequence')
+          stop_lat_longs = []
+          for index2, row2 in route_stops.iterrows():
+            stop_lat = row2['LAT']
+            stop_long = row2['LON']
+            seq = row2['Sequence']
+            stop_lat_longs.append({'lat': stop_lat, 'long': stop_long, 'seq': seq})
+
+          if route_id not in route_id_device_details_mapping:
+              route_id_device_details_mapping[route_id] = {}
+          route_id_device_details_mapping[route_id][device_id] = stop_lat_longs
+          
+  except FileNotFoundError:
+    print("One or more of the specified files were not found. Please ensure the files exist in the correct directory.")
+  except pd.errors.ParserError:
+    print("Error parsing the CSV file. Please check the file format.")
+  except KeyError as e:
+    print(f"A required column is missing: {e}")
+  except Exception as e:
+    print(f"An unexpected error occurred: {e}")
+
+  print("devices not found: ", count)
+  import time
+  time.sleep(5)
+  process_devices(d, route_id_device_details_mapping)
+
