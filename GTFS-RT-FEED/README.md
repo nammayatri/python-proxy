@@ -123,20 +123,25 @@ The application expects trip update data to be stored in Redis under the key spe
 
 1. Access Redis CLI:
 ```bash
-docker compose exec redis redis-cli
+docker run -d --name redis-stack -p 6379:6379 -p 8001:8001 redis/redis-stack:latest
 ```
 
-2. Set test data:
+2. Connect with redis-cli:
+```bash
+docker exec -it redis-stack redis-cli
+```
+
+3. Set test data:
 ```bash
 JSON.SET gtfs_realtime_data:tripupdates $ '{"header":{"gtfsRealtimeVersion":"2.0","incrementality":"FULL_DATASET","timestamp":"1745591074"},"entity":[{"id":"1","tripUpdate":{"trip":{"tripId":"4796-S-UP-53717","startTime":"05:40:00","startDate":"20250611","routeId":"4796","directionId":0},"stopTimeUpdate":[{"stopSequence":2,"arrival":{"time":"1749600920"},"departure":{"time":"1749605700"},"stopId":"KwaxxmSs"}],"vehicle":{"id":"vehicle_4796","label":"PB07"},"timestamp":"1745591074"}}]}'
 ```
 
-3. Check the data in Redis GUI:
+4. Check the data in Redis GUI:
 ```bash
 http://localhost:8001/redis-stack/browser
 ```
 
-3. Test the API:
+5. Test the API:
 ```bash
 curl http://localhost:8004/gtfs-rt/trip-updates/json
 ```
