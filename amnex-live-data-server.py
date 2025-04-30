@@ -900,7 +900,6 @@ def parse_amnex_payload(payload, serverTime, client_ip):
             deviceId = payload[5]
             timestamp = payload[8]
             date = payload[9]
-            routeNumber = payload[17]
             date = dd_mm_ss_to_date(date + "-" + timestamp)
             dataState = payload[3]
             raw = payload
@@ -911,7 +910,6 @@ def parse_amnex_payload(payload, serverTime, client_ip):
                 "deviceId": deviceId,
                 "timestamp": date_to_unix(date),
                 "dataState": dataState,
-                "routeNumber": routeNumber,
                 "pushedToKafkaAt": date_to_unix(datetime.now()),
                 "serverTime": date_to_unix(serverTime),
                 "raw": raw,
@@ -1401,7 +1399,6 @@ def calculate_route_match_score(route_id, vehicle_no, stops: dict, vehicle_point
 
         # Sort vehicle_points by timestamp to ensure they're in chronological order
         vehicle_points = sorted(vehicle_points, key=lambda x: x.get('timestamp', 0))
-        print("Route ID: VERIFY_LOCALLY_WITH_THIS", vehicle_no, route_id, "polyline: ", route_polyline, "vehicle_points: ", json.dumps(vehicle_points), "polyline_points: ", json.dumps(polyline_points))
         if polyline_points:
             # Count how many vehicle_points are near the polyline
             near_points = []
@@ -1426,7 +1423,6 @@ def calculate_route_match_score(route_id, vehicle_no, stops: dict, vehicle_point
             proximity_ratio = len(near_points) / len(vehicle_points) if len(vehicle_points) > 0 else 0
             
             # Only proceed if enough vehicle_points are near the polyline
-            print(f"Route ID: {vehicle_no} {route_id} route match check ", min_segments_list, proximity_ratio)
             if proximity_ratio >= 0.3:
                 # Convert set to list and sort to check direction
                 if len(min_segments_list) >= 2 and min(min_segments_list) == min_segments_list[0]:
@@ -1438,45 +1434,49 @@ def calculate_route_match_score(route_id, vehicle_no, stops: dict, vehicle_point
         logger.error(f"Error calculating route match score: {stops} {e}\nTraceback: {error_details}")
         return 0.0
 
+def push_to_kafka(entity):
+    max_retries = 3
+    retries = 0
+    success = False
+
+    while retries < max_retries and not success:
+        try:
+            # For confluent_kafka.Producer, we need to provide the data as a string
+            producer.produce(KAFKA_TOPIC, json.dumps(entity).encode('utf-8'), callback=delivery_report)
+            producer.poll(0)  # Trigger any callbacks
+            success = True
+        except BufferError as e:
+            logger.error(f"Kafka buffer full, waiting before retry: {str(e)}")
+            # Wait for buffer space to free up
+            producer.poll(1)
+            retries += 1
+        except Exception as e:
+            logger.error(f"Failed to send to Kafka (attempt {retries+1}): {str(e)}")
+            retries += 1
+            time.sleep(1)
+
+    # Flush to ensure delivery        
+    if success:
+        try:
+            producer.flush(timeout=5.0)
+        except Exception as e:
+            logger.error(f"Error flushing Kafka producer: {str(e)}")
+
 def handle_client_data(payload, client_ip, serverTime,session=None):
     """Handle client data and send it to Kafka"""
     try:
          # Try to send to Kafka with retries
-        max_retries = 3
-        retries = 0
-        success = False
-
         entity = parse_payload(payload, client_ip, serverTime)
 
         if not entity:
             return
 
-        while retries < max_retries and not success:
-            try:
-                # For confluent_kafka.Producer, we need to provide the data as a string
-                producer.produce(KAFKA_TOPIC, json.dumps(entity).encode('utf-8'), callback=delivery_report)
-                producer.poll(0)  # Trigger any callbacks
-                success = True
-            except BufferError as e:
-                logger.error(f"Kafka buffer full, waiting before retry: {str(e)}")
-                # Wait for buffer space to free up
-                producer.poll(1)
-                retries += 1
-            except Exception as e:
-                logger.error(f"Failed to send to Kafka (attempt {retries+1}): {str(e)}")
-                retries += 1
-                time.sleep(1)
-        
-        # Flush to ensure delivery        
-        if success:
-            try:
-                producer.flush(timeout=5.0)
-            except Exception as e:
-                logger.error(f"Error flushing Kafka producer: {str(e)}")
         if FORWARD_TCP:
             forward_to_tcp(payload)
 
+
         if 'dataState' not in entity or entity.get('dataState') not in ['L', 'LP', 'LO'] or entity.get('provider') == 'chalo':
+            push_to_kafka(entity)
             print(f"Skipping chalo data")
             return
             
@@ -1486,6 +1486,8 @@ def handle_client_data(payload, client_ip, serverTime,session=None):
         
         # Get route information for this vehicle
         fleet_info = get_fleet_info(deviceId, vehicle_lat, vehicle_lon, entity.get('timestamp'))
+        entity['routeNumber'] = fleet_info.get('route_id')
+        push_to_kafka(entity)
         if fleet_info and 'route_id' in fleet_info and fleet_info["route_id"] != None:
             route_id = fleet_info['route_id']
             
