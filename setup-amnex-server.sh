@@ -131,7 +131,34 @@ python3 -m pip install -r requirements.txt
 
 # Start the server
 echo "🚀 Starting GPS server..."
-sudo $WORK_DIR/venv/bin/python3 amnex-live-data-server.py
+# Start the server in the background and save its PID
+sudo $WORK_DIR/venv/bin/python3 amnex-live-data-server.py &
+SERVER_PID=$!
+echo "Server started with PID: $SERVER_PID"
+
+# Monitor for version changes every 10 seconds
+while true; do
+    sleep 10
+    NEW_VERSION=$(get_version_from_redis)
+    CURRENT_VERSION="$VERSION"
+    
+    if [ "$NEW_VERSION" != "$CURRENT_VERSION" ]; then
+        echo "🔄 Version changed from $CURRENT_VERSION to $NEW_VERSION. Restarting server..."
+        # Kill the current server process
+        sudo kill -9 $SERVER_PID
+        
+        # Update the current version
+        VERSION="$NEW_VERSION"
+        
+        git checkout "$VERSION"
+        
+        $WORK_DIR/venv/bin/python3 -m pip install -r requirements.txt
+        
+        sudo $WORK_DIR/venv/bin/python3 amnex-live-data-server.py &
+        SERVER_PID=$!
+        echo "Server restarted with PID: $SERVER_PID"
+    fi
+done
 
 # Cleanup
 trap 'deactivate' EXIT
