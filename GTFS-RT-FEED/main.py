@@ -30,7 +30,8 @@ REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 REDIS_DB = int(os.getenv("REDIS_DB", 0))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", None)
 APP_PORT = int(os.getenv("APP_PORT", 8004))
-REDIS_KEY = os.getenv("REDIS_KEY", "gtfs_realtime_data:tripupdates")\
+REDIS_KEY = os.getenv("REDIS_KEY", "gtfs-rt-tripupdates:bus")
+TRAIN_REDIS_KEY = os.getenv("TRAIN_REDIS_KEY", "gtfs-rt-tripupdates:bus")
 
 DEV_MODE = os.getenv("DEV_MODE", "false").lower() == "true"
 
@@ -57,12 +58,12 @@ except Exception as e:
     logger.error(f"Unexpected error connecting to Redis: {str(e)}")
     raise
 
-def get_trip_updates_from_redis():
+def get_trip_updates_from_redis(redis_key):
     try:
-        logger.info(f"Fetching trip updates from Redis key: {REDIS_KEY}")
-        trip_updates = redis_client.json().get(REDIS_KEY)
+        logger.info(f"Fetching trip updates from Redis key: {redis_key}")
+        trip_updates = redis_client.json().get(redis_key)
         if not trip_updates:
-            logger.warning(f"No trip updates found in Redis key {REDIS_KEY}")
+            logger.warning(f"No trip updates found in Redis key {redis_key}")
             raise HTTPException(status_code=404, detail=f"No trip updates found in Redis")
         
         logger.debug(f"Retrieved trip data: {trip_updates}")
@@ -137,39 +138,68 @@ async def root():
         "api": "GTFS Realtime Feed API",
         "version": "1.0.0",
         "endpoints": {
-            "trip_updates": "/gtfs-rt/trip-updates",
+            "bus_trip_updates": "/gtfs-rt-tripupdates/bus",
+            "train_trip_updates": "/gtfs-rt-tripupdates/train",
             "vehicle_positions": "/gtfs-rt/vehicle-positions (coming soon)",
             "service_alerts": "/gtfs-rt/service-alerts (coming soon)"
         }
     }
 
 
-@app.get("/gtfs-rt/trip-updates", tags=["Trip Updates"])
-async def trip_updates_info():
-    """Information about trip updates endpoints"""
+@app.get("/gtfs-rt-tripupdates/bus", tags=["Bus Trip Updates"])
+async def bus_trip_updates_info():
+    """Information about bus trip updates endpoints"""
     return {
-        "description": "GTFS-RT Trip Updates feed",
+        "description": "GTFS-RT Bus Trip Updates feed",
         "formats": {
-            "protobuf": "/gtfs-rt/trip-updates/pb",
-            "json": "/gtfs-rt/trip-updates/json"
+            "protobuf": "/gtfs-rt-tripupdates/bus/pb",
+            "json": "/gtfs-rt-tripupdates/bus/json"
         }
     }
 
-@app.get("/gtfs-rt/trip-updates/pb", tags=["Trip Updates"])
-async def get_trip_updates_protobuf():
-    """Get trip updates in protobuf format"""
-    logger.info("Received request for protobuf trip updates")
-    feed = get_trip_updates_from_redis()
+@app.get("/gtfs-rt-tripupdates/bus/pb", tags=["Bus Trip Updates"])
+async def get_bus_trip_updates_protobuf():
+    """Get bus trip updates in protobuf format"""
+    logger.info("Received request for protobuf bus trip updates")
+    feed = get_trip_updates_from_redis(REDIS_KEY)
     return Response(
         content=feed.SerializeToString(),
         media_type="application/x-protobuf"
     )
 
-@app.get("/gtfs-rt/trip-updates/json", tags=["Trip Updates"])
-async def get_trip_updates_json():
-    """Get trip updates in JSON format"""
-    logger.info("Received request for JSON trip updates")
-    feed = get_trip_updates_from_redis()
+@app.get("/gtfs-rt-tripupdates/bus/json", tags=["Bus Trip Updates"])
+async def get_bus_trip_updates_json():
+    """Get bus trip updates in JSON format"""
+    logger.info("Received request for JSON bus trip updates")
+    feed = get_trip_updates_from_redis(REDIS_KEY)
+    return json_format.MessageToDict(feed)
+
+@app.get("/gtfs-rt-tripupdates/train", tags=["Train Trip Updates"])
+async def train_trip_updates_info():
+    """Information about train trip updates endpoints"""
+    return {
+        "description": "GTFS-RT Train Trip Updates feed",
+        "formats": {
+            "protobuf": "/gtfs-rt-tripupdates/train/pb",
+            "json": "/gtfs-rt-tripupdates/train/json"
+        }
+    }
+
+@app.get("/gtfs-rt-tripupdates/train/pb", tags=["Train Trip Updates"])
+async def get_train_trip_updates_protobuf():
+    """Get train trip updates in protobuf format"""
+    logger.info("Received request for protobuf train trip updates")
+    feed = get_trip_updates_from_redis(TRAIN_REDIS_KEY)
+    return Response(
+        content=feed.SerializeToString(),
+        media_type="application/x-protobuf"
+    )
+
+@app.get("/gtfs-rt-tripupdates/train/json", tags=["Train Trip Updates"])
+async def get_train_trip_updates_json():
+    """Get train trip updates in JSON format"""
+    logger.info("Received request for JSON train trip updates")
+    feed = get_trip_updates_from_redis(TRAIN_REDIS_KEY)
     return json_format.MessageToDict(feed)
 
 # Placeholder endpoints for future implementation
