@@ -8,25 +8,21 @@ import logging
 from dotenv import load_dotenv
 from pathlib import Path
 
-# Get script directory and set up log file
 SCRIPT_DIR = Path(__file__).resolve().parent
 log_file = SCRIPT_DIR / 'train_updates.log'
 
-# Configure logging to write to file
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler(log_file),
-        logging.StreamHandler()  # Also print to console
+        logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
 
-# Load environment variables from .env file
 load_dotenv()
 
-# Redis configuration from environment variables
 REDIS_HOST = os.getenv('REDIS_HOST')
 REDIS_PORT = os.getenv('REDIS_PORT')
 REDIS_DB = os.getenv('REDIS_DB')
@@ -35,7 +31,6 @@ TRAIN_REDIS_KEY = os.getenv('TRAIN_REDIS_KEY')
 logger.info(f"Logging to file: {log_file}")
 logger.info(f"Connecting to Redis at {REDIS_HOST}:{REDIS_PORT}")
 
-# Redis configuration
 redis_client = redis.Redis(
     host=REDIS_HOST,
     port=REDIS_PORT,
@@ -73,7 +68,6 @@ def transform_to_gtfs_rt(data):
 
     current_timestamp = int(time.time())
     
-    # Initialize GTFS-RT structure
     gtfs_rt = {
         "header": {
             "gtfsRealtimeVersion": "2.0",
@@ -83,7 +77,6 @@ def transform_to_gtfs_rt(data):
         "entity": []
     }
 
-    # Group stations by train number
     trains_data = {}
     for station in data:
         train_no = station.get('trainNo')
@@ -94,16 +87,13 @@ def transform_to_gtfs_rt(data):
             trains_data[train_no] = []
         trains_data[train_no].append(station)
 
-    # Process each train
     for train_no, stations in trains_data.items():
         if not stations:
             continue
 
-        # Get the first station to extract common trip information
         first_station = stations[0]
         train_start_date = datetime.strptime(first_station['trainStartDate'], "%Y/%m/%d %H:%M:%S")
         
-        # Create trip update entity
         trip_update = {
             "id": f"{train_no}_T1",
             "tripUpdate": {
@@ -123,17 +113,13 @@ def transform_to_gtfs_rt(data):
             }
         }
 
-        # Add stop time updates
         for station in stations:
-            # Parse scheduled times
             sched_arrival_time = datetime.strptime(station['schedArrivalTime'], "%H:%M:%S").time()
             sched_departure_time = datetime.strptime(station['schedDepartureTime'], "%H:%M:%S").time()
             
-            # Combine with train start date
             sched_arrival = datetime.combine(train_start_date.date(), sched_arrival_time)
             sched_departure = datetime.combine(train_start_date.date(), sched_departure_time)
             
-            # Add delays to scheduled times
             actual_arrival = sched_arrival.timestamp() + station['delayArrival']
             actual_departure = sched_departure.timestamp() + station['delayDeparture']
 
@@ -161,10 +147,8 @@ def store_gtfs_rt_in_redis(gtfs_rt_data):
         return
 
     try:
-        # Store the complete GTFS-RT feed
         redis_client.set(TRAIN_REDIS_KEY, json.dumps(gtfs_rt_data))
         
-        # Set expiry for 24 hours (86400 seconds)
         redis_client.expire(TRAIN_REDIS_KEY, 86400)
         
         logger.info(f"Successfully stored GTFS-RT feed with {len(gtfs_rt_data['entity'])} trip updates")
@@ -181,22 +165,17 @@ def main():
     logger.info("Starting train status data fetch")
     
     try:
-        # Get train status
         status_data = get_train_status()
         
-        # Transform to GTFS-RT format
         gtfs_rt_data = transform_to_gtfs_rt(status_data)
 
-        print(gtfs_rt_data)
-        
-        # Store in Redis
         store_gtfs_rt_in_redis(gtfs_rt_data)
         
         logger.info("Successfully completed train status data fetch and storage")
             
     except Exception as e:
         logger.error(f"Unexpected error: {e}")
-        raise  # Re-raise the exception so Kubernetes knows the job failed
+        raise
 
 if __name__ == "__main__":
     main()
