@@ -125,9 +125,13 @@ def transform_to_gtfs_rt(data):
 
         # Add stop time updates
         for station in stations:
-            # Calculate actual arrival and departure times
-            sched_arrival = datetime.strptime(station['schedArrivalTime'], "%H:%M:%S")
-            sched_departure = datetime.strptime(station['schedDepartureTime'], "%H:%M:%S")
+            # Parse scheduled times
+            sched_arrival_time = datetime.strptime(station['schedArrivalTime'], "%H:%M:%S").time()
+            sched_departure_time = datetime.strptime(station['schedDepartureTime'], "%H:%M:%S").time()
+            
+            # Combine with train start date
+            sched_arrival = datetime.combine(train_start_date.date(), sched_arrival_time)
+            sched_departure = datetime.combine(train_start_date.date(), sched_departure_time)
             
             # Add delays to scheduled times
             actual_arrival = sched_arrival.timestamp() + station['delayArrival']
