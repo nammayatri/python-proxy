@@ -1,0 +1,22 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: train-status-fetcher
+  namespace: hkm-multimodal
+spec:
+  schedule: "*/5 * * * *"  # Runs every 5 minutes
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: train-status-fetcher
+            image: your-image-name:tag
+            env:
+            - name: REDIS_HOST
+              value: "your-redis-host"
+            - name: REDIS_PORT
+              value: "6379"
+            - name: REDIS_DB
+              value: "3"
+          restartPolicy: OnFailure
