@@ -61,7 +61,8 @@ except Exception as e:
 def get_trip_updates_from_redis(redis_key):
     try:
         logger.info(f"Fetching trip updates from Redis key: {redis_key}")
-        trip_updates = redis_client.json().get(redis_key)
+        trip_updates_str = redis_client.get(redis_key)
+        trip_updates = json.loads(trip_updates_str)
         if not trip_updates:
             logger.warning(f"No trip updates found in Redis key {redis_key}")
             raise HTTPException(status_code=404, detail=f"No trip updates found in Redis")
