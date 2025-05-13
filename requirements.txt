@@ -18,7 +18,7 @@ h11==0.16.0
 haversine==2.8.0
 idna==3.10
 itsdangerous==2.2.0
-Jinja2==3.1.4
+Jinja2==3.1.6
 MarkupSafe==2.1.5
 numpy==1.26.4
 packaging==24.1
