@@ -1734,12 +1734,14 @@ MQTT_HOST = os.getenv('MQTT_HOST', 'localhost')
 MQTT_PORT = os.getenv('MQTT_PORT', '1883')
 MQTT_USER = os.getenv('MQTT_USER', 'user123')
 MQTT_PASSWORD = os.getenv('MQTT_PASSWORD', 'abc123')
-MQTT_TOPIC = os.getenv('MQTT_TOPIC', 'gps-data')
+# In MQTTv5, we can use $share to share a topic between multiple clients 
+# so that one message is consumed by one client in a group (It is load balanced automatically by the broker)
+MQTT_TOPIC = '$share/prod-gps-server/' + os.getenv('MQTT_TOPIC', 'gps-data')
 MQTT_CLIENT_ID = os.getenv('MQTT_CLIENT_ID', 'local-gps-fetch-server') # Pod name in Production
 
 def mqtt_client():
     """MQTT client to consume GPS data and forward to Kafka"""
-    def on_connect(client, _userdata, _flags, rc):
+    def on_connect(client, _userdata, _flags, rc, _properties):
         if rc == 0:
             logger.info("✅ Connected to MQTT broker")
             client.subscribe(MQTT_TOPIC)
@@ -1761,7 +1763,7 @@ def mqtt_client():
             traceback.print_exc()
     
     # Create MQTT client
-    client = mqtt.Client(client_id=MQTT_CLIENT_ID)
+    client = mqtt.Client(client_id=MQTT_CLIENT_ID, protocol=mqtt.MQTTv5)
     client.username_pw_set(MQTT_USER, MQTT_PASSWORD)
     client.on_connect = on_connect
     client.on_message = on_message
