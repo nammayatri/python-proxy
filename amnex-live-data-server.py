@@ -1506,6 +1506,22 @@ def push_to_kafka(entity):
         except Exception as e:
             logger.error(f"Error flushing Kafka producer: {str(e)}")
 
+WHITELISTED_NY_GPS_DEVICE_IDS_CACHE_KEY = "gps-server:whitelisted_ny_gps_device_ids"
+def get_whitelisted_ny_gps_deviceIds():
+    deviceIds = redis_client.lrange(WHITELISTED_NY_GPS_DEVICE_IDS_CACHE_KEY, 0, -1)
+    if type(deviceIds) != list[str]:
+        return []
+    
+    return deviceIds
+
+BLACKLISTED_AMNEX_DEVICE_IDS_CACHE_KEY = "gps-server:blacklisted_amnex_device_ids"
+def get_blacklisted_amnex_deviceIds():
+    deviceIds = redis_client.lrange(BLACKLISTED_AMNEX_DEVICE_IDS_CACHE_KEY, 0, -1)
+    if type(deviceIds) != list[str]:
+        return []
+    
+    return deviceIds
+
 def handle_client_data(payload, client_ip, serverTime, isNYGpsDevice = False, session=None):
     """Handle client data and send it to Kafka"""
     try:
@@ -1518,19 +1534,29 @@ def handle_client_data(payload, client_ip, serverTime, isNYGpsDevice = False, se
         if FORWARD_TCP and not isNYGpsDevice:
             forward_to_tcp(payload)
         
+        deviceId = entity.get("deviceId")
+
         if isNYGpsDevice:
             push_to_kafka(entity)
-            logger.info("Skipping NY gps device mqtt server data for other processing")
-            return
+            ny_whitelisted_device_ids = get_whitelisted_ny_gps_deviceIds()
+            if deviceId not in ny_whitelisted_device_ids:
+                logger.info(f"Skipping NY gps device: {deviceId}, mqtt server data for other processing")
+                return
 
-        if 'dataState' not in entity or entity.get('dataState') not in ['L', 'LP', 'LO'] or entity.get('provider') == 'chalo':
+        if not isNYGpsDevice and ('dataState' not in entity or entity.get('dataState') not in ['L', 'LP', 'LO'] or entity.get('provider') == 'chalo'):
             push_to_kafka(entity)
             print(f"Skipping chalo data")
             return
-            
-        deviceId = entity.get("deviceId")
+
         vehicle_lat = float(entity['lat'])
         vehicle_lon = float(entity['long'])
+            
+        if entity.get('provider') == 'amnex':
+            amnex_blacklisted_device_ids = get_blacklisted_amnex_deviceIds()
+            if deviceId in amnex_blacklisted_device_ids:
+                push_to_kafka(entity)
+                logger.info(f"Skipping blacklisted amnex device: {deviceId}")
+                return
         
         # Get route information for this vehicle
         fleet_info = get_fleet_info(deviceId, vehicle_lat, vehicle_lon, entity.get('timestamp'))
