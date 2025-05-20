@@ -932,7 +932,7 @@ def parse_mqtt_payload(data_str, serverTime, client_ip):
         if len(parts) != 7 or parts[0] != "data":
             raise Exception(f"Unknown format of payload {data_str}")
             
-        deviceId = parts[1]
+        deviceId = parts[1].replace("CD", "")
         lat = float(parts[2])
         lon = float(parts[3])
         speed = float(parts[4])
