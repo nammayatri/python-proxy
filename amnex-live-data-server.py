@@ -1511,7 +1511,7 @@ def get_whitelisted_ny_gps_deviceIds():
     deviceIds = redis_client.lrange(WHITELISTED_NY_GPS_DEVICE_IDS_CACHE_KEY, 0, -1)
     if type(deviceIds) != list[str]:
         return []
-    
+    print("deviceIds white", deviceIds)    
     return deviceIds
 
 BLACKLISTED_AMNEX_DEVICE_IDS_CACHE_KEY = "gps-server:blacklisted_amnex_device_ids"
@@ -1519,7 +1519,7 @@ def get_blacklisted_amnex_deviceIds():
     deviceIds = redis_client.lrange(BLACKLISTED_AMNEX_DEVICE_IDS_CACHE_KEY, 0, -1)
     if type(deviceIds) != list[str]:
         return []
-    
+    print("deviceIds black", deviceIds)
     return deviceIds
 
 def handle_client_data(payload, client_ip, serverTime, isNYGpsDevice = False, session=None):
