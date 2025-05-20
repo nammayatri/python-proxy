@@ -1508,6 +1508,7 @@ def push_to_kafka(entity):
 
 WHITELISTED_NY_GPS_DEVICE_IDS_CACHE_KEY = "gps-server:whitelisted_ny_gps_device_ids"
 def get_whitelisted_ny_gps_deviceIds():
+    return ["3087764365", "3087855693", "3087813297", "3087744289", "3087810997", "1428387553", "301219289"]
     deviceIds = redis_client.lrange(WHITELISTED_NY_GPS_DEVICE_IDS_CACHE_KEY, 0, -1)
     if type(deviceIds) != list[str]:
         return []
@@ -1516,6 +1517,7 @@ def get_whitelisted_ny_gps_deviceIds():
 
 BLACKLISTED_AMNEX_DEVICE_IDS_CACHE_KEY = "gps-server:blacklisted_amnex_device_ids"
 def get_blacklisted_amnex_deviceIds():
+    return ["866041042256377", "865860041737124", "865501043873992", "864337056440093", "866758048846386", "861107033954232", "862607055624299"]
     deviceIds = redis_client.lrange(BLACKLISTED_AMNEX_DEVICE_IDS_CACHE_KEY, 0, -1)
     if type(deviceIds) != list[str]:
         return []
