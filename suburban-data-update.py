@@ -22,6 +22,8 @@ CLIENT_ID = os.getenv('CLIENT_ID', 'client1')
 CLIENT_SECRET = os.getenv('CLIENT_SECRET', 'secret')
 SCOPE = os.getenv('SCOPE', 'cumta')
 AUTH_TOKEN = os.getenv('AUTH_TOKEN', 'token')
+AUTH_URL = os.getenv('AUTH_URL', 'auth_url')
+TRAIN_RUNNING_URL = os.getenv('TRAIN_RUNNING_URL', 'train_running_url')
 
 access_token_global = None
 
@@ -40,7 +42,7 @@ def get_access_token(force_refresh=False):
     global access_token_global
     if not force_refresh and access_token_global:
         return access_token_global
-    url = 'https://gw.crisapis.indianrail.gov.in/token'
+    url = AUTH_URL
     headers = {
         'Content-Type': 'application/x-www-form-urlencoded',
     }
@@ -68,7 +70,7 @@ def get_train_status():
         logger.error("Failed to get access token")
         return None
 
-    url = 'https://gw.crisapis.indianrail.gov.in/t/ntes.cris.in/ntesagent/1.0.0/get-train-running'
+    url = TRAIN_RUNNING_URL
     
     headers = {
         'Accept': 'application/json, text/plain, */*',
