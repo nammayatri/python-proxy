@@ -18,6 +18,12 @@ REDIS_HOST = os.getenv('REDIS_HOST', 'localhost')
 REDIS_PORT = int(os.getenv('REDIS_PORT', 6379))
 REDIS_DB = int(os.getenv('REDIS_DB', 0))
 SLEEP_INTERVAL = int(os.getenv('SLEEP_INTERVAL', 5))
+CLIENT_ID = os.getenv('CLIENT_ID', 'client1')
+CLIENT_SECRET = os.getenv('CLIENT_SECRET', 'secret')
+SCOPE = os.getenv('SCOPE', 'cumta')
+AUTH_TOKEN = os.getenv('AUTH_TOKEN', 'token')
+
+access_token_global = None
 
 logger.info(f"Connecting to Redis at {REDIS_HOST}:{REDIS_PORT}")
 logger.info(f"Using sleep interval of {SLEEP_INTERVAL} seconds")
@@ -30,16 +36,48 @@ redis_client = redis.Redis(
     decode_responses=True
 )
 
+def get_access_token(force_refresh=False):
+    global access_token_global
+    if not force_refresh and access_token_global:
+        return access_token_global
+    url = 'https://gw.crisapis.indianrail.gov.in/token'
+    headers = {
+        'Content-Type': 'application/x-www-form-urlencoded',
+    }
+    data = {
+        'grant_type': 'client_credentials',
+        'client_id': CLIENT_ID,
+        'client_secret': CLIENT_SECRET,
+        'scope': SCOPE
+    }
+    try:
+        response = requests.post(url, headers=headers, data=data)
+        response.raise_for_status()
+        token_data = response.json()
+        access_token_global = token_data.get('access_token')
+        return access_token_global
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error getting access token: {e}")
+        return None
+
 def get_train_status():
     """Make API call to get train running status"""
-    url = 'https://enquiry.indianrail.gov.in/ntesagent/get-train-running'
+    global access_token_global
+    access_token = get_access_token()
+    if not access_token:
+        logger.error("Failed to get access token")
+        return None
+
+    url = 'https://gw.crisapis.indianrail.gov.in/t/ntes.cris.in/ntesagent/1.0.0/get-train-running'
     
     headers = {
         'Accept': 'application/json, text/plain, */*',
         'Accept-Language': 'en-GB,en-US;q=0.9,en;q=0.8',
         'Connection': 'keep-alive',
         'Content-Type': 'application/json;charset=UTF-8',
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        'authToken': AUTH_TOKEN,
+        'Authorization': f'Bearer {access_token}'
     }
     
     data = {
@@ -49,7 +87,24 @@ def get_train_status():
     try:
         response = requests.post(url, headers=headers, json=data)
         response.raise_for_status()
-        return response.json()
+        result = response.json()
+        # If authentication error, refresh token and retry once
+        if (
+            result
+            and isinstance(result, dict)
+            and "errors" in result
+            and result["errors"].get("code") == 900901
+        ):
+            logger.info("Access token expired or invalid, refreshing token and retrying...")
+            access_token = get_access_token(force_refresh=True)
+            if not access_token:
+                logger.error("Failed to refresh access token")
+                return None
+            headers['Authorization'] = f'Bearer {access_token}'
+            response = requests.post(url, headers=headers, json=data)
+            response.raise_for_status()
+            return response.json()
+        return result
     except requests.exceptions.RequestException as e:
         logger.error(f"Error making API request: {e}")
         return None
@@ -94,13 +149,12 @@ def main():
     
     while True:
         try:
-            # Get train status
             status_data = get_train_status()
-            
-            # Store in Redis
-            store_in_redis(status_data)
-            
-            # Wait for the configured interval before next call
+            # print("get_train_status() response:", status_data)  # Debug print
+            if status_data and 'vTrainRunningList' in status_data:
+                store_in_redis(status_data['vTrainRunningList'])
+            else:
+                logger.error("API response missing 'vTrainRunningList'")
             time.sleep(SLEEP_INTERVAL)
             
         except Exception as e:
