@@ -1606,6 +1606,7 @@ def handle_client_data(payload, client_ip, serverTime, isNYGpsDevice = False, se
                 "timestamp": entity["timestamp"],
                 "speed": entity.get("speed", 0),
                 "device_id": deviceId,
+                "vehicle_number": vehicle_number,
                 "route_id": route_id,
                 "serverTime": int(time.time())  # Add current server time
             })
@@ -1625,11 +1626,14 @@ def handle_client_data(payload, client_ip, serverTime, isNYGpsDevice = False, se
                 
                 # Store location in Redis Geo set
                 geo_key = "bus_locations"  # Single key for all bus locations
+                geo_key_new = "bus_locations_metadata"  # Single key for all bus locations with metadata
                 if vehicle_lon is not None and vehicle_lat is not None and vehicle_number:
                     redis_client.geoadd(geo_key, vehicle_lon, vehicle_lat, vehicle_number)
+                    redis_client.geoadd(geo_key_new, vehicle_lon, vehicle_lat, vehicle_data)
                 else:
                     logger.error(f"Invalid location data: lon={vehicle_lon}, lat={vehicle_lat}, member={vehicle_number}")
                 redis_client.expire(geo_key, 86400)  # Expire after 24 hours
+                redis_client.expire(geo_key_new, 86400)  # Expire after 24 hours
                 
             except Exception as e:
                 logger.error(f"Error storing data in Redis: {str(e)}")
