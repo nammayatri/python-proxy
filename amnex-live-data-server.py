@@ -1114,9 +1114,11 @@ class TCPClient:
                     data += '\n'
                 
                 self.socket.sendall(data.encode())
+                print("send data success", data)
                 return True
             except Exception as e:
-                logger.error(f"Error sending data: {str(e)}")
+                print("faled to send data", data)
+                logger.error(f"Error sending data: {str(e)} {data}")
                 self.connected = False  # Mark as disconnected for reconnection
                 
                 # Re-queue the message
@@ -1533,7 +1535,7 @@ def handle_client_data(payload, client_ip, serverTime, isNYGpsDevice = False, se
         if not entity:
             return
 
-        if FORWARD_TCP and not isNYGpsDevice:
+        if FORWARD_TCP and not isNYGpsDevice and not entity.get('provider') == 'chalo':
             forward_to_tcp(payload)
         
         deviceId = entity.get("deviceId")
