@@ -27,8 +27,8 @@ pandas==2.2.1
 polyline==2.0.2
 protobuf==5.28.2
 psycopg2-binary==2.9.10
-pydantic==2.11.4
-pydantic_core==2.33.2
+pydantic==2.6.1
+pydantic-core==2.16.2
 python-dotenv==1.0.1
 pytz==2024.2
 redis==3.5.3
@@ -43,8 +43,9 @@ soupsieve==2.6
 SQLAlchemy==2.0.39
 starlette==0.36.3
 typing-inspection==0.4.0
-typing_extensions==4.13.2
+typing-extensions>=4.12.0
 urllib3==2.4.0
 uvicorn==0.27.1
 Werkzeug==3.0.4
 zope.interface==7.0.1
+aiohttp==3.9.3
