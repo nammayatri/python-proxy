@@ -8,6 +8,9 @@ import logging
 from pydantic import BaseModel, field_validator
 import uvicorn
 from contextlib import asynccontextmanager
+import gc
+import threading
+import time
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -18,6 +21,7 @@ BASE_URL = os.getenv("GTFS_BASE_URL", "http://localhost:8080")
 POLLING_INTERVAL = int(os.getenv("GTFS_POLLING_INTERVAL", "60"))  # in seconds
 API_HOST = os.getenv("GTFS_API_HOST", "0.0.0.0")
 API_PORT = int(os.getenv("GTFS_API_PORT", "8000"))
+GC_INTERVAL = int(os.getenv("GTFS_GC_INTERVAL", "300"))  # 5 minutes default
 
 # Pydantic models for data validation
 class NandiStop(BaseModel):
@@ -80,14 +84,25 @@ class NandiPatternsRes(BaseModel):
 
 class GTFSData:
     def __init__(self):
-        self.patterns_by_gtfs: Dict[str, List[NandiPattern]] = {}
+        self.patterns_by_gtfs: Dict[str, Dict[str, NandiPattern]] = {}
         self.pattern_details: Dict[str, NandiPatternDetails] = {}
+        self.routes_by_gtfs: Dict[str, Dict[str, NandiRoutesRes]] = {}
         self.routes: Dict[str, NandiRoutesRes] = {}
         self.last_update: Dict[str, datetime] = {
             "patterns": datetime.min,
             "pattern_details": datetime.min,
             "routes": datetime.min
         }
+        self._lock = threading.Lock()
+
+    def update_data(self, temp_data: 'GTFSData'):
+        """Atomically update all data structures"""
+        with self._lock:
+            self.patterns_by_gtfs = temp_data.patterns_by_gtfs
+            self.pattern_details = temp_data.pattern_details
+            self.routes = temp_data.routes
+            self.routes_by_gtfs = temp_data.routes_by_gtfs
+            self.last_update = temp_data.last_update
 
 async def initial_data_load():
     """Load initial data before server starts"""
@@ -101,13 +116,13 @@ async def initial_data_load():
             # Create temporary storage for pattern details
             pattern_details = {}
             
-            # Organize patterns by GTFS ID
+            # Organize patterns by GTFS ID using dictionaries for O(1) operations
             patterns_by_gtfs = {}
             for pattern in patterns:
                 gtfs_id = pattern.id.split(':')[0]  # Extract GTFS ID from pattern ID
                 if gtfs_id not in patterns_by_gtfs:
-                    patterns_by_gtfs[gtfs_id] = []
-                patterns_by_gtfs[gtfs_id].append(pattern)
+                    patterns_by_gtfs[gtfs_id] = {}
+                patterns_by_gtfs[gtfs_id][pattern.id] = pattern
                 
                 try:
                     details = await fetch_pattern_details(session, pattern.id)
@@ -115,11 +130,20 @@ async def initial_data_load():
                 except Exception as e:
                     logger.error(f"Error fetching pattern details for {pattern.id}: {str(e)}")
                     continue
+
+            # Organize routes by GTFS ID using dictionaries for O(1) operations
+            routes_by_gtfs = {}
+            for route in routes:
+                gtfs_id = route.id.split(':')[0]
+                if gtfs_id not in routes_by_gtfs:
+                    routes_by_gtfs[gtfs_id] = {}
+                routes_by_gtfs[gtfs_id][route.id] = route
             
             # Update all data structures atomically
             gtfs_data.patterns_by_gtfs = patterns_by_gtfs
             gtfs_data.pattern_details = pattern_details
             gtfs_data.routes = {route.id: route for route in routes}
+            gtfs_data.routes_by_gtfs = routes_by_gtfs
             
             # Update timestamps
             current_time = datetime.now()
@@ -132,9 +156,24 @@ async def initial_data_load():
         logger.error(f"Error during initial data load: {str(e)}")
         raise
 
+def garbage_collector():
+    """Background thread for periodic garbage collection"""
+    while True:
+        try:
+            # Force garbage collection
+            collected = gc.collect()
+            logger.debug(f"Garbage collector ran, collected {collected} objects")
+        except Exception as e:
+            logger.error(f"Error in garbage collector: {str(e)}")
+        time.sleep(GC_INTERVAL)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for FastAPI application"""
+    # Start garbage collector thread
+    gc_thread = threading.Thread(target=garbage_collector, daemon=True)
+    gc_thread.start()
+    
     # Startup: Load initial data and start polling task
     await initial_data_load()
     polling_task_instance = asyncio.create_task(polling_task())
@@ -177,49 +216,79 @@ async def fetch_routes(session: aiohttp.ClientSession) -> List[NandiRoutesRes]:
 async def polling_task():
     """Main polling task that updates all data periodically"""
     while True:
+        session = None
         try:
-            async with aiohttp.ClientSession() as session:
-                # Fetch all data first
-                patterns = await fetch_patterns(session)
-                routes = await fetch_routes(session)
+            # Create a new session for each iteration
+            session = aiohttp.ClientSession()
+            
+            # Fetch all data first
+            patterns = await fetch_patterns(session)
+            routes = await fetch_routes(session)
+            
+            # Create temporary storage for pattern details
+            pattern_details = {}
+            
+            # Organize patterns by GTFS ID using dictionaries for O(1) operations
+            patterns_by_gtfs = {}
+            for pattern in patterns:
+                gtfs_id = pattern.id.split(':')[0]  # Extract GTFS ID from pattern ID
+                if gtfs_id not in patterns_by_gtfs:
+                    patterns_by_gtfs[gtfs_id] = {}
+                patterns_by_gtfs[gtfs_id][pattern.id] = pattern
                 
-                # Create temporary storage for pattern details
-                pattern_details = {}
+                try:
+                    details = await fetch_pattern_details(session, pattern.id)
+                    pattern_details[pattern.id] = details
+                except Exception as e:
+                    logger.error(f"Error fetching pattern details for {pattern.id}: {str(e)}")
+                    continue
+
+            # Organize routes by GTFS ID using dictionaries for O(1) operations
+            routes_by_gtfs = {}
+            for route in routes:
+                gtfs_id = route.id.split(':')[0]
+                if gtfs_id not in routes_by_gtfs:
+                    routes_by_gtfs[gtfs_id] = {}
+                routes_by_gtfs[gtfs_id][route.id] = route
+            
+            # Only update if we have all the data
+            if patterns and routes:
+                # Create a temporary GTFSData instance for the new data
+                temp_data = GTFSData()
+                temp_data.patterns_by_gtfs = patterns_by_gtfs
+                temp_data.pattern_details = pattern_details
+                temp_data.routes = {route.id: route for route in routes}
+                temp_data.routes_by_gtfs = routes_by_gtfs
                 
-                # Organize patterns by GTFS ID
-                patterns_by_gtfs = {}
-                for pattern in patterns:
-                    gtfs_id = pattern.id.split(':')[0]  # Extract GTFS ID from pattern ID
-                    if gtfs_id not in patterns_by_gtfs:
-                        patterns_by_gtfs[gtfs_id] = []
-                    patterns_by_gtfs[gtfs_id].append(pattern)
-                    
-                    try:
-                        details = await fetch_pattern_details(session, pattern.id)
-                        pattern_details[pattern.id] = details
-                    except Exception as e:
-                        logger.error(f"Error fetching pattern details for {pattern.id}: {str(e)}")
-                        continue
+                # Update timestamps
+                current_time = datetime.now()
+                temp_data.last_update["patterns"] = current_time
+                temp_data.last_update["pattern_details"] = current_time
+                temp_data.last_update["routes"] = current_time
                 
-                # Only update if we have all the data
-                if patterns and routes:
-                    # Update all data structures atomically
-                    gtfs_data.patterns_by_gtfs = patterns_by_gtfs
-                    gtfs_data.pattern_details = pattern_details
-                    gtfs_data.routes = {route.id: route for route in routes}
-                    
-                    # Update timestamps
-                    current_time = datetime.now()
-                    gtfs_data.last_update["patterns"] = current_time
-                    gtfs_data.last_update["pattern_details"] = current_time
-                    gtfs_data.last_update["routes"] = current_time
-                    
-                    logger.info(f"Successfully updated all data: {len(patterns)} patterns across {len(patterns_by_gtfs)} GTFS IDs, {len(pattern_details)} pattern details, {len(routes)} routes")
-                else:
-                    logger.error("Failed to fetch complete data set, skipping update")
-                    
+                # Atomically swap the data structures
+                gtfs_data.update_data(temp_data)
+                
+                # Clear references to help garbage collection
+                del patterns
+                del routes
+                del patterns_by_gtfs
+                del routes_by_gtfs
+                del pattern_details
+                del temp_data
+                
+                # Force garbage collection after update
+                gc.collect()
+                
+                logger.info(f"Successfully updated all data: {len(patterns)} patterns across {len(patterns_by_gtfs)} GTFS IDs, {len(pattern_details)} pattern details, {len(routes)} routes")
+            else:
+                logger.error("Failed to fetch complete data set, skipping update")
+                
         except Exception as e:
             logger.error(f"Error in polling task: {str(e)}")
+        finally:
+            if session:
+                await session.close()
             
         await asyncio.sleep(POLLING_INTERVAL)  # Poll at configured interval
 
@@ -229,7 +298,7 @@ async def get_patterns(gtfs_id: str):
     """Get patterns filtered by GTFS ID"""
     if gtfs_id not in gtfs_data.patterns_by_gtfs:
         raise HTTPException(status_code=404, detail=f"No patterns found for GTFS ID: {gtfs_id}")
-    return NandiPatternsRes(patterns=gtfs_data.patterns_by_gtfs[gtfs_id])
+    return NandiPatternsRes(patterns=list(gtfs_data.patterns_by_gtfs[gtfs_id].values()))
 
 @app.get("/patterns/{pattern_id}", response_model=NandiPatternDetails)
 async def get_pattern_details(pattern_id: str):
@@ -239,9 +308,11 @@ async def get_pattern_details(pattern_id: str):
     return gtfs_data.pattern_details[pattern_id]
 
 @app.get("/routes", response_model=List[NandiRoutesRes])
-async def get_routes():
-    """Get all routes"""
-    return list(gtfs_data.routes.values())
+async def get_routes(gtfs_id: str):
+    """Get routes filtered by GTFS ID"""
+    if gtfs_id not in gtfs_data.routes_by_gtfs:
+        raise HTTPException(status_code=404, detail=f"No routes found for GTFS ID: {gtfs_id}")
+    return list(gtfs_data.routes_by_gtfs[gtfs_id].values())
 
 @app.get("/routes/{route_id}", response_model=NandiRoutesRes)
 async def get_route(route_id: str):

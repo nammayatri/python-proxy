@@ -5,6 +5,10 @@ WORKDIR /app
 
 COPY requirements.txt .
 
+RUN apt-get update && apt-get install -y \
+    curl \
+    htop
+
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the rest of the application code into the container
