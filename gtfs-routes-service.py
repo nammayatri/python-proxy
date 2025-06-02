@@ -5,12 +5,13 @@ import asyncio
 import os
 from datetime import datetime
 import logging
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, RootModel
 import uvicorn
 from contextlib import asynccontextmanager
 import gc
 import threading
 import time
+from urllib.parse import unquote
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -79,8 +80,17 @@ class NandiRoutesRes(BaseModel):
     def convert_to_str(cls, v):
         return str(v) if v is not None else None
 
-class NandiPatternsRes(BaseModel):
-    patterns: List[NandiPattern]
+class NandiPatternsRes(RootModel):
+    root: List[NandiPattern]
+
+    def __iter__(self):
+        return iter(self.root)
+
+    def __getitem__(self, item):
+        return self.root[item]
+
+    def __len__(self):
+        return len(self.root)
 
 class GTFSData:
     def __init__(self):
@@ -269,6 +279,9 @@ async def polling_task():
                 # Atomically swap the data structures
                 gtfs_data.update_data(temp_data)
                 
+                # Log the update before clearing variables
+                logger.info(f"Successfully updated all data: {len(patterns)} patterns across {len(patterns_by_gtfs)} GTFS IDs, {len(pattern_details)} pattern details, {len(routes)} routes")
+                
                 # Clear references to help garbage collection
                 del patterns
                 del routes
@@ -279,8 +292,6 @@ async def polling_task():
                 
                 # Force garbage collection after update
                 gc.collect()
-                
-                logger.info(f"Successfully updated all data: {len(patterns)} patterns across {len(patterns_by_gtfs)} GTFS IDs, {len(pattern_details)} pattern details, {len(routes)} routes")
             else:
                 logger.error("Failed to fetch complete data set, skipping update")
                 
@@ -293,23 +304,26 @@ async def polling_task():
         await asyncio.sleep(POLLING_INTERVAL)  # Poll at configured interval
 
 # API endpoints
-@app.get("/patterns", response_model=NandiPatternsRes)
+@app.get("/patterns/{gtfs_id}", response_model=NandiPatternsRes)
 async def get_patterns(gtfs_id: str):
     """Get patterns filtered by GTFS ID"""
+    gtfs_id = unquote(gtfs_id)
     if gtfs_id not in gtfs_data.patterns_by_gtfs:
         raise HTTPException(status_code=404, detail=f"No patterns found for GTFS ID: {gtfs_id}")
-    return NandiPatternsRes(patterns=list(gtfs_data.patterns_by_gtfs[gtfs_id].values()))
+    return NandiPatternsRes(root=list(gtfs_data.patterns_by_gtfs[gtfs_id].values()))
 
-@app.get("/patterns/{pattern_id}", response_model=NandiPatternDetails)
+@app.get("/pattern/{pattern_id}", response_model=NandiPatternDetails)
 async def get_pattern_details(pattern_id: str):
     """Get specific pattern details"""
+    pattern_id = unquote(pattern_id)
     if pattern_id not in gtfs_data.pattern_details:
         raise HTTPException(status_code=404, detail="Pattern not found")
     return gtfs_data.pattern_details[pattern_id]
 
-@app.get("/routes", response_model=List[NandiRoutesRes])
+@app.get("/routes/{gtfs_id}", response_model=List[NandiRoutesRes])
 async def get_routes(gtfs_id: str):
     """Get routes filtered by GTFS ID"""
+    gtfs_id = unquote(gtfs_id)
     if gtfs_id not in gtfs_data.routes_by_gtfs:
         raise HTTPException(status_code=404, detail=f"No routes found for GTFS ID: {gtfs_id}")
     return list(gtfs_data.routes_by_gtfs[gtfs_id].values())
@@ -317,6 +331,7 @@ async def get_routes(gtfs_id: str):
 @app.get("/routes/{route_id}", response_model=NandiRoutesRes)
 async def get_route(route_id: str):
     """Get specific route"""
+    route_id = unquote(route_id)
     if route_id not in gtfs_data.routes:
         raise HTTPException(status_code=404, detail="Route not found")
     return gtfs_data.routes[route_id]
