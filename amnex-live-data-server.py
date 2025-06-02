@@ -1629,7 +1629,10 @@ def handle_client_data(payload, client_ip, serverTime, isNYGpsDevice = False, se
                 geo_key_new = "bus_locations_metadata"  # Single key for all bus locations with metadata
                 if vehicle_lon is not None and vehicle_lat is not None and vehicle_number:
                     redis_client.geoadd(geo_key, vehicle_lon, vehicle_lat, vehicle_number)
-                    redis_client.geoadd(geo_key_new, vehicle_lon, vehicle_lat, vehicle_data)
+                    vehicle_data_without_eta = json.loads(vehicle_data)
+                    vehicle_data_without_eta.pop("eta_data", None)
+                    vehicle_data_without_eta.pop("visited_stops", None)
+                    redis_client.geoadd(geo_key_new, vehicle_lon, vehicle_lat, vehicle_data_without_eta)
                 else:
                     logger.error(f"Invalid location data: lon={vehicle_lon}, lat={vehicle_lat}, member={vehicle_number}")
                 redis_client.expire(geo_key, 86400)  # Expire after 24 hours
