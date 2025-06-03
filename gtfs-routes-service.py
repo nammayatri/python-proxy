@@ -92,6 +92,20 @@ class NandiPatternsRes(RootModel):
     def __len__(self):
         return len(self.root)
 
+class LatLong(BaseModel):
+    lat: float
+    lon: float
+
+class RouteStopMapping(BaseModel):
+    estimatedTravelTimeFromPreviousStop: Optional[int] = None
+    providerCode: str
+    routeCode: str
+    sequenceNum: int
+    stopCode: str
+    stopName: str
+    stopPoint: LatLong
+    vehicleType: str
+
 class GTFSData:
     def __init__(self):
         self.patterns_by_gtfs: Dict[str, Dict[str, NandiPattern]] = {}
@@ -103,6 +117,8 @@ class GTFSData:
             "pattern_details": datetime.min,
             "routes": datetime.min
         }
+        self.route_stop_map: Dict[str, Dict[str, List[RouteStopMapping]]] = {}
+        self.stop_route_map: Dict[str, Dict[str, List[RouteStopMapping]]] = {}
         self._lock = threading.Lock()
 
     def update_data(self, temp_data: 'GTFSData'):
@@ -113,6 +129,8 @@ class GTFSData:
             self.routes = temp_data.routes
             self.routes_by_gtfs = temp_data.routes_by_gtfs
             self.last_update = temp_data.last_update
+            self.route_stop_map = temp_data.route_stop_map
+            self.stop_route_map = temp_data.stop_route_map
 
 async def initial_data_load():
     """Load initial data before server starts"""
@@ -149,11 +167,47 @@ async def initial_data_load():
                     routes_by_gtfs[gtfs_id] = {}
                 routes_by_gtfs[gtfs_id][route.id] = route
             
+            # Build route_stop_map and stop_route_map (reference-based)
+            route_stop_map = {}
+            stop_route_map = {}
+            route_lookup = {route.id: route for route in routes}
+            for gtfs_id in patterns_by_gtfs:
+                route_stop_map[gtfs_id] = {}
+                stop_route_map[gtfs_id] = {}
+            for pattern_detail in pattern_details.values():
+                route_id = pattern_detail.routeId
+                route = route_lookup.get(route_id)
+                if not route:
+                    continue
+                gtfs_id = route_id.split(":")[0]
+                route_code = route.id
+                if route_code not in route_stop_map[gtfs_id]:
+                    route_stop_map[gtfs_id][route_code] = []
+                for seq, stop in enumerate(pattern_detail.stops):
+                    route_obj = routes_by_gtfs[gtfs_id].get(route_id)
+                    vehicle_type = route_obj.mode if route_obj and hasattr(route_obj, 'mode') else "UNKNOWN"
+                    mapping = RouteStopMapping(
+                        estimatedTravelTimeFromPreviousStop=None,  # Placeholder
+                        providerCode="GTFS",  # Placeholder
+                        routeCode=route_code.split(':')[-1],
+                        sequenceNum=seq,
+                        stopCode=stop.code.split(':')[-1],
+                        stopName=stop.name,
+                        stopPoint=LatLong(lat=stop.lat, lon=stop.lon),
+                        vehicleType=vehicle_type
+                    )
+                    route_stop_map[gtfs_id][route_code].append(mapping)
+                    if stop.code not in stop_route_map[gtfs_id]:
+                        stop_route_map[gtfs_id][stop.code] = []
+                    stop_route_map[gtfs_id][stop.code].append(mapping)
+            
             # Update all data structures atomically
             gtfs_data.patterns_by_gtfs = patterns_by_gtfs
             gtfs_data.pattern_details = pattern_details
             gtfs_data.routes = {route.id: route for route in routes}
             gtfs_data.routes_by_gtfs = routes_by_gtfs
+            gtfs_data.route_stop_map = route_stop_map
+            gtfs_data.stop_route_map = stop_route_map
             
             # Update timestamps
             current_time = datetime.now()
@@ -261,40 +315,70 @@ async def polling_task():
                     routes_by_gtfs[gtfs_id] = {}
                 routes_by_gtfs[gtfs_id][route.id] = route
             
-            # Only update if we have all the data
-            if patterns and routes:
-                # Create a temporary GTFSData instance for the new data
-                temp_data = GTFSData()
-                temp_data.patterns_by_gtfs = patterns_by_gtfs
-                temp_data.pattern_details = pattern_details
-                temp_data.routes = {route.id: route for route in routes}
-                temp_data.routes_by_gtfs = routes_by_gtfs
+            # Build route_stop_map and stop_route_map (reference-based)
+            route_stop_map = {}
+            stop_route_map = {}
+            route_lookup = {route.id: route for route in routes}
+            for gtfs_id in patterns_by_gtfs:
+                route_stop_map[gtfs_id] = {}
+                stop_route_map[gtfs_id] = {}
+            for pattern_detail in pattern_details.values():
+                route_id = pattern_detail.routeId
+                route = route_lookup.get(route_id)
+                if not route:
+                    continue
+                gtfs_id = route_id.split(":")[0]
+                route_code = route.shortName if route.shortName else route.id
+                if route_code not in route_stop_map[gtfs_id]:
+                    route_stop_map[gtfs_id][route_code] = []
+                for seq, stop in enumerate(pattern_detail.stops):
+                    route_obj = routes_by_gtfs[gtfs_id].get(route_id)
+                    vehicle_type = route_obj.mode if route_obj and hasattr(route_obj, 'mode') else "UNKNOWN"
+                    mapping = RouteStopMapping(
+                        estimatedTravelTimeFromPreviousStop=None,  # Placeholder
+                        providerCode="GTFS",  # Placeholder
+                        routeCode=route_code,
+                        sequenceNum=seq,
+                        stopCode=stop.code,
+                        stopName=stop.name,
+                        stopPoint=LatLong(lat=stop.lat, lon=stop.lon),
+                        vehicleType=vehicle_type
+                    )
+                    route_stop_map[gtfs_id][route_code].append(mapping)
+                    if stop.code not in stop_route_map[gtfs_id]:
+                        stop_route_map[gtfs_id][stop.code] = []
+                    stop_route_map[gtfs_id][stop.code].append(mapping)
                 
-                # Update timestamps
-                current_time = datetime.now()
-                temp_data.last_update["patterns"] = current_time
-                temp_data.last_update["pattern_details"] = current_time
-                temp_data.last_update["routes"] = current_time
-                
-                # Atomically swap the data structures
-                gtfs_data.update_data(temp_data)
-                
-                # Log the update before clearing variables
-                logger.info(f"Successfully updated all data: {len(patterns)} patterns across {len(patterns_by_gtfs)} GTFS IDs, {len(pattern_details)} pattern details, {len(routes)} routes")
-                
-                # Clear references to help garbage collection
-                del patterns
-                del routes
-                del patterns_by_gtfs
-                del routes_by_gtfs
-                del pattern_details
-                del temp_data
-                
-                # Force garbage collection after update
-                gc.collect()
-            else:
-                logger.error("Failed to fetch complete data set, skipping update")
-                
+            temp_data = GTFSData()
+            temp_data.patterns_by_gtfs = patterns_by_gtfs
+            temp_data.pattern_details = pattern_details
+            temp_data.routes = {route.id: route for route in routes}
+            temp_data.routes_by_gtfs = routes_by_gtfs
+            temp_data.route_stop_map = route_stop_map
+            temp_data.stop_route_map = stop_route_map
+            
+            # Update timestamps
+            current_time = datetime.now()
+            temp_data.last_update["patterns"] = current_time
+            temp_data.last_update["pattern_details"] = current_time
+            temp_data.last_update["routes"] = current_time
+            
+            # Atomically swap the data structures
+            gtfs_data.update_data(temp_data)
+            
+            # Log the update before clearing variables
+            logger.info(f"Successfully updated all data: {len(patterns)} patterns across {len(patterns_by_gtfs)} GTFS IDs, {len(pattern_details)} pattern details, {len(routes)} routes")
+            
+            # Clear references to help garbage collection
+            del patterns
+            del routes
+            del patterns_by_gtfs
+            del routes_by_gtfs
+            del pattern_details
+            del temp_data
+            
+            # Force garbage collection after update
+            gc.collect()
         except Exception as e:
             logger.error(f"Error in polling task: {str(e)}")
         finally:
@@ -335,6 +419,22 @@ async def get_route(route_id: str):
     if route_id not in gtfs_data.routes:
         raise HTTPException(status_code=404, detail="Route not found")
     return gtfs_data.routes[route_id]
+
+@app.get("/route-stop-mapping/{gtfs_id}/route/{route_code}", response_model=List[RouteStopMapping])
+async def get_route_stop_mapping_by_route(gtfs_id: str, route_code: str):
+    gtfs_id = unquote(gtfs_id)
+    route_code = unquote(route_code)
+    if gtfs_id not in gtfs_data.route_stop_map or route_code not in gtfs_data.route_stop_map[gtfs_id]:
+        raise HTTPException(status_code=404, detail="Route code not found for GTFS ID")
+    return gtfs_data.route_stop_map[gtfs_id][route_code]
+
+@app.get("/route-stop-mapping/{gtfs_id}/stop/{stop_code}", response_model=List[RouteStopMapping])
+async def get_route_stop_mapping_by_stop(gtfs_id: str, stop_code: str):
+    gtfs_id = unquote(gtfs_id)
+    stop_code = unquote(stop_code)
+    if gtfs_id not in gtfs_data.stop_route_map or stop_code not in gtfs_data.stop_route_map[gtfs_id]:
+        raise HTTPException(status_code=404, detail="Stop code not found for GTFS ID")
+    return gtfs_data.stop_route_map[gtfs_id][stop_code]
 
 if __name__ == "__main__":
     uvicorn.run(app, host=API_HOST, port=API_PORT)
