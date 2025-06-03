@@ -26,6 +26,7 @@ paho-mqtt==2.1.0
 pandas==2.2.1
 polyline==2.0.2
 protobuf==5.28.2
+psutil==5.9.8
 psycopg2-binary==2.9.10
 pydantic==2.6.1
 pydantic-core==2.16.2

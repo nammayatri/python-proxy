@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Union, Set
 import aiohttp
 import asyncio
 import os
@@ -12,6 +12,8 @@ import gc
 import threading
 import time
 from urllib.parse import unquote
+import psutil
+import weakref
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -112,14 +114,15 @@ class GTFSData:
         self.pattern_details: Dict[str, NandiPatternDetails] = {}
         self.routes_by_gtfs: Dict[str, Dict[str, NandiRoutesRes]] = {}
         self.routes: Dict[str, NandiRoutesRes] = {}
+        self.route_stop_map: Dict[str, Dict[str, List[RouteStopMapping]]] = {}
+        self.stop_route_map: Dict[str, Dict[str, List[RouteStopMapping]]] = {}
         self.last_update: Dict[str, datetime] = {
             "patterns": datetime.min,
             "pattern_details": datetime.min,
             "routes": datetime.min
         }
-        self.route_stop_map: Dict[str, Dict[str, List[RouteStopMapping]]] = {}
-        self.stop_route_map: Dict[str, Dict[str, List[RouteStopMapping]]] = {}
         self._lock = threading.Lock()
+        self._processed_patterns: Set[str] = set()  # Track processed patterns
 
     def update_data(self, temp_data: 'GTFSData'):
         """Atomically update all data structures"""
@@ -128,9 +131,10 @@ class GTFSData:
             self.pattern_details = temp_data.pattern_details
             self.routes = temp_data.routes
             self.routes_by_gtfs = temp_data.routes_by_gtfs
-            self.last_update = temp_data.last_update
             self.route_stop_map = temp_data.route_stop_map
             self.stop_route_map = temp_data.stop_route_map
+            self.last_update = temp_data.last_update
+            self._processed_patterns = temp_data._processed_patterns
 
 async def initial_data_load():
     """Load initial data before server starts"""
@@ -227,6 +231,17 @@ def garbage_collector():
             # Force garbage collection
             collected = gc.collect()
             logger.debug(f"Garbage collector ran, collected {collected} objects")
+            
+            # Log memory usage
+            process = psutil.Process()
+            memory_usage = process.memory_info().rss / 1024 / 1024  # Convert to MB
+            logger.info(f"Current memory usage: {memory_usage:.2f} MB")
+            
+            # If memory usage is too high, try to free more memory
+            if memory_usage > 500:  # 500MB threshold
+                gc.collect(2)  # Force full collection
+                logger.warning(f"High memory usage detected: {memory_usage:.2f} MB")
+                
         except Exception as e:
             logger.error(f"Error in garbage collector: {str(e)}")
         time.sleep(GC_INTERVAL)
@@ -277,115 +292,157 @@ async def fetch_routes(session: aiohttp.ClientSession) -> List[NandiRoutesRes]:
             return [NandiRoutesRes(**item) for item in data]
         raise HTTPException(status_code=response.status, detail="Failed to fetch routes")
 
+async def process_pattern_batch(session: aiohttp.ClientSession, patterns: List[NandiPattern], 
+                              batch_size: int = 100) -> Dict[str, NandiPatternDetails]:
+    """Process patterns in batches to manage memory"""
+    pattern_details = {}
+    for i in range(0, len(patterns), batch_size):
+        batch = patterns[i:i + batch_size]
+        tasks = []
+        for pattern in batch:
+            if pattern.id not in gtfs_data._processed_patterns:
+                tasks.append(fetch_pattern_details(session, pattern.id))
+        
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for pattern, result in zip(batch, results):
+                if isinstance(result, Exception):
+                    logger.error(f"Error fetching pattern details for {pattern.id}: {str(result)}")
+                    continue
+                pattern_details[pattern.id] = result
+                gtfs_data._processed_patterns.add(pattern.id)
+        
+        # Force garbage collection after each batch
+        gc.collect()
+    
+    return pattern_details
+
 async def polling_task():
     """Main polling task that updates all data periodically"""
     while True:
         session = None
         try:
-            # Create a new session for each iteration
             session = aiohttp.ClientSession()
             
             # Fetch all data first
             patterns = await fetch_patterns(session)
             routes = await fetch_routes(session)
             
-            # Create temporary storage for pattern details
-            pattern_details = {}
+            # Process patterns in batches
+            pattern_details = await process_pattern_batch(session, patterns)
             
-            # Organize patterns by GTFS ID using dictionaries for O(1) operations
+            # Organize patterns by GTFS ID
             patterns_by_gtfs = {}
             for pattern in patterns:
-                gtfs_id = pattern.id.split(':')[0]  # Extract GTFS ID from pattern ID
+                gtfs_id = pattern.id.split(':')[0]
                 if gtfs_id not in patterns_by_gtfs:
                     patterns_by_gtfs[gtfs_id] = {}
                 patterns_by_gtfs[gtfs_id][pattern.id] = pattern
-                
-                try:
-                    details = await fetch_pattern_details(session, pattern.id)
-                    pattern_details[pattern.id] = details
-                except Exception as e:
-                    logger.error(f"Error fetching pattern details for {pattern.id}: {str(e)}")
-                    continue
 
-            # Organize routes by GTFS ID using dictionaries for O(1) operations
+            # Organize routes by GTFS ID
             routes_by_gtfs = {}
             for route in routes:
                 gtfs_id = route.id.split(':')[0]
                 if gtfs_id not in routes_by_gtfs:
                     routes_by_gtfs[gtfs_id] = {}
                 routes_by_gtfs[gtfs_id][route.id] = route
-            
-            # Build route_stop_map and stop_route_map (reference-based)
+
+            # Build route_stop_map and stop_route_map
             route_stop_map = {}
             stop_route_map = {}
-            route_lookup = {route.id: route for route in routes}
+            
+            # Pre-allocate dictionaries
             for gtfs_id in patterns_by_gtfs:
                 route_stop_map[gtfs_id] = {}
                 stop_route_map[gtfs_id] = {}
-            for pattern_detail in pattern_details.values():
-                route_id = pattern_detail.routeId
-                route = route_lookup.get(route_id)
-                if not route:
-                    continue
-                gtfs_id = route_id.split(":")[0]
-                route_code = route.shortName if route.shortName else route.id
-                if route_code not in route_stop_map[gtfs_id]:
-                    route_stop_map[gtfs_id][route_code] = []
-                for seq, stop in enumerate(pattern_detail.stops):
-                    route_obj = routes_by_gtfs[gtfs_id].get(route_id)
-                    vehicle_type = route_obj.mode if route_obj and hasattr(route_obj, 'mode') else "UNKNOWN"
-                    mapping = RouteStopMapping(
-                        estimatedTravelTimeFromPreviousStop=None,  # Placeholder
-                        providerCode="GTFS",  # Placeholder
-                        routeCode=route_code,
-                        sequenceNum=seq,
-                        stopCode=stop.code,
-                        stopName=stop.name,
-                        stopPoint=LatLong(lat=stop.lat, lon=stop.lon),
-                        vehicleType=vehicle_type
-                    )
-                    route_stop_map[gtfs_id][route_code].append(mapping)
-                    if stop.code not in stop_route_map[gtfs_id]:
-                        stop_route_map[gtfs_id][stop.code] = []
-                    stop_route_map[gtfs_id][stop.code].append(mapping)
+
+            # Process pattern details in batches
+            batch_size = 100
+            for i in range(0, len(pattern_details), batch_size):
+                batch = list(pattern_details.items())[i:i + batch_size]
+                for pattern_id, pattern_detail in batch:
+                    route_id = pattern_detail.routeId
+                    gtfs_id = route_id.split(':')[0]
+                    route_obj = routes_by_gtfs.get(gtfs_id, {}).get(route_id)
+                    
+                    if not route_obj:
+                        continue
+
+                    route_code = route_id
+                    if route_code not in route_stop_map[gtfs_id]:
+                        route_stop_map[gtfs_id][route_code] = []
+
+                    for seq, stop in enumerate(pattern_detail.stops):
+                        route_obj = routes_by_gtfs[gtfs_id].get(route_id)
+                        vehicle_type = route_obj.mode if route_obj and hasattr(route_obj, 'mode') else "UNKNOWN"
+                        
+                        mapping = RouteStopMapping(
+                            estimatedTravelTimeFromPreviousStop=None,
+                            providerCode="GTFS",
+                            routeCode=route_code.split(':')[-1],
+                            sequenceNum=seq,
+                            stopCode=stop.code.split(':')[-1],
+                            stopName=stop.name,
+                            stopPoint=LatLong(lat=stop.lat, lon=stop.lon),
+                            vehicleType=vehicle_type
+                        )
+
+                        route_stop_map[gtfs_id][route_code].append(mapping)
+                        stop_code = stop.code.split(':')[-1]
+                        if stop_code not in stop_route_map[gtfs_id]:
+                            stop_route_map[gtfs_id][stop_code] = []
+                        stop_route_map[gtfs_id][stop_code].append(mapping)
+
+                # Force garbage collection after each batch
+                gc.collect()
+
+            if patterns and routes:
+                temp_data = GTFSData()
+                temp_data.patterns_by_gtfs = patterns_by_gtfs
+                temp_data.pattern_details = pattern_details
+                temp_data.routes = {route.id: route for route in routes}
+                temp_data.routes_by_gtfs = routes_by_gtfs
+                temp_data.route_stop_map = route_stop_map
+                temp_data.stop_route_map = stop_route_map
+                temp_data._processed_patterns = gtfs_data._processed_patterns.copy()
                 
-            temp_data = GTFSData()
-            temp_data.patterns_by_gtfs = patterns_by_gtfs
-            temp_data.pattern_details = pattern_details
-            temp_data.routes = {route.id: route for route in routes}
-            temp_data.routes_by_gtfs = routes_by_gtfs
-            temp_data.route_stop_map = route_stop_map
-            temp_data.stop_route_map = stop_route_map
-            
-            # Update timestamps
-            current_time = datetime.now()
-            temp_data.last_update["patterns"] = current_time
-            temp_data.last_update["pattern_details"] = current_time
-            temp_data.last_update["routes"] = current_time
-            
-            # Atomically swap the data structures
-            gtfs_data.update_data(temp_data)
-            
-            # Log the update before clearing variables
-            logger.info(f"Successfully updated all data: {len(patterns)} patterns across {len(patterns_by_gtfs)} GTFS IDs, {len(pattern_details)} pattern details, {len(routes)} routes")
-            
-            # Clear references to help garbage collection
-            del patterns
-            del routes
-            del patterns_by_gtfs
-            del routes_by_gtfs
-            del pattern_details
-            del temp_data
-            
-            # Force garbage collection after update
-            gc.collect()
+                current_time = datetime.now()
+                temp_data.last_update["patterns"] = current_time
+                temp_data.last_update["pattern_details"] = current_time
+                temp_data.last_update["routes"] = current_time
+                
+                gtfs_data.update_data(temp_data)
+                
+                # Log the update before clearing variables
+                logger.info(f"Successfully updated all data: {len(patterns)} patterns across {len(patterns_by_gtfs)} GTFS IDs, {len(pattern_details)} pattern details, {len(routes)} routes")
+                
+                # Clear references to help garbage collection
+                del patterns
+                del routes
+                del patterns_by_gtfs
+                del routes_by_gtfs
+                del pattern_details
+                del temp_data
+                del route_stop_map
+                del stop_route_map
+                
+                # Force garbage collection
+                gc.collect()
+                
+                # Log memory usage
+                process = psutil.Process()
+                memory_usage = process.memory_info().rss / 1024 / 1024
+                logger.info(f"Current memory usage: {memory_usage:.2f} MB")
+            else:
+                logger.error("Failed to fetch complete data set, skipping update")
+                
         except Exception as e:
             logger.error(f"Error in polling task: {str(e)}")
         finally:
             if session:
                 await session.close()
             
-        await asyncio.sleep(POLLING_INTERVAL)  # Poll at configured interval
+        await asyncio.sleep(POLLING_INTERVAL)
 
 # API endpoints
 @app.get("/patterns/{gtfs_id}", response_model=NandiPatternsRes)
