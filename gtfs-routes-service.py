@@ -108,6 +108,12 @@ class RouteStopMapping(BaseModel):
     stopPoint: LatLong
     vehicleType: str
 
+def castVehicleType(vehicle_type:str) -> str:
+    if vehicle_type == "RAIL":
+        return "METRO"
+    else:
+        return vehicle_type
+
 class GTFSData:
     def __init__(self):
         self.patterns_by_gtfs: Dict[str, Dict[str, NandiPattern]] = {}
@@ -186,7 +192,7 @@ async def initial_data_load():
                 gtfs_id = route_id.split(":")[0]
                 route_code = route.id
                 if route_code not in route_stop_map[gtfs_id]:
-                    route_stop_map[gtfs_id][route_code] = []
+                    route_stop_map[gtfs_id][route_code.split(':')[-1]] = []
                 for seq, stop in enumerate(pattern_detail.stops):
                     route_obj = routes_by_gtfs[gtfs_id].get(route_id)
                     vehicle_type = route_obj.mode if route_obj and hasattr(route_obj, 'mode') else "UNKNOWN"
@@ -198,12 +204,12 @@ async def initial_data_load():
                         stopCode=stop.code.split(':')[-1],
                         stopName=stop.name,
                         stopPoint=LatLong(lat=stop.lat, lon=stop.lon),
-                        vehicleType=vehicle_type
+                        vehicleType=castVehicleType(vehicle_type)
                     )
-                    route_stop_map[gtfs_id][route_code].append(mapping)
+                    route_stop_map[gtfs_id][route_code.split(':')[-1]].append(mapping)
                     if stop.code not in stop_route_map[gtfs_id]:
-                        stop_route_map[gtfs_id][stop.code] = []
-                    stop_route_map[gtfs_id][stop.code].append(mapping)
+                        stop_route_map[gtfs_id][stop.code.split(':')[-1]] = []
+                    stop_route_map[gtfs_id][stop.code.split(':')[-1]].append(mapping)
             
             # Update all data structures atomically
             gtfs_data.patterns_by_gtfs = patterns_by_gtfs
@@ -370,7 +376,7 @@ async def polling_task():
 
                     route_code = route_id
                     if route_code not in route_stop_map[gtfs_id]:
-                        route_stop_map[gtfs_id][route_code] = []
+                        route_stop_map[gtfs_id][route_code.split(':')[-1]] = []
 
                     for seq, stop in enumerate(pattern_detail.stops):
                         route_obj = routes_by_gtfs[gtfs_id].get(route_id)
@@ -387,7 +393,7 @@ async def polling_task():
                             vehicleType=vehicle_type
                         )
 
-                        route_stop_map[gtfs_id][route_code].append(mapping)
+                        route_stop_map[gtfs_id][route_code.split(':')[-1]].append(mapping)
                         stop_code = stop.code.split(':')[-1]
                         if stop_code not in stop_route_map[gtfs_id]:
                             stop_route_map[gtfs_id][stop_code] = []
