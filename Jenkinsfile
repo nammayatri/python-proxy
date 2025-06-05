@@ -20,6 +20,10 @@ pipeline {
       steps {
           withCredentials([string(credentialsId: 'pk_docker_hub', variable: 'DOCKER_PASSWORD')]) {
             sh 'docker build -t python-proxy .'
+            // Login to ECR
+            sh 'aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin 463356420488.dkr.ecr.ap-south-1.amazonaws.com'
+            sh "docker tag python-proxy:latest 463356420488.dkr.ecr.ap-south-1.amazonaws.com/python-proxy:${env.LAST_COMMIT_HASH}"
+            sh "docker push 463356420488.dkr.ecr.ap-south-1.amazonaws.com/python-proxy:${env.LAST_COMMIT_HASH}"
             sh 'echo $DOCKER_PASSWORD'
             sh 'echo $DOCKER_PASSWORD | docker login -u 12349901 --password-stdin'
             sh "docker tag python-proxy:latest 12349901/python-proxy:${env.LAST_COMMIT_HASH}"
