@@ -27,6 +27,11 @@ API_HOST = os.getenv("GTFS_API_HOST", "0.0.0.0")
 API_PORT = int(os.getenv("GTFS_API_PORT", "8000"))
 GC_INTERVAL = int(os.getenv("GTFS_GC_INTERVAL", "300"))  # 5 minutes default
 
+
+class LatLong(BaseModel):
+    lat: float
+    lon: float
+
 # Pydantic models for data validation
 class NandiStop(BaseModel):
     id: str
@@ -78,6 +83,8 @@ class NandiRoutesRes(BaseModel):
     mode: str
     agencyName: Optional[str] = None
     tripCount: Optional[int] = None
+    startPoint: LatLong
+    endPoint: LatLong
 
     @field_validator('id', 'shortName', 'longName', 'mode', 'agencyName', mode='before')
     @classmethod
@@ -95,10 +102,6 @@ class NandiPatternsRes(RootModel):
 
     def __len__(self):
         return len(self.root)
-
-class LatLong(BaseModel):
-    lat: float
-    lon: float
 
 class RouteStopMapping(BaseModel):
     estimatedTravelTimeFromPreviousStop: Optional[int] = None
@@ -182,7 +185,9 @@ async def initial_data_load():
                     longName=route.longName,
                     mode=castVehicleType(route.mode),
                     agencyName=route.agencyName,
-                    tripCount=route_trip_counts.get(route_code, 0)
+                    tripCount=route_trip_counts.get(route_code, 0),
+                    startPoint=LatLong(lat=0.0, lon=0.0),
+                    endPoint=LatLong(lat=0.0, lon=0.0)
                 )
 
             for pattern in pattern_details_list:
@@ -203,12 +208,23 @@ async def initial_data_load():
                         stopCode=stop.code,
                         stopName=stop.name,
                         stopPoint=LatLong(lat=stop.lat, lon=stop.lon),
-                        vehicleType=castVehicleType(routes_by_gtfs.get(gtfs_id, {}).get(pattern.routeId, NandiRoutesRes(id=pattern.routeId, mode="UNKNOWN")).mode)
+                        vehicleType=castVehicleType(routes_by_gtfs.get(gtfs_id, {}).get(pattern.routeId, NandiRoutesRes(
+                            id=pattern.routeId,
+                            mode="UNKNOWN",
+                            startPoint=LatLong(lat=0.0, lon=0.0),
+                            endPoint=LatLong(lat=0.0, lon=0.0)
+                        )).mode)
                     )
                     route_stop_map[gtfs_id][route_code].append(mapping)
                     if stop.code not in stop_route_map[gtfs_id]:
                         stop_route_map[gtfs_id][stop.code] = []
                     stop_route_map[gtfs_id][stop.code].append(mapping)
+                    
+                    # Set startPoint and endPoint for the route
+                    if seq == 0:  # First stop
+                        routes_by_gtfs[gtfs_id][route_code].startPoint = LatLong(lat=stop.lat, lon=stop.lon)
+                    if seq == len(pattern.stops) - 1:  # Last stop
+                        routes_by_gtfs[gtfs_id][route_code].endPoint = LatLong(lat=stop.lat, lon=stop.lon)
             # Free memory
             del pattern_details_list
             gc.collect()
@@ -298,7 +314,11 @@ async def fetch_routes(session: aiohttp.ClientSession) -> List[NandiRoutesRes]:
     async with session.get(f"{BASE_URL}/otp/routers/default/index/routes") as response:
         if response.status == 200:
             data = await response.json()
-            return [NandiRoutesRes(**item) for item in data]
+            return [NandiRoutesRes(
+                **item,
+                startPoint=LatLong(lat=0.0, lon=0.0),
+                endPoint=LatLong(lat=0.0, lon=0.0)
+            ) for item in data]
         raise HTTPException(status_code=response.status, detail="Failed to fetch routes")
 
 async def process_pattern_batch(session: aiohttp.ClientSession, patterns: List[NandiPattern], 
@@ -375,7 +395,12 @@ async def polling_task():
                             stopCode=stop.code,
                             stopName=stop.name,
                             stopPoint=LatLong(lat=stop.lat, lon=stop.lon),
-                            vehicleType=castVehicleType(routes_by_gtfs.get(gtfs_id, {}).get(pattern.routeId, NandiRoutesRes(id=pattern.routeId, mode="UNKNOWN")).mode)
+                            vehicleType=castVehicleType(routes_by_gtfs.get(gtfs_id, {}).get(pattern.routeId, NandiRoutesRes(
+                                id=pattern.routeId,
+                                mode="UNKNOWN",
+                                startPoint=LatLong(lat=0.0, lon=0.0),
+                                endPoint=LatLong(lat=0.0, lon=0.0)
+                            )).mode)
                         )
                         route_stop_map[gtfs_id][route_code].append(mapping)
                         if stop.code not in stop_route_map[gtfs_id]:
