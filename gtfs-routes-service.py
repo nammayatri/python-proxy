@@ -180,7 +180,7 @@ async def initial_data_load():
                     id=route_code,
                     shortName=route.shortName,
                     longName=route.longName,
-                    mode=route.mode,
+                    mode=castVehicleType(route.mode),
                     agencyName=route.agencyName,
                     tripCount=route_trip_counts.get(route_code, 0)
                 )
