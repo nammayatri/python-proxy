@@ -441,7 +441,7 @@ async def polling_task():
         await asyncio.sleep(POLLING_INTERVAL)
 
 # API endpoints
-@app.get("/routes/{gtfs_id}/{route_id}", response_model=NandiRoutesRes)
+@app.get("/route/{gtfs_id}/{route_id}", response_model=NandiRoutesRes)
 async def get_route(gtfs_id: str, route_id: str):
     """Get specific route"""
     gtfs_id = unquote(gtfs_id)
@@ -449,6 +449,13 @@ async def get_route(gtfs_id: str, route_id: str):
     if gtfs_id not in gtfs_data.routes_by_gtfs or route_id not in gtfs_data.routes_by_gtfs[gtfs_id]:
         raise HTTPException(status_code=404, detail="Route not found")
     return gtfs_data.routes_by_gtfs[gtfs_id][route_id]
+
+@app.get("/routes/{gtfs_id}", response_model=List[NandiRoutesRes])
+async def get_routes(gtfs_id: str):
+    gtfs_id = unquote(gtfs_id)
+    if gtfs_id not in gtfs_data.routes_by_gtfs:
+        raise HTTPException(status_code=404, detail="GTFS ID not found")
+    return list(gtfs_data.routes_by_gtfs[gtfs_id].values())
 
 @app.get("/route-stop-mapping/{gtfs_id}/route/{route_code}", response_model=List[RouteStopMapping])
 async def get_route_stop_mapping_by_route(gtfs_id: str, route_code: str):
