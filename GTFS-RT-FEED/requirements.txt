@@ -11,6 +11,7 @@ protobuf==4.25.3
 pydantic==2.11.4
 pydantic_core==2.33.2
 python-dotenv==1.0.1
+pytz==2025.2
 redis==5.0.1
 requests==2.32.3
 setuptools==80.3.1

@@ -7,6 +7,9 @@ from datetime import datetime
 import logging
 from dotenv import load_dotenv
 from pathlib import Path
+import pytz
+
+ist = pytz.timezone("Asia/Kolkata")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 log_file = SCRIPT_DIR / 'train_updates.log'
@@ -119,9 +122,13 @@ def transform_to_gtfs_rt(data):
             
             sched_arrival = datetime.combine(train_start_date.date(), sched_arrival_time)
             sched_departure = datetime.combine(train_start_date.date(), sched_departure_time)
+
+            sched_arrival_ist = ist.localize(sched_arrival)
+            sched_departure_ist = ist.localize(sched_departure)
             
-            actual_arrival = sched_arrival.timestamp() + station['delayArrival']
-            actual_departure = sched_departure.timestamp() + station['delayDeparture']
+            actual_arrival = sched_arrival_ist.timestamp() + station['delayArrival']
+            actual_departure = sched_departure_ist.timestamp() + station['delayDeparture']
+            
 
             stop_update = {
                 "stopSequence": station['sequence'],
