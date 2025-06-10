@@ -83,6 +83,7 @@ class NandiRoutesRes(BaseModel):
     mode: str
     agencyName: Optional[str] = None
     tripCount: Optional[int] = None
+    stopCount: Optional[int] = None
     startPoint: LatLong
     endPoint: LatLong
 
@@ -171,6 +172,18 @@ async def initial_data_load():
                     route_trip_counts[route_code] = 0
                 route_trip_counts[route_code] += trip_count
             
+            # Calculate stop counts for each route
+            route_stop_counts = {}
+            for pattern in pattern_details_list:
+                gtfs_id = pattern.routeId.split(':')[0]
+                route_code = pattern.routeId.split(':')[-1]
+                if gtfs_id not in route_stop_counts:
+                    route_stop_counts[gtfs_id] = {}
+                if route_code not in route_stop_counts[gtfs_id]:
+                    route_stop_counts[gtfs_id][route_code] = set()
+                # Add all stop codes for this pattern to the set
+                route_stop_counts[gtfs_id][route_code].update(stop.code for stop in pattern.stops)
+            
             # Fetch routes
             routes = await fetch_routes(session)
             routes_by_gtfs = {}
@@ -186,6 +199,7 @@ async def initial_data_load():
                     mode=castVehicleType(route.mode),
                     agencyName=route.agencyName,
                     tripCount=route_trip_counts.get(route_code, 0),
+                    stopCount=len(route_stop_counts.get(gtfs_id, {}).get(route_code, set())),
                     startPoint=LatLong(lat=0.0, lon=0.0),
                     endPoint=LatLong(lat=0.0, lon=0.0)
                 )
