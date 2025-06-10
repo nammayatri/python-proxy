@@ -36,6 +36,7 @@ KAFKA_SERVER = os.getenv('KAFKA_SERVER', 'localhost:9096')
 
 # Redis connection setup
 REDIS_NODES = os.getenv('REDIS_NODES', 'localhost:6379').split(',')
+PROD_REDIS_NODES = os.getenv('PROD_REDIS_NODES', 'localhost:6379').split(',')
 IS_CLUSTER_REDIS = os.getenv('IS_CLUSTER_REDIS', 'false').lower() == 'true'
 
 # TCP forwarding configuration
@@ -65,13 +66,17 @@ producer = Producer(producer_config)
 if IS_CLUSTER_REDIS:
     # Redis Cluster setup
     startup_nodes = [{"host": node.split(":")[0], "port": int(node.split(":")[1])} for node in REDIS_NODES]
+    prod_startup_nodes = [{"host": node.split(":")[0], "port": int(node.split(":")[1])} for node in PROD_REDIS_NODES]
     redis_client = RedisCluster(startup_nodes=startup_nodes, decode_responses=True, skip_full_coverage_check=True)
+    prod_redis_client = RedisCluster(startup_nodes=prod_startup_nodes, decode_responses=True, skip_full_coverage_check=True)
     print("✅ Connected to Redis Cluster")
 else:
     # Redis Standalone setup (assume first node for standalone)
     STANDALONE_REDIS_DATABASE = int(os.getenv('STANDALONE_REDIS_DATABASE', '1'))
     host, port = REDIS_NODES[0].split(":")
+    prodHost, prodPort = PROD_REDIS_NODES[0].split(":")
     redis_client = redis.StrictRedis(host=host, port=int(port), db=STANDALONE_REDIS_DATABASE, decode_responses=True)
+    prod_redis_client = redis.StrictRedis(host=prodHost, port=int(prodPort), db=STANDALONE_REDIS_DATABASE, decode_responses=True)
     print(f"✅ Connected to Redis Standalone at {host}:{port} (DB={STANDALONE_REDIS_DATABASE})")
 
 # Database configuration
@@ -1600,7 +1605,7 @@ def handle_client_data(payload, client_ip, serverTime, isNYGpsDevice = False, se
             vehicle_number = fleet_info.get('vehicle_no', deviceId)
             
             # Create vehicle data
-            vehicle_data = json.dumps({
+            vehicle_data_obj = {
                 "latitude": entity["lat"],
                 "longitude": entity["long"],
                 "timestamp": entity["timestamp"],
@@ -1609,18 +1614,22 @@ def handle_client_data(payload, client_ip, serverTime, isNYGpsDevice = False, se
                 "vehicle_number": vehicle_number,
                 "route_id": route_id,
                 "serverTime": int(time.time())  # Add current server time
-            })
+            }
+
+            min_vehicle_data = json.dumps(vehicle_data_obj)
+            
             
             # Add ETA data if available
             if 'eta_list' in entity:
-                vehicle_data_obj = json.loads(vehicle_data)
                 vehicle_data_obj['eta_data'] = entity['eta_list']
                 vehicle_data_obj['visited_stops'] = entity['visited_stops']
-                vehicle_data = json.dumps(vehicle_data_obj)
+            vehicle_data = json.dumps(vehicle_data_obj)
             
             try:
                 # Store vehicle data in hash
                 logger.info(f"Route ID: Bus vehicle {vehicle_number} is on route, {route_id}")
+                prod_redis_client.hset(redis_key, vehicle_number, vehicle_data)
+                prod_redis_client.expire(redis_key, 86400)  # Expire after 24 hours
                 redis_client.hset(redis_key, vehicle_number, vehicle_data)
                 redis_client.expire(redis_key, 86400)  # Expire after 24 hours
                 
@@ -1628,13 +1637,14 @@ def handle_client_data(payload, client_ip, serverTime, isNYGpsDevice = False, se
                 geo_key = "bus_locations"  # Single key for all bus locations
                 geo_key_new = "bus_locations_metadata"  # Single key for all bus locations with metadata
                 if vehicle_lon is not None and vehicle_lat is not None and vehicle_number:
+                    prod_redis_client.geoadd(geo_key, vehicle_lon, vehicle_lat, vehicle_number)
+                    prod_redis_client.geoadd(geo_key_new, vehicle_lon, vehicle_lat, min_vehicle_data)
                     redis_client.geoadd(geo_key, vehicle_lon, vehicle_lat, vehicle_number)
-                    vehicle_data_without_eta = json.loads(vehicle_data)
-                    vehicle_data_without_eta.pop("eta_data", None)
-                    vehicle_data_without_eta.pop("visited_stops", None)
-                    redis_client.geoadd(geo_key_new, vehicle_lon, vehicle_lat, vehicle_data_without_eta)
+                    redis_client.geoadd(geo_key_new, vehicle_lon, vehicle_lat, min_vehicle_data)
                 else:
                     logger.error(f"Invalid location data: lon={vehicle_lon}, lat={vehicle_lat}, member={vehicle_number}")
+                prod_redis_client.expire(geo_key, 86400)  # Expire after 24 hours
+                prod_redis_client.expire(geo_key_new, 86400)  # Expire after 24 hours
                 redis_client.expire(geo_key, 86400)  # Expire after 24 hours
                 redis_client.expire(geo_key_new, 86400)  # Expire after 24 hours
                 
