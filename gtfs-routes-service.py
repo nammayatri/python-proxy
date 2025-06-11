@@ -494,14 +494,17 @@ async def get_routes_fuzzy(gtfs_id: str, query: str, limit: Optional[int] = None
     if gtfs_id not in gtfs_data.routes_by_gtfs:
         raise HTTPException(status_code=404, detail="GTFS ID not found")
     
-    results = []
+    # Use a dictionary to track unique routes
+    unique_routes = {}
+    
     for route in gtfs_data.routes_by_gtfs[gtfs_id].values():
         if query in route.longName or query in route.shortName or query in route.id:
-            results.append(route)
-            if limit is not None and len(results) >= limit:
+            # Use route.id as key to ensure uniqueness
+            unique_routes[route.id] = route
+            if limit is not None and len(unique_routes) >= limit:
                 break
     
-    return results
+    return list(unique_routes.values())
 
 @app.get("/stops/{gtfs_id}", response_model=List[RouteStopMapping])
 async def get_stops(gtfs_id: str):
@@ -521,6 +524,28 @@ async def get_stop(gtfs_id: str, stop_code: str):
     if gtfs_id not in gtfs_data.stop_route_map or stop_code not in gtfs_data.stop_route_map[gtfs_id]:
         raise HTTPException(status_code=404, detail="Stop code not found for GTFS ID")
     return gtfs_data.stop_route_map[gtfs_id][stop_code]
+
+@app.get("/stops/{gtfs_id}/fuzzy/{query}", response_model=List[RouteStopMapping])
+async def get_stops_fuzzy(gtfs_id: str, query: str, limit: Optional[int] = None):
+    gtfs_id = unquote(gtfs_id)
+    query = unquote(query).lower()
+    if gtfs_id not in gtfs_data.stop_route_map:
+        raise HTTPException(status_code=404, detail="GTFS ID not found")
+    
+    # Use a dictionary to track unique stops while preserving all matching RouteStopMapping objects
+    unique_stops = {}
+    
+    for stop_code, stop_mappings in gtfs_data.stop_route_map[gtfs_id].items():
+        # Check if any of the stop mappings match the query
+        for mapping in stop_mappings:
+            if (query in mapping.stopName.lower() or 
+                query in mapping.stopCode.lower()):
+                # Use stop_code as key to ensure uniqueness while preserving all matching mappings
+                unique_stops[stop_code] = mapping
+                if limit is not None and len(unique_stops) >= limit:
+                    return list(unique_stops.values())
+    
+    return list(unique_stops.values())
 
 @app.get("/ready")
 async def readiness_probe():
