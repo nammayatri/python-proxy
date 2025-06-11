@@ -503,6 +503,21 @@ async def get_routes_fuzzy(gtfs_id: str, query: str, limit: Optional[int] = None
     
     return results
 
+@app.get("/stops/{gtfs_id}", response_model=List[RouteStopMapping])
+async def get_stops(gtfs_id: str):
+    gtfs_id = unquote(gtfs_id)
+    if gtfs_id not in gtfs_data.stop_route_map:
+        raise HTTPException(status_code=404, detail="GTFS ID not found")
+    return list(gtfs_data.stop_route_map[gtfs_id].values())
+
+@app.get("/stop/{gtfs_id}/{stop_code}", response_model=List[RouteStopMapping])
+async def get_stop(gtfs_id: str, stop_code: str):
+    gtfs_id = unquote(gtfs_id)
+    stop_code = unquote(stop_code)
+    if gtfs_id not in gtfs_data.stop_route_map or stop_code not in gtfs_data.stop_route_map[gtfs_id]:
+        raise HTTPException(status_code=404, detail="Stop code not found for GTFS ID")
+    return gtfs_data.stop_route_map[gtfs_id][stop_code]
+
 @app.get("/ready")
 async def readiness_probe():
     """Readiness probe endpoint that checks if the service is ready to handle requests"""
