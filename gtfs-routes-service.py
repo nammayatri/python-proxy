@@ -511,11 +511,9 @@ async def get_stops(gtfs_id: str):
     gtfs_id = unquote(gtfs_id)
     if gtfs_id not in gtfs_data.stop_route_map:
         raise HTTPException(status_code=404, detail="GTFS ID not found")
-    # Flatten the list of lists into a single list of RouteStopMapping objects
-    all_stops = []
-    for stop_list in gtfs_data.stop_route_map[gtfs_id].values():
-        all_stops.extend(stop_list)
-    return all_stops
+    
+    # Return the first mapping for each stop since they are already deduplicated
+    return [mappings[0] for mappings in gtfs_data.stop_route_map[gtfs_id].values()]
 
 @app.get("/stop/{gtfs_id}/{stop_code}", response_model=List[RouteStopMapping])
 async def get_stop(gtfs_id: str, stop_code: str):
