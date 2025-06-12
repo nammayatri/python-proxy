@@ -496,12 +496,7 @@ async def polling_task():
                                 stopCode=stop.code,
                                 stopName=stop.name,
                                 stopPoint=LatLong(lat=stop.lat, lon=stop.lon),
-                                vehicleType=castVehicleType(routes_by_gtfs.get(gtfs_id, {}).get(pattern.routeId, NandiRoutesRes(
-                                    id=pattern.routeId,
-                                    mode="UNKNOWN",
-                                    startPoint=LatLong(lat=0.0, lon=0.0),
-                                    endPoint=LatLong(lat=0.0, lon=0.0)
-                                )).mode)
+                                vehicleType=castVehicleType(routes_by_gtfs[gtfs_id][route_code].mode if routes_by_gtfs[gtfs_id][route_code].mode != None else "UNKNOWN")
                             )
                             route_stop_map[gtfs_id][route_code].append(mapping)
                             if stop.code not in stop_route_map[gtfs_id]:
