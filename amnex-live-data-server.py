@@ -1612,7 +1612,7 @@ def handle_client_data(payload, client_ip, serverTime, isNYGpsDevice = False, se
                     "speed": entity.get("speed", 0),
                     "device_id": deviceId,
                     "vehicle_number": vehicle_number,
-                    "route_id": route_id,
+                    "route_id": str(route_id),
                     "serverTime": int(time.time())  # Add current server time
                 }
 
