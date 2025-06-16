@@ -1337,6 +1337,7 @@ def clean_redis_key_for_route_info(route_id, redis_key):
     # Remove outdated vehicles
     if vehicles_to_remove:
         redis_client.hdel(redis_key, *vehicles_to_remove)
+        prod_redis_client.hdel(redis_key, *vehicles_to_remove)
         removed_count = len(vehicles_to_remove)
         logger.info(f"Removed {removed_count} outdated vehicles from route {route_id}")
     
