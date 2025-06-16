@@ -185,7 +185,7 @@ class BusScheduleTripDetail(Base):
     deleted = Column(Boolean, nullable=False, default=False)
     route_number_id = Column(BigInteger, nullable=False)
 
-def get_route_id_from_waybills(vehicle_no: str, current_lat: float = None, current_lon: float = None, timestamp: int = None) -> Optional[str]:
+def get_route_ids_from_waybills(vehicle_no: str, current_lat: float = None, current_lon: float = None, timestamp: int = None) -> Optional[str]:
     """Get the route_id from waybills database for a given vehicle number"""
     try:
         with WaybillsSessionLocal() as db:
@@ -224,34 +224,29 @@ def get_route_id_from_waybills(vehicle_no: str, current_lat: float = None, curre
                 return None
             print(f"Route ID: Bus scheudle len {len(schedules)}")
 
-            best_route_id = None
-            best_score = 0.0
-            
+            best_route_ids = []
+            routes_match_score = {}
             for schedule in schedules:
-                route_stops = stop_tracker.get_route_stops(str(schedule.route_number_id))
-                if 'polyline' not in route_stops or ('polyline' in route_stops and route_stops['polyline'] is None):
-                    print(f"Route ID: Bus route_stops polyline not found {schedule.route_number_id}")
-                    
-                # Calculate match score using location history
-                score = calculate_route_match_score(schedule.route_number_id, vehicle_no, route_stops, location_history)
-                # Ensure score is not None
-                if score is None:
-                    score = 0.0
-                print(f"Route ID: Bus score {vehicle_no} Score for route {schedule.route_number_id}: {score}")
-                if score > best_score:
-                    best_score = score
-                    best_route_id = str(schedule.route_number_id)
-            
-            # Only return a route if it has a good match score
-            if best_score >= 0.3:  # Adjust this threshold as needed
-                return best_route_id
-                
-            return None
+                if schedule.route_number_id not in routes_match_score:
+                    route_stops = stop_tracker.get_route_stops(str(schedule.route_number_id))
+                    if 'polyline' not in route_stops or ('polyline' in route_stops and route_stops['polyline'] is None):
+                        print(f"Route ID: Bus route_stops polyline not found {schedule.route_number_id}")
+                        
+                    # Calculate match score using location history
+                    score = calculate_route_match_score(schedule.route_number_id, vehicle_no, route_stops, location_history)
+                    # Ensure score is not None
+                    if score is None:
+                        score = 0.0
+                    print(f"Route ID: Bus score {vehicle_no} Score for route {schedule.route_number_id}: {score}")
+                    if score > 0.8:
+                        best_route_ids.append(schedule.route_number_id)
+                    routes_match_score[schedule.route_number_id] = score
+            return best_route_ids
             
     except Exception as e:
         error_details = traceback.format_exc()
         logger.error(f"Error querying waybills database for vehicle {vehicle_no}: {e}\nTraceback: {error_details}")
-        return None
+        return []
 
 # Don't create tables since we're using existing tables
 # Base.metadata.create_all(bind=engine)
@@ -763,6 +758,8 @@ def get_fleet_info(device_id: str, current_lat: float = None, current_lon: float
     """Get both fleet number and route ID for a device"""
     cache_key = f"fleetInfo:{device_id}"
     cache_key_saved = cache_key + ":saved"
+
+    fleet_mapping_values = [] # response values
     
     # Check cache first
     fleet_info_str = redis_client.get(cache_key)
@@ -782,33 +779,34 @@ def get_fleet_info(device_id: str, current_lat: float = None, current_lon: float
                 return {}
 
             # Get route for fleet
-            route_id = get_route_id_from_waybills(fleet_mapping.vehicle_no, current_lat, current_lon, timestamp)
-            logger.info(f"Route ID: {fleet_mapping.vehicle_no}, {route_id}")
-            val = {
-                'vehicle_no': fleet_mapping.vehicle_no,
-                'device_id': device_id,
-                'route_id': route_id
-            }
-            try:
-                fleet_info_saved = redis_client.get(cache_key_saved)
-                if fleet_info_saved is not None:
-                    fleet_info_saved = json.loads(fleet_info_saved)
-                    print("going to delete route info")
-                    if ('route_id' in fleet_info_saved and 
-                        fleet_info_saved['route_id'] is not None and 
-                        route_id != fleet_info_saved['route_id']):
-                        print(f"going to delete route info: {fleet_info_saved['route_id']}")
-                        route_key = "route:" + fleet_info_saved['route_id']
-                        clean_redis_key_for_route_info(fleet_info_saved['route_id'], route_key)
-            except Exception as e:
-                logger.error(f"Error cleaning redis key for route info: {e}")
-            redis_client.setex(cache_key_saved, BUS_LOCATION_MAX_AGE + BUS_CLEANUP_INTERVAL, json.dumps(val)) # hack for cleanup if route changes
-            redis_client.setex(cache_key, BUS_CLEANUP_INTERVAL, json.dumps(val))
-            return val
-
+            route_ids = get_route_ids_from_waybills(fleet_mapping.vehicle_no, current_lat, current_lon, timestamp)
+            logger.info(f"Route ID: {fleet_mapping.vehicle_no}, {route_ids}")
+            for route_id in route_ids:
+                val = {
+                    'vehicle_no': fleet_mapping.vehicle_no,
+                    'device_id': device_id,
+                    'route_id': route_id
+                }
+                try:
+                    fleet_info_saved = redis_client.get(cache_key_saved)
+                    if fleet_info_saved is not None:
+                        fleet_info_saved = json.loads(fleet_info_saved)
+                        print("going to delete route info")
+                        if ('route_id' in fleet_info_saved and 
+                            fleet_info_saved['route_id'] is not None and 
+                            route_id != fleet_info_saved['route_id']):
+                            print(f"going to delete route info: {fleet_info_saved['route_id']}")
+                            route_key = "route:" + fleet_info_saved['route_id']
+                            clean_redis_key_for_route_info(fleet_info_saved['route_id'], route_key)
+                except Exception as e:
+                    logger.error(f"Error cleaning redis key for route info: {e}")
+                redis_client.setex(cache_key_saved, BUS_LOCATION_MAX_AGE + BUS_CLEANUP_INTERVAL, json.dumps(val)) # hack for cleanup if route changes
+                redis_client.setex(cache_key, BUS_CLEANUP_INTERVAL, json.dumps(val))
+                fleet_mapping_values.append(val)
+            return fleet_mapping_values
     except Exception as e:
         print(f"Error querying fleet info for device {device_id}: {e}")
-        return {}
+        return fleet_mapping_values
 
 def date_to_unix(d: date) -> int:
     return int(d.timestamp())
@@ -1566,90 +1564,91 @@ def handle_client_data(payload, client_ip, serverTime, isNYGpsDevice = False, se
                 return
         
         # Get route information for this vehicle
-        fleet_info = get_fleet_info(deviceId, vehicle_lat, vehicle_lon, entity.get('timestamp'))
-        entity['routeNumber'] = fleet_info.get('route_id')
-        push_to_kafka(entity)
-        if fleet_info and 'route_id' in fleet_info and fleet_info["route_id"] != None:
-            route_id = fleet_info['route_id']
-            
-            stopsInfo = stop_tracker.get_route_stops(route_id)
-            
-            # Pass vehicle_id (deviceId) to track visited stops
-            if deviceId:
-                visited_stops = stop_tracker.get_visited_stops(route_id, deviceId)
-            else:
-                visited_stops = []
-            eta_data = stop_tracker.calculate_eta(
-                stopsInfo,
-                route_id, 
-                vehicle_lat, 
-                vehicle_lon, 
-                serverTime,
-                vehicle_id=deviceId,
-                visited_stops=visited_stops,
-                vehicle_no=fleet_info.get('vehicle_no', deviceId)
-            )
-            
-            if eta_data:
-                entity['closest_stop'] = eta_data['closest_stop']
-                entity['distance_to_stop'] = eta_data['closest_stop']['distance']
-                entity['eta_list'] = eta_data['eta']
-                entity['calculation_method'] = eta_data['calculation_method']
-                entity['visited_stops'] = visited_stops
-        # Store in Redis
-        if fleet_info and 'route_id' in fleet_info and fleet_info["route_id"] != None:
-            route_id = fleet_info['route_id']
-            redis_key = f"route:{route_id}"
-            
-            # Get vehicle number
-            vehicle_number = fleet_info.get('vehicle_no', deviceId)
-            
-            # Create vehicle data
-            vehicle_data_obj = {
-                "latitude": entity["lat"],
-                "longitude": entity["long"],
-                "timestamp": entity["timestamp"],
-                "speed": entity.get("speed", 0),
-                "device_id": deviceId,
-                "vehicle_number": vehicle_number,
-                "route_id": route_id,
-                "serverTime": int(time.time())  # Add current server time
-            }
-
-            min_vehicle_data = json.dumps(vehicle_data_obj)
-            
-            
-            # Add ETA data if available
-            if 'eta_list' in entity:
-                vehicle_data_obj['eta_data'] = entity['eta_list']
-                vehicle_data_obj['visited_stops'] = entity['visited_stops']
-            vehicle_data = json.dumps(vehicle_data_obj)
-            
-            try:
-                # Store vehicle data in hash
-                logger.info(f"Route ID: Bus vehicle {vehicle_number} is on route, {route_id}")
-                prod_redis_client.hset(redis_key, vehicle_number, vehicle_data)
-                prod_redis_client.expire(redis_key, 86400)  # Expire after 24 hours
-                redis_client.hset(redis_key, vehicle_number, vehicle_data)
-                redis_client.expire(redis_key, 86400)  # Expire after 24 hours
+        fleet_infos = get_fleet_info(deviceId, vehicle_lat, vehicle_lon, entity.get('timestamp'))
+        for fleet_info in fleet_infos:
+            entity['routeNumber'] = fleet_info.get('route_id')
+            push_to_kafka(entity)
+            if fleet_info and 'route_id' in fleet_info and fleet_info["route_id"] != None:
+                route_id = fleet_info['route_id']
                 
-                # Store location in Redis Geo set
-                geo_key = "bus_locations"  # Single key for all bus locations
-                geo_key_new = "bus_locations_metadata"  # Single key for all bus locations with metadata
-                if vehicle_lon is not None and vehicle_lat is not None and vehicle_number:
-                    prod_redis_client.geoadd(geo_key, vehicle_lon, vehicle_lat, vehicle_number)
-                    prod_redis_client.geoadd(geo_key_new, vehicle_lon, vehicle_lat, min_vehicle_data)
-                    redis_client.geoadd(geo_key, vehicle_lon, vehicle_lat, vehicle_number)
-                    redis_client.geoadd(geo_key_new, vehicle_lon, vehicle_lat, min_vehicle_data)
+                stopsInfo = stop_tracker.get_route_stops(route_id)
+                
+                # Pass vehicle_id (deviceId) to track visited stops
+                if deviceId:
+                    visited_stops = stop_tracker.get_visited_stops(route_id, deviceId)
                 else:
-                    logger.error(f"Invalid location data: lon={vehicle_lon}, lat={vehicle_lat}, member={vehicle_number}")
-                prod_redis_client.expire(geo_key, 86400)  # Expire after 24 hours
-                prod_redis_client.expire(geo_key_new, 86400)  # Expire after 24 hours
-                redis_client.expire(geo_key, 86400)  # Expire after 24 hours
-                redis_client.expire(geo_key_new, 86400)  # Expire after 24 hours
+                    visited_stops = []
+                eta_data = stop_tracker.calculate_eta(
+                    stopsInfo,
+                    route_id, 
+                    vehicle_lat, 
+                    vehicle_lon, 
+                    serverTime,
+                    vehicle_id=deviceId,
+                    visited_stops=visited_stops,
+                    vehicle_no=fleet_info.get('vehicle_no', deviceId)
+                )
                 
-            except Exception as e:
-                logger.error(f"Error storing data in Redis: {str(e)}")
+                if eta_data:
+                    entity['closest_stop'] = eta_data['closest_stop']
+                    entity['distance_to_stop'] = eta_data['closest_stop']['distance']
+                    entity['eta_list'] = eta_data['eta']
+                    entity['calculation_method'] = eta_data['calculation_method']
+                    entity['visited_stops'] = visited_stops
+            # Store in Redis
+            if fleet_info and 'route_id' in fleet_info and fleet_info["route_id"] != None:
+                route_id = fleet_info['route_id']
+                redis_key = f"route:{route_id}"
+                
+                # Get vehicle number
+                vehicle_number = fleet_info.get('vehicle_no', deviceId)
+                
+                # Create vehicle data
+                vehicle_data_obj = {
+                    "latitude": entity["lat"],
+                    "longitude": entity["long"],
+                    "timestamp": entity["timestamp"],
+                    "speed": entity.get("speed", 0),
+                    "device_id": deviceId,
+                    "vehicle_number": vehicle_number,
+                    "route_id": route_id,
+                    "serverTime": int(time.time())  # Add current server time
+                }
+
+                min_vehicle_data = json.dumps(vehicle_data_obj)
+                
+                
+                # Add ETA data if available
+                if 'eta_list' in entity:
+                    vehicle_data_obj['eta_data'] = entity['eta_list']
+                    vehicle_data_obj['visited_stops'] = entity['visited_stops']
+                vehicle_data = json.dumps(vehicle_data_obj)
+                
+                try:
+                    # Store vehicle data in hash
+                    logger.info(f"Route ID: Bus vehicle {vehicle_number} is on route, {route_id}")
+                    prod_redis_client.hset(redis_key, vehicle_number, vehicle_data)
+                    prod_redis_client.expire(redis_key, 86400)  # Expire after 24 hours
+                    redis_client.hset(redis_key, vehicle_number, vehicle_data)
+                    redis_client.expire(redis_key, 86400)  # Expire after 24 hours
+                    
+                    # Store location in Redis Geo set
+                    geo_key = "bus_locations"  # Single key for all bus locations
+                    geo_key_new = "bus_locations_metadata"  # Single key for all bus locations with metadata
+                    if vehicle_lon is not None and vehicle_lat is not None and vehicle_number:
+                        prod_redis_client.geoadd(geo_key, vehicle_lon, vehicle_lat, vehicle_number)
+                        prod_redis_client.geoadd(geo_key_new, vehicle_lon, vehicle_lat, min_vehicle_data)
+                        redis_client.geoadd(geo_key, vehicle_lon, vehicle_lat, vehicle_number)
+                        redis_client.geoadd(geo_key_new, vehicle_lon, vehicle_lat, min_vehicle_data)
+                    else:
+                        logger.error(f"Invalid location data: lon={vehicle_lon}, lat={vehicle_lat}, member={vehicle_number}")
+                    prod_redis_client.expire(geo_key, 86400)  # Expire after 24 hours
+                    prod_redis_client.expire(geo_key_new, 86400)  # Expire after 24 hours
+                    redis_client.expire(geo_key, 86400)  # Expire after 24 hours
+                    redis_client.expire(geo_key_new, 86400)  # Expire after 24 hours
+                    
+                except Exception as e:
+                    logger.error(f"Error storing data in Redis: {str(e)}")
     except Exception as e:
         logger.error(f"Error handling client data: {str(e)}")
         traceback.print_exc()
