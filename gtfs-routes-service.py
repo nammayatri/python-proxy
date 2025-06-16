@@ -14,6 +14,7 @@ import time
 from urllib.parse import unquote
 import psutil
 from aiohttp import TCPConnector
+import traceback
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -455,10 +456,15 @@ async def polling_task():
                 routes = await fetch_routes(session)
                 routes_by_gtfs = {}
                 for route in routes:
-                    gtfs_id = route.id.split(':')[0]
-                    if gtfs_id not in routes_by_gtfs:
-                        routes_by_gtfs[gtfs_id] = {}
-                    routes_by_gtfs[gtfs_id][route.id] = route
+                    try:
+                        gtfs_id = str(route.id.split(':')[0])
+                        route_code = str(route.id.split(':')[-1])
+                        if gtfs_id not in routes_by_gtfs:
+                            routes_by_gtfs[gtfs_id] = {}
+                        routes_by_gtfs[gtfs_id][route_code] = route
+                    except Exception as e:
+                        logger.error(f"Error processing route {route.id}: {str(e)}")
+                        continue
 
                 # Fetch all patterns
                 patterns = await fetch_patterns(session)
@@ -479,29 +485,37 @@ async def polling_task():
                     
                     # Process batch
                     for pattern in batch_details:
-                        gtfs_id = pattern.routeId.split(':')[0]
-                        route_code = pattern.routeId.split(':')[-1]
-                        if gtfs_id not in route_stop_map:
-                            route_stop_map[gtfs_id] = {}
-                        if route_code not in route_stop_map[gtfs_id]:
-                            route_stop_map[gtfs_id][route_code] = []
-                        if gtfs_id not in stop_route_map:
-                            stop_route_map[gtfs_id] = {}
-                        for seq, stop in enumerate(pattern.stops):
-                            mapping = RouteStopMapping(
-                                estimatedTravelTimeFromPreviousStop=None,
-                                providerCode="GTFS",
-                                routeCode=route_code,
-                                sequenceNum=seq,
-                                stopCode=stop.code,
-                                stopName=stop.name,
-                                stopPoint=LatLong(lat=stop.lat, lon=stop.lon),
-                                vehicleType=castVehicleType(routes_by_gtfs[gtfs_id][route_code].mode if routes_by_gtfs[gtfs_id][route_code].mode != None else "UNKNOWN")
-                            )
-                            route_stop_map[gtfs_id][route_code].append(mapping)
-                            if stop.code not in stop_route_map[gtfs_id]:
-                                stop_route_map[gtfs_id][stop.code] = []
-                            stop_route_map[gtfs_id][stop.code].append(mapping)
+                        try:
+                            gtfs_id = str(pattern.routeId.split(':')[0])
+                            route_code = str(pattern.routeId.split(':')[-1])
+                            if gtfs_id not in route_stop_map:
+                                route_stop_map[gtfs_id] = {}
+                            if route_code not in route_stop_map[gtfs_id]:
+                                route_stop_map[gtfs_id][route_code] = []
+                            if gtfs_id not in stop_route_map:
+                                stop_route_map[gtfs_id] = {}
+                            for seq, stop in enumerate(pattern.stops):
+                                try:
+                                    mapping = RouteStopMapping(
+                                        estimatedTravelTimeFromPreviousStop=None,
+                                        providerCode="GTFS",
+                                        routeCode=route_code,
+                                        sequenceNum=seq,
+                                        stopCode=str(stop.code),
+                                        stopName=str(stop.name),
+                                        stopPoint=LatLong(lat=float(stop.lat), lon=float(stop.lon)),
+                                        vehicleType=castVehicleType(routes_by_gtfs[gtfs_id][route_code].mode if routes_by_gtfs[gtfs_id][route_code].mode != None else "UNKNOWN")
+                                    )
+                                    route_stop_map[gtfs_id][route_code].append(mapping)
+                                    if stop.code not in stop_route_map[gtfs_id]:
+                                        stop_route_map[gtfs_id][stop.code] = []
+                                    stop_route_map[gtfs_id][stop.code].append(mapping)
+                                except Exception as e:
+                                    logger.error(f"Error processing stop {stop.code} for route {route_code}: {str(e)}")
+                                    continue
+                        except Exception as e:
+                            logger.error(f"Error processing pattern {pattern.id}: {str(e)}")
+                            continue
                     
                     # Free memory after batch
                     del batch_details
@@ -510,7 +524,7 @@ async def polling_task():
 
                 if routes:
                     temp_data = GTFSData()
-                    temp_data.routes = {route.id: route for route in routes}
+                    temp_data.routes = {str(route.id): route for route in routes}
                     temp_data.route_stop_map = route_stop_map
                     temp_data.stop_route_map = stop_route_map
                     current_time = datetime.now()
@@ -534,9 +548,11 @@ async def polling_task():
                     logger.error("Failed to fetch complete data set, skipping update")
             except Exception as e:
                 logger.error(f"Error in polling task iteration: {str(e)}")
+                logger.error(f"Error details: {traceback.format_exc()}")
             await asyncio.sleep(POLLING_INTERVAL)
     except Exception as e:
         logger.error(f"Fatal error in polling task: {str(e)}")
+        logger.error(f"Error details: {traceback.format_exc()}")
     finally:
         if session:
             await session.close()
@@ -602,13 +618,17 @@ async def get_stops(gtfs_id: str):
     # Return the first mapping for each stop since they are already deduplicated
     return [mappings[0] for mappings in gtfs_data.stop_route_map[gtfs_id].values()]
 
-@app.get("/stop/{gtfs_id}/{stop_code}", response_model=List[RouteStopMapping])
+@app.get("/stop/{gtfs_id}/{stop_code}", response_model=RouteStopMapping)
 async def get_stop(gtfs_id: str, stop_code: str):
     gtfs_id = unquote(gtfs_id)
     stop_code = unquote(stop_code)
     if gtfs_id not in gtfs_data.stop_route_map or stop_code not in gtfs_data.stop_route_map[gtfs_id]:
         raise HTTPException(status_code=404, detail="Stop code not found for GTFS ID")
-    return gtfs_data.stop_route_map[gtfs_id][stop_code]
+    result = gtfs_data.stop_route_map[gtfs_id][stop_code]
+    if len(result) > 0:
+        return result[0]
+    else:
+        raise HTTPException(status_code=404, detail="Stop code not found for GTFS ID")
 
 @app.get("/stops/{gtfs_id}/fuzzy/{query}", response_model=List[RouteStopMapping])
 async def get_stops_fuzzy(gtfs_id: str, query: str, limit: Optional[int] = None):
