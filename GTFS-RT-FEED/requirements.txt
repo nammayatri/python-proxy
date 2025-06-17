@@ -7,7 +7,7 @@ fastapi==0.109.2
 gtfs-realtime-bindings==1.0.0
 h11==0.16.0
 idna==3.10
-protobuf==4.25.3
+protobuf==4.25.8
 pydantic==2.11.4
 pydantic_core==2.33.2
 python-dotenv==1.0.1
