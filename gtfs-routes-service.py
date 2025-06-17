@@ -15,6 +15,8 @@ from urllib.parse import unquote
 import psutil
 from aiohttp import TCPConnector
 import traceback
+import hashlib
+import json
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -33,6 +35,7 @@ RATE_LIMIT_DELAY = float(os.getenv("GTFS_RATE_LIMIT_DELAY", "0.1"))  # Delay bet
 CPU_THRESHOLD = float(os.getenv("GTFS_CPU_THRESHOLD", "80.0"))  # CPU usage threshold percentage
 CONNECTION_LIMIT = int(os.getenv("GTFS_CONNECTION_LIMIT", "100"))  # Maximum number of concurrent connections
 DNS_TTL = int(os.getenv("GTFS_DNS_TTL", "300"))  # DNS cache TTL in seconds
+MEMORY_THRESHOLD = int(os.getenv("GTFS_MEMORY_THRESHOLD", "5000"))  # Memory usage threshold in MB
 
 # Add rate limiting semaphore
 api_semaphore = asyncio.Semaphore(5)  # Limit concurrent API calls
@@ -183,6 +186,7 @@ class GTFSData:
         self.last_update: Dict[str, datetime] = {
             "routes": datetime.min
         }
+        self.data_hash: Dict[str, str] = {}  # Store hash per gtfs_id
         self._lock = threading.Lock()
 
     def update_data(self, temp_data: 'GTFSData'):
@@ -192,9 +196,18 @@ class GTFSData:
             self.route_stop_map = temp_data.route_stop_map
             self.stop_route_map = temp_data.stop_route_map
             self.last_update = temp_data.last_update
+            self.routes_by_gtfs = temp_data.routes_by_gtfs
+            self.data_hash = temp_data.data_hash
 
 # At the top of your file
 is_ready = False
+
+# Helper function to compute a hash from a data structure
+def compute_data_hash(data) -> str:
+    # Use json.dumps with sort_keys for deterministic output
+    data_str = json.dumps(data, sort_keys=True, default=lambda o: o.__dict__ if hasattr(o, '__dict__') else str(o))
+    return hashlib.sha256(data_str.encode('utf-8')).hexdigest()
+
 
 async def initial_data_load():
     """Load initial data before server starts"""
@@ -300,6 +313,17 @@ async def initial_data_load():
         # Update timestamp
         current_time = datetime.now()
         gtfs_data.last_update["routes"] = current_time
+
+        # Compute and store hash for each gtfs_id
+        gtfs_data.data_hash = {}
+        for gtfs_id in routes_by_gtfs:
+            # Only hash the relevant data for this gtfs_id
+            relevant = {
+                'routes': {k: v.dict() if hasattr(v, 'dict') else v for k, v in routes_by_gtfs[gtfs_id].items()},
+                'route_stop_map': {k: [m.model_dump() if hasattr(m, 'model_dump') else m for m in v] for k, v in route_stop_map.get(gtfs_id, {}).items()},
+                'stop_route_map': {k: [m.model_dump() if hasattr(m, 'model_dump') else m for m in v] for k, v in stop_route_map.get(gtfs_id, {}).items()},
+            }
+            gtfs_data.data_hash[gtfs_id] = compute_data_hash(relevant)
         logger.info(f"Initial data load complete: {len(routes)} routes, {total_patterns} patterns")
         # Set global is_ready to True
         global is_ready
@@ -447,7 +471,7 @@ async def polling_task():
                 cpu_percent = process.cpu_percent(interval=1.0)
                 memory_usage = process.memory_info().rss / 1024 / 1024
                 
-                if cpu_percent > CPU_THRESHOLD or memory_usage > 500:  # Added memory threshold
+                if cpu_percent > CPU_THRESHOLD or memory_usage > MEMORY_THRESHOLD:  # Added memory threshold
                     logger.warning(f"High resource usage detected (CPU: {cpu_percent:.1f}%, Memory: {memory_usage:.1f}MB), delaying update")
                     await asyncio.sleep(POLLING_INTERVAL)
                     continue
@@ -529,6 +553,16 @@ async def polling_task():
                     temp_data.stop_route_map = stop_route_map
                     current_time = datetime.now()
                     temp_data.last_update["routes"] = current_time
+                    temp_data.routes_by_gtfs = routes_by_gtfs
+                    # Compute and store hash for each gtfs_id
+                    temp_data.data_hash = {}
+                    for gtfs_id in routes_by_gtfs:
+                        relevant = {
+                            'routes': {k: v.dict() if hasattr(v, 'dict') else v for k, v in routes_by_gtfs[gtfs_id].items()},
+                            'route_stop_map': {k: [m.model_dump() if hasattr(m, 'model_dump') else m for m in v] for k, v in route_stop_map.get(gtfs_id, {}).items()},
+                            'stop_route_map': {k: [m.model_dump() if hasattr(m, 'model_dump') else m for m in v] for k, v in stop_route_map.get(gtfs_id, {}).items()},
+                        }
+                        temp_data.data_hash[gtfs_id] = compute_data_hash(relevant)
                     gtfs_data.update_data(temp_data)
                     logger.info(f"Successfully updated all data: {len(routes)} routes, {total_patterns} patterns")
                     
@@ -658,6 +692,14 @@ async def readiness_probe():
     if not is_ready:
         raise HTTPException(status_code=503, detail="Service not ready - still loading initial data")
     return {"status": "ok", "message": "Service is ready to handle requests"}
+
+# API endpoint to get the current data hash (version) for a GTFS ID
+@app.get("/version/{gtfs_id}")
+async def get_version(gtfs_id: str):
+    gtfs_id = unquote(gtfs_id)
+    if gtfs_id not in gtfs_data.data_hash:
+        raise HTTPException(status_code=404, detail="GTFS ID not found")
+    return {"gtfs_id": gtfs_id, "version": gtfs_data.data_hash[gtfs_id]}
 
 if __name__ == "__main__":
     uvicorn.run(app, host=API_HOST, port=API_PORT)
