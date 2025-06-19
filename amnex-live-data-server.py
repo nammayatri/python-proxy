@@ -1300,7 +1300,14 @@ def get_vehicle_location_history(device_id: str) -> List[dict]:
 
 def clean_redis_key_for_route_info(route_id, redis_key):
     current_time = int(time.time())
+    prod_vehicle_data = prod_redis_client.hgetall(redis_key)
     vehicle_data = redis_client.hgetall(redis_key)
+    # Merge prod_vehicle_data and vehicle_data so that all vehicles from both are considered.
+    # If a vehicle_id exists in both, prefer the one from prod_vehicle_data.
+    merged_vehicle_data = dict(vehicle_data) if vehicle_data else {}
+    if prod_vehicle_data:
+        merged_vehicle_data.update(prod_vehicle_data)
+    vehicle_data = merged_vehicle_data
     if not vehicle_data:
         return
     
@@ -1308,7 +1315,7 @@ def clean_redis_key_for_route_info(route_id, redis_key):
     removed_count = 0
     
     # Check each vehicle's timestamp
-    for vehicle_id, data_json in vehicle_data.items():
+    for vehicle_id, data_json in merged_vehicle_data.items():
         try:
             data = json.loads(data_json)
             # First check serverTime if available
@@ -1407,9 +1414,6 @@ def start_vehicle_cleanup_thread():
     """Start a background thread for vehicle mapping cleanup"""
     def cleanup_worker():
         logger.info(f"Vehicle mappings cleanup thread started (interval: {BUS_CLEANUP_INTERVAL}s, max age: {BUS_LOCATION_MAX_AGE}s)")
-        
-        # Initial delay to allow server to fully start
-        time.sleep(30)
         
         while True:
             try:
@@ -1840,8 +1844,6 @@ def main_server():
         server.bind((HOST, PORT))
         server.listen(100)  # Increase backlog for more pending connections
         
-        # Start the vehicle mappings cleanup thread
-        vehicle_cleanup_thread = start_vehicle_cleanup_thread()
         
         print(f"Listening for connections on {HOST}:{PORT}...")
         
@@ -1874,5 +1876,6 @@ if __name__ == "__main__":
     # Start MQTT client, no separate thread required 
     # as we already called loop_start() and we already registered a shutdown function
     mqtt_client_obj = mqtt_client()
+    start_vehicle_cleanup_thread()
     main_server()
 
