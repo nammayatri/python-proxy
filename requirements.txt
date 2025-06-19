@@ -1,52 +1,46 @@
-annotated-types==0.7.0
-anyio==4.9.0
-beautifulsoup4==4.12.3
-blinker==1.8.2
-certifi==2025.4.26
-charset-normalizer==3.4.2
-click==8.1.8
-clickhouse-driver==0.2.6
-confluent-kafka==2.5.3
-DateTime==5.5
-fastapi==0.109.2
-Flask==3.0.3
-geopy==2.4.1
-greenlet==3.1.1
-gtfs-realtime-bindings==1.0.0
-gunicorn==23.0.0
-h11==0.16.0
-haversine==2.8.0
-idna==3.10
-itsdangerous==2.2.0
-Jinja2==3.1.4
-MarkupSafe==2.1.5
-numpy==1.26.4
-packaging==24.1
-paho-mqtt==2.1.0
-pandas==2.2.1
-polyline==2.0.2
-protobuf==5.28.2
-psutil==5.9.8
-psycopg2-binary==2.9.10
-pydantic==2.6.1
-pydantic-core==2.16.2
-python-dotenv==1.0.1
-pytz==2024.2
-redis==3.5.3
-redis-py-cluster==2.1.3
-requests==2.32.3
-scikit-learn==1.4.2
-scipy==1.12.0
-setuptools==80.3.1
-shapely==2.0.3
-sniffio==1.3.1
-soupsieve==2.6
-SQLAlchemy==2.0.39
-starlette==0.36.3
-typing-inspection==0.4.0
-typing-extensions>=4.12.0
-urllib3==2.4.0
-uvicorn==0.27.1
-Werkzeug==3.0.4
-zope.interface==7.0.1
-aiohttp==3.9.3
+# Web/API
+Flask>=3.0.0
+fastapi>=0.109.0
+uvicorn>=0.27.0
+requests>=2.32.0
+starlette>=0.36.0
+
+# AWS/S3/CSV
+boto3>=1.34.0
+botocore>=1.34.0
+pandas>=2.1.0
+numpy>=1.26.0
+
+# Data Validation
+pydantic>=2.6.0
+
+# Database
+psycopg2-binary>=2.9.0
+sqlalchemy>=2.0.0
+
+# Redis
+redis>=3.5.0
+redis-py-cluster>=2.1.0
+
+# Messaging
+confluent-kafka>=2.5.0
+paho-mqtt>=2.1.0
+
+# Geospatial/Math
+geopy>=2.4.0
+haversine>=2.8.0
+shapely>=2.0.0
+polyline>=2.0.0
+
+# Google/GTFS/Protobuf
+protobuf>=5.28.0
+gtfs-realtime-bindings>=1.0.0
+google-api-python-client>=2.0.0
+
+# Async HTTP
+aiohttp>=3.9.0
+anyio>=4.9.0
+
+# Utilities
+python-dotenv>=1.0.0
+pytz>=2024.0
