@@ -17,7 +17,6 @@ AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 AWS_REGION = os.getenv("AWS_REGION", "ap-south-1")
 S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME", "nandi-data")
 S3_CSV_KEY = os.getenv("S3_CSV_KEY", "currentWaybill/waybills.csv")
-USE_IAM_ROLE = os.getenv("USE_IAM_ROLE", "false").lower() == "true"
 AWS_PROFILE = os.getenv("AWS_PROFILE")
 
 class VehicleData(BaseModel):
@@ -46,22 +45,21 @@ class S3CSVReader:
             
             # Log S3 configuration (without sensitive data)
             logger.info(f"S3 Configuration - Bucket: {S3_BUCKET_NAME}, Region: {AWS_REGION}")
-            logger.info(f"AWS Access Key ID length: {len(AWS_ACCESS_KEY_ID) if AWS_ACCESS_KEY_ID else 0}")
-            logger.info(f"AWS Secret Key length: {len(AWS_SECRET_ACCESS_KEY) if AWS_SECRET_ACCESS_KEY else 0}")
             
-            # Get session token from environment variable
-            session_token = os.getenv('AWS_SESSION_TOKEN')
-            if session_token:
-                logger.info("AWS Session Token is present")
+            # Check if explicit credentials are available
+            has_explicit_credentials = AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY
             
-            # Verify credentials are not empty
-            if not AWS_ACCESS_KEY_ID or not AWS_SECRET_ACCESS_KEY:
-                logger.error("AWS credentials are empty. Please check your environment variables:")
-                logger.error("AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set")
-                raise ValueError("AWS credentials are empty")
-            
-            # Initialize S3 client
-            try:
+            if has_explicit_credentials:
+                logger.info("Using explicit AWS credentials")
+                logger.info(f"AWS Access Key ID length: {len(AWS_ACCESS_KEY_ID)}")
+                logger.info(f"AWS Secret Key length: {len(AWS_SECRET_ACCESS_KEY)}")
+                
+                # Get session token from environment variable
+                session_token = os.getenv('AWS_SESSION_TOKEN')
+                if session_token:
+                    logger.info("AWS Session Token is present")
+                
+                # Initialize S3 client with explicit credentials
                 self.s3_client = boto3.client(
                     's3',
                     region_name=AWS_REGION,
@@ -69,10 +67,15 @@ class S3CSVReader:
                     aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
                     aws_session_token=session_token 
                 )
-                logger.info("Successfully initialized S3 client")
-            except Exception as e:
-                logger.error(f"Failed to initialize S3 client: {e}")
-                raise
+            else:
+                logger.info("No explicit credentials found, using IAM role/default credential chain")
+                # Use default credential chain (IAM role, environment variables, etc.)
+                self.s3_client = boto3.client(
+                    's3',
+                    region_name=AWS_REGION
+                )
+            
+            logger.info("Successfully initialized S3 client")
             
             # Test the connection by listing the bucket
             try:
