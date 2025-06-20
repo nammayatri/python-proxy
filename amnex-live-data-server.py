@@ -765,10 +765,11 @@ def get_fleet_info(device_id: str, current_lat: float = None, current_lon: float
     # Check cache first
     fleet_info_str = redis_client.get(cache_key)
     if fleet_info_str is not None:
-        fleet_info = json.loads(fleet_info_str)
-        if current_lat is not None and current_lon is not None:
-            store_vehicle_location_history(fleet_info['vehicle_no'], current_lat, current_lon, timestamp)
-        return fleet_info
+        fleet_infos = json.loads(fleet_info_str)
+        for fleet_info in fleet_infos:
+            if current_lat is not None and current_lon is not None:
+                store_vehicle_location_history(fleet_info['vehicle_no'], current_lat, current_lon, timestamp)
+        return fleet_infos
     try:
         with SessionLocal() as db:
             # Get fleet number for device
