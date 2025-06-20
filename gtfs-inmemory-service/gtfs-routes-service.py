@@ -17,7 +17,7 @@ from aiohttp import TCPConnector
 import traceback
 import hashlib
 import json
-from s3_csv_reader import s3_csv_reader, initialize_s3_csv_reader, s3_csv_polling_task
+from db_vehicle_reader import db_vehicle_reader, initialize_db_vehicle_reader
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -40,6 +40,26 @@ MEMORY_THRESHOLD = int(os.getenv("GTFS_MEMORY_THRESHOLD", "5000"))  # Memory usa
 
 # Add rate limiting semaphore
 api_semaphore = asyncio.Semaphore(5)  # Limit concurrent API calls
+
+def clean_identifier(identifier: str) -> str:
+    """
+    Clean an identifier by:
+    1. URL decoding (e.g., %3A -> :)
+    2. Removing GTFS ID prefix if present (e.g., chennai_data:12345 -> 12345)
+    
+    Args:
+        identifier: The identifier to clean (could be route code, stop code, etc.)
+    
+    Returns:
+        Cleaned identifier without GTFS ID prefix
+    """
+    # First decode URL encoding
+    decoded = unquote(identifier).split(':')[-1]
+    
+    # Remove GTFS ID prefix if present (format: gtfs_id:code)
+    
+    
+    return decoded
 
 # Create a shared session with optimized settings
 class OptimizedClientSession:
@@ -411,20 +431,18 @@ async def lifespan(app: FastAPI):
         await initial_data_load()
         polling_task_instance = asyncio.create_task(polling_task())
         
-        # Initialize S3 CSV reader
-        await initialize_s3_csv_reader()
-        s3_csv_polling_task_instance = asyncio.create_task(s3_csv_polling_task(POLLING_INTERVAL))
+        # Initialize database vehicle reader (with graceful failure handling)
+        try:
+            await initialize_db_vehicle_reader()
+        except Exception as e:
+            logger.error(f"Failed to initialize vehicle reader: {str(e)}")
+            logger.warning("Service will continue without vehicle data functionality")
         
         yield
         # Shutdown: Cancel the polling tasks and close session
         polling_task_instance.cancel()
-        s3_csv_polling_task_instance.cancel()
         try:
             await polling_task_instance
-        except asyncio.CancelledError:
-            pass
-        try:
-            await s3_csv_polling_task_instance
         except asyncio.CancelledError:
             pass
         await OptimizedClientSession.close_instance()
@@ -669,39 +687,39 @@ async def polling_task():
 @app.get("/route/{gtfs_id}/{route_id}", response_model=NandiRoutesRes)
 async def get_route(gtfs_id: str, route_id: str):
     """Get specific route"""
-    gtfs_id = unquote(gtfs_id)
-    route_id = unquote(route_id)
+    gtfs_id = clean_identifier(gtfs_id)
+    route_id = clean_identifier(route_id)
     if gtfs_id not in gtfs_data.routes_by_gtfs or route_id not in gtfs_data.routes_by_gtfs[gtfs_id]:
         raise HTTPException(status_code=404, detail="Route not found")
     return gtfs_data.routes_by_gtfs[gtfs_id][route_id]
 
 @app.get("/routes/{gtfs_id}", response_model=List[NandiRoutesRes])
 async def get_routes(gtfs_id: str):
-    gtfs_id = unquote(gtfs_id)
+    gtfs_id = clean_identifier(gtfs_id)
     if gtfs_id not in gtfs_data.routes_by_gtfs:
         raise HTTPException(status_code=404, detail="GTFS ID not found")
     return list(gtfs_data.routes_by_gtfs[gtfs_id].values())
 
 @app.get("/route-stop-mapping/{gtfs_id}/route/{route_code}", response_model=List[RouteStopMapping])
 async def get_route_stop_mapping_by_route(gtfs_id: str, route_code: str):
-    gtfs_id = unquote(gtfs_id)
-    route_code = unquote(route_code)
+    gtfs_id = clean_identifier(gtfs_id)
+    route_code = clean_identifier(route_code)
     if gtfs_id not in gtfs_data.route_stop_map or route_code not in gtfs_data.route_stop_map[gtfs_id]:
         raise HTTPException(status_code=404, detail="Route code not found for GTFS ID")
     return gtfs_data.route_stop_map[gtfs_id][route_code]
 
 @app.get("/route-stop-mapping/{gtfs_id}/stop/{stop_code}", response_model=List[RouteStopMapping])
 async def get_route_stop_mapping_by_stop(gtfs_id: str, stop_code: str):
-    gtfs_id = unquote(gtfs_id)
-    stop_code = unquote(stop_code)
+    gtfs_id = clean_identifier(gtfs_id)
+    stop_code = clean_identifier(stop_code)
     if gtfs_id not in gtfs_data.stop_route_map or stop_code not in gtfs_data.stop_route_map[gtfs_id]:
         raise HTTPException(status_code=404, detail="Stop code not found for GTFS ID")
     return gtfs_data.stop_route_map[gtfs_id][stop_code]
 
 @app.get("/routes/{gtfs_id}/fuzzy/{query}", response_model=List[NandiRoutesRes])
 async def get_routes_fuzzy(gtfs_id: str, query: str, limit: Optional[int] = None):
-    gtfs_id = unquote(gtfs_id)
-    query = unquote(query)
+    gtfs_id = clean_identifier(gtfs_id)
+    query = clean_identifier(query)
     if gtfs_id not in gtfs_data.routes_by_gtfs:
         raise HTTPException(status_code=404, detail="GTFS ID not found")
     
@@ -719,7 +737,7 @@ async def get_routes_fuzzy(gtfs_id: str, query: str, limit: Optional[int] = None
 
 @app.get("/stops/{gtfs_id}", response_model=List[RouteStopMapping])
 async def get_stops(gtfs_id: str):
-    gtfs_id = unquote(gtfs_id)
+    gtfs_id = clean_identifier(gtfs_id)
     if gtfs_id not in gtfs_data.stop_route_map:
         raise HTTPException(status_code=404, detail="GTFS ID not found")
     
@@ -728,8 +746,8 @@ async def get_stops(gtfs_id: str):
 
 @app.get("/stop/{gtfs_id}/{stop_code}", response_model=RouteStopMapping)
 async def get_stop(gtfs_id: str, stop_code: str):
-    gtfs_id = unquote(gtfs_id)
-    stop_code = unquote(stop_code)
+    gtfs_id = clean_identifier(gtfs_id)
+    stop_code = clean_identifier(stop_code)
     if gtfs_id not in gtfs_data.stop_route_map or stop_code not in gtfs_data.stop_route_map[gtfs_id]:
         raise HTTPException(status_code=404, detail="Stop code not found for GTFS ID")
     result = gtfs_data.stop_route_map[gtfs_id][stop_code]
@@ -740,8 +758,8 @@ async def get_stop(gtfs_id: str, stop_code: str):
 
 @app.get("/stops/{gtfs_id}/fuzzy/{query}", response_model=List[RouteStopMapping])
 async def get_stops_fuzzy(gtfs_id: str, query: str, limit: Optional[int] = None):
-    gtfs_id = unquote(gtfs_id)
-    query = unquote(query).lower()
+    gtfs_id = clean_identifier(gtfs_id)
+    query = clean_identifier(query).lower()
     if gtfs_id not in gtfs_data.stop_route_map:
         raise HTTPException(status_code=404, detail="GTFS ID not found")
     
@@ -770,7 +788,7 @@ async def readiness_probe():
 # API endpoint to get the current data hash (version) for a GTFS ID
 @app.get("/version/{gtfs_id}")
 async def get_version(gtfs_id: str):
-    gtfs_id = unquote(gtfs_id)
+    gtfs_id = clean_identifier(gtfs_id)
     if gtfs_id not in gtfs_data.data_hash:
         raise HTTPException(status_code=404, detail="GTFS ID not found")
     return {"gtfs_id": gtfs_id, "version": gtfs_data.data_hash[gtfs_id]}
@@ -778,22 +796,59 @@ async def get_version(gtfs_id: str):
 # API endpoint to get children station codes for a given gtfs_id and stop_code
 @app.get("/station-children/{gtfs_id}/{stop_code}", response_model=List[str])
 async def get_station_children(gtfs_id: str, stop_code: str):
-    gtfs_id = unquote(gtfs_id)
-    stop_code = unquote(stop_code)
+    gtfs_id = clean_identifier(gtfs_id)
+    stop_code = clean_identifier(stop_code)
     if gtfs_id not in gtfs_data.children_by_parent:
         raise HTTPException(status_code=404, detail="GTFS ID not found")
     children = gtfs_data.children_by_parent[gtfs_id].get(stop_code, [])
     return children
 
-# Vehicle data endpoints from S3 CSV
+# Vehicle data endpoints from database
 @app.get("/vehicle/{vehicle_no}/service-type", response_model=VehicleServiceTypeResponse)
 async def get_service_type_by_vehicle(vehicle_no: str):
     """Get service type for a specific vehicle number"""
-    vehicle_no = unquote(vehicle_no)
-    vehicle_data = s3_csv_reader.get_vehicle_data(vehicle_no)
-    if not vehicle_data:
-        raise HTTPException(status_code=404, detail="Vehicle not found")
-    return {"vehicle_no": vehicle_no, "service_type": vehicle_data.service_type, "waybill_id": vehicle_data.waybill_id, "schedule_no": vehicle_data.schedule_no, "last_updated": vehicle_data.last_updated}
+    try:
+        vehicle_no = clean_identifier(vehicle_no)
+        vehicle_data = await db_vehicle_reader.get_vehicle_data(vehicle_no)
+        if not vehicle_data:
+            raise HTTPException(status_code=404, detail="Vehicle not found")
+        return {"vehicle_no": vehicle_no, "service_type": vehicle_data.service_type, "waybill_id": vehicle_data.waybill_id, "schedule_no": vehicle_data.schedule_no, "last_updated": vehicle_data.last_updated}
+    except HTTPException:
+        # Re-raise HTTP exceptions as they are intentional
+        raise
+    except Exception as e:
+        logger.error(f"Error in vehicle service type endpoint: {str(e)}")
+        raise HTTPException(status_code=503, detail="Vehicle service temporarily unavailable")
+
+@app.get("/vehicle/cache/stats")
+async def get_vehicle_cache_stats():
+    """Get vehicle cache statistics"""
+    try:
+        stats = db_vehicle_reader.get_cache_stats()
+        return stats
+    except Exception as e:
+        logger.error(f"Error getting cache stats: {str(e)}")
+        raise HTTPException(status_code=503, detail="Cache stats temporarily unavailable")
+
+@app.post("/vehicle/cache/clear")
+async def clear_vehicle_cache():
+    """Clear the vehicle cache"""
+    try:
+        db_vehicle_reader.clear_cache()
+        return {"message": "Vehicle cache cleared successfully"}
+    except Exception as e:
+        logger.error(f"Error clearing cache: {str(e)}")
+        raise HTTPException(status_code=503, detail="Failed to clear cache")
+
+@app.get("/vehicle/status")
+async def get_vehicle_reader_status():
+    """Get vehicle reader status and cache information"""
+    try:
+        status = db_vehicle_reader.get_status()
+        return status
+    except Exception as e:
+        logger.error(f"Error getting vehicle reader status: {str(e)}")
+        raise HTTPException(status_code=503, detail="Status temporarily unavailable")
 
 if __name__ == "__main__":
     uvicorn.run(app, host=API_HOST, port=API_PORT)

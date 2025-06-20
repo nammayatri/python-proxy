@@ -5,7 +5,7 @@ A FastAPI-based service that provides GTFS (General Transit Feed Specification) 
 ## Features
 
 - **GTFS Routes API**: Fetch routes, patterns, and stop mappings
-- **Vehicle Data Integration**: S3 CSV integration for vehicle service type data
+- **Vehicle Data Integration**: Database integration for vehicle service type data
 - **Real-time Data Polling**: Automatic data refresh from GTFS sources
 - **Memory Optimization**: Efficient memory management with garbage collection
 - **Health Checks**: Built-in readiness and health check endpoints
@@ -52,14 +52,12 @@ A FastAPI-based service that provides GTFS (General Transit Feed Specification) 
 - `GTFS_DNS_TTL` - DNS cache TTL (default: 300)
 - `GTFS_MEMORY_THRESHOLD` - Memory threshold in MB (default: 5000)
 
-### AWS/S3 Configuration
-- `AWS_ACCESS_KEY_ID` - AWS access key
-- `AWS_SECRET_ACCESS_KEY` - AWS secret key
-- `AWS_REGION` - AWS region (default: ap-south-1)
-- `S3_BUCKET_NAME` - S3 bucket name (default: nandi-data)
-- `S3_CSV_KEY` - S3 CSV file key (default: currentWaybill/waybills.csv)
-- `USE_IAM_ROLE` - Use IAM role (default: false)
-- `AWS_PROFILE` - AWS profile name
+### Database Configuration
+- `WAYBILLS_DB_USER` - Database username
+- `WAYBILLS_DB_PASS` - Database password
+- `WAYBILLS_DB_HOST` - Database host
+- `WAYBILLS_DB_PORT` - Database port
+- `WAYBILLS_DB_NAME` - Database name
 
 ## Setup
 
@@ -73,8 +71,11 @@ pip install -r requirements.txt
 2. Set environment variables:
 ```bash
 export GTFS_BASE_URL="your_gtfs_api_url"
-export AWS_ACCESS_KEY_ID="your_aws_key"
-export AWS_SECRET_ACCESS_KEY="your_aws_secret"
+export WAYBILLS_DB_USER="your_db_user"
+export WAYBILLS_DB_PASS="your_db_password"
+export WAYBILLS_DB_HOST="your_db_host"
+export WAYBILLS_DB_PORT="5432"
+export WAYBILLS_DB_NAME="waybills"
 ```
 
 3. Run the service:
@@ -109,7 +110,7 @@ Once the service is running, visit:
 ## Data Sources
 
 - **GTFS Data**: Fetched from the configured GTFS API endpoint
-- **Vehicle Data**: S3 CSV file containing vehicle service type mappings
+- **Vehicle Data**: Database table containing vehicle service type mappings
 
 ## Performance Features
 
