@@ -615,7 +615,8 @@ class StopTracker:
                 if stop['stop_id'] not in visited_stops:
                     # Add to visited stops if not already there
                     logger.info(f"Vehicle {vehicle_id} is at stop {stop['stop_id']}")
-                    visited_stops = self.update_visited_stops(route_id, vehicle_id, stop['stop_id'])
+                    self.update_visited_stops(route_id, vehicle_id, stop['stop_id'])
+                    visited_stops.append(stop['stop_id'])
                     calculation_method = "visited_stops"
                 break
                     
@@ -1572,7 +1573,6 @@ def handle_client_data(payload, client_ip, serverTime, isNYGpsDevice = False, se
         fleet_infos = get_fleet_info(deviceId, vehicle_lat, vehicle_lon, entity.get('timestamp'))
         for fleet_info in fleet_infos:
             entity['routeNumber'] = fleet_info.get('route_id')
-            push_to_kafka(entity)
             if fleet_info and 'route_id' in fleet_info and fleet_info["route_id"] != None:
                 route_id = fleet_info['route_id']
                 
@@ -1583,6 +1583,7 @@ def handle_client_data(payload, client_ip, serverTime, isNYGpsDevice = False, se
                     visited_stops = stop_tracker.get_visited_stops(route_id, deviceId)
                 else:
                     visited_stops = []
+                before_curr_point_visited_stops = [x for x in visited_stops]
                 eta_data = stop_tracker.calculate_eta(
                     stopsInfo,
                     route_id, 
@@ -1593,6 +1594,9 @@ def handle_client_data(payload, client_ip, serverTime, isNYGpsDevice = False, se
                     visited_stops=visited_stops,
                     vehicle_no=fleet_info.get('vehicle_no', deviceId)
                 )
+                if len(visited_stops) > len(before_curr_point_visited_stops):
+                    entity['stopId'] = visited_stops[-1]
+                push_to_kafka(entity)
                 
                 if eta_data:
                     entity['closest_stop'] = eta_data['closest_stop']
@@ -1600,6 +1604,8 @@ def handle_client_data(payload, client_ip, serverTime, isNYGpsDevice = False, se
                     entity['eta_list'] = eta_data['eta']
                     entity['calculation_method'] = eta_data['calculation_method']
                     entity['visited_stops'] = visited_stops
+            else: 
+                push_to_kafka(entity)
             # Store in Redis
             if fleet_info and 'route_id' in fleet_info and fleet_info["route_id"] != None:
                 route_id = fleet_info['route_id']
