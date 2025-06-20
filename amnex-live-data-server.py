@@ -1572,6 +1572,8 @@ def handle_client_data(payload, client_ip, serverTime, isNYGpsDevice = False, se
         
         # Get route information for this vehicle
         fleet_infos = get_fleet_info(deviceId, vehicle_lat, vehicle_lon, entity.get('timestamp'))
+        if not fleet_infos:
+            push_to_kafka(entity)
         for fleet_info in fleet_infos:
             entity['routeNumber'] = fleet_info.get('route_id')
             if fleet_info and 'route_id' in fleet_info and fleet_info["route_id"] != None:
