@@ -3,12 +3,19 @@ import logging
 import os
 from datetime import datetime, date
 from typing import Dict, List, Optional, Any, Tuple
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 import asyncpg
 import traceback
 
 # Configure logging
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
+
+# Test log message to verify logging is working
+logger.info("db_vehicle_reader module loaded successfully")
+logger.critical("CRITICAL: db_vehicle_reader module logging test - this should always appear")
+print("PRINT: db_vehicle_reader module loaded - print statement fallback")
 
 # Environment Variables
 WAYBILLS_DB_USER = os.getenv("WAYBILLS_DB_USER", "postgres")
@@ -24,6 +31,12 @@ class VehicleData(BaseModel):
     schedule_no: str
     last_updated: Optional[datetime] = None
     duty_date: Optional[date] = None
+
+    @field_validator('waybill_id', 'schedule_no', mode='before')
+    @classmethod
+    def convert_to_str(cls, v):
+        """Convert any value to string"""
+        return str(v) if v is not None else None
 
 class DBVehicleReader:
     def __init__(self):
@@ -41,9 +54,11 @@ class DBVehicleReader:
     async def initialize_db_connection(self) -> bool:
         """Initialize database connection with error handling"""
         try:
+            logger.debug("Starting database connection initialization...")
             if self.db_pool:
                 await self.db_pool.close()
             
+            logger.debug(f"Connecting to database: {WAYBILLS_DB_HOST}:{WAYBILLS_DB_PORT}/{WAYBILLS_DB_NAME}")
             self.db_pool = await asyncpg.create_pool(
                 user=WAYBILLS_DB_USER,
                 password=WAYBILLS_DB_PASS,
@@ -55,6 +70,7 @@ class DBVehicleReader:
             )
             
             # Test the connection
+            logger.debug("Testing database connection...")
             async with self.db_pool.acquire() as conn:
                 await conn.execute("SELECT 1")
             
@@ -70,6 +86,7 @@ class DBVehicleReader:
             self.error_count += 1
             logger.error(f"Failed to initialize database connection: {str(e)}")
             logger.error(f"Error count: {self.error_count}/{self.max_errors}")
+            logger.error(f"Exception details: {traceback.format_exc()}")
             return False
 
     def _get_cached_vehicle_data(self, vehicle_no: str) -> Optional[VehicleData]:
@@ -164,6 +181,9 @@ class DBVehicleReader:
                     row = await conn.fetchrow(query, vehicle_no)
                 
                 if row:
+                    logger.info(f"Raw database row for vehicle {vehicle_no}: {dict(row)}")
+                    logger.info(f"Data types: waybill_id={type(row['waybill_id'])}, schedule_no={type(row['schedule_no'])}")
+                    
                     vehicle = VehicleData(
                         waybill_id=row['waybill_id'],
                         service_type=row['service_type'],
@@ -172,7 +192,7 @@ class DBVehicleReader:
                         last_updated=row['last_updated'],
                         duty_date=row['duty_date']
                     )
-                    logger.debug(f"Found vehicle data for {vehicle_no}")
+                    logger.info(f"Found vehicle data for {vehicle_no}: {vehicle.service_type}")
                     
                     # Cache the data
                     self._cache_vehicle_data(vehicle_no, vehicle)
@@ -398,11 +418,14 @@ db_vehicle_reader = DBVehicleReader()
 async def initialize_db_vehicle_reader():
     """Initialize the database vehicle reader with error handling"""
     try:
+        logger.info("Starting database vehicle reader initialization...")
         success = await db_vehicle_reader.initialize_db_connection()
         if success:
             logger.info("Database vehicle reader initialized successfully")
         else:
             logger.warning("Database vehicle reader initialization failed, but service will continue")
+            logger.warning(f"Last error: {db_vehicle_reader.last_error}")
     except Exception as e:
         logger.error(f"Failed to initialize database vehicle reader: {str(e)}")
+        logger.error(f"Exception details: {traceback.format_exc()}")
         logger.warning("Service will continue without vehicle data functionality") 
