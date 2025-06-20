@@ -801,9 +801,9 @@ def get_fleet_info(device_id: str, current_lat: float = None, current_lon: float
                             clean_redis_key_for_route_info(fleet_info_saved['route_id'], route_key)
                 except Exception as e:
                     logger.error(f"Error cleaning redis key for route info: {e}")
-                redis_client.setex(cache_key_saved, BUS_LOCATION_MAX_AGE + BUS_CLEANUP_INTERVAL, json.dumps(val)) # hack for cleanup if route changes
-                redis_client.setex(cache_key, BUS_CLEANUP_INTERVAL, json.dumps(val))
                 fleet_mapping_values.append(val)
+            redis_client.setex(cache_key_saved, BUS_LOCATION_MAX_AGE + BUS_CLEANUP_INTERVAL, json.dumps(fleet_mapping_values)) # hack for cleanup if route changes
+            redis_client.setex(cache_key, BUS_CLEANUP_INTERVAL, json.dumps(fleet_mapping_values))
             return fleet_mapping_values
     except Exception as e:
         print(f"Error querying fleet info for device {device_id}: {e}")
