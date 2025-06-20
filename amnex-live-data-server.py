@@ -1553,7 +1553,7 @@ def handle_client_data(payload, client_ip, serverTime, isNYGpsDevice = False, se
                 logger.info(f"Skipping NY gps device: {deviceId}, mqtt server data for other processing")
                 return
 
-        if not isNYGpsDevice and ('dataState' not in entity or entity.get('dataState') not in ['L', 'LP', 'LO']):
+        if not isNYGpsDevice and ('dataState' not in entity or entity.get('dataState') not in ['L', 'LP', 'LO'] or entity.get('provider') == 'amnex'):
             push_to_kafka(entity)
             print(f"Skipping chalo data")
             return
