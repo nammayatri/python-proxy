@@ -821,7 +821,7 @@ async def get_service_type_by_vehicle(vehicle_no: str):
         vehicle_data = await db_vehicle_reader.get_vehicle_data(vehicle_no)
         if not vehicle_data:
             raise HTTPException(status_code=404, detail="Vehicle not found")
-        return {"vehicle_no": vehicle_no, "service_type": vehicle_data.service_type, "waybill_id": vehicle_data.waybill_id, "schedule_no": vehicle_data.schedule_no, "last_updated": vehicle_data.last_updated}
+        return {"vehicle_no": vehicle_no, "service_type": vehicle_data.service_type, "waybill_id": vehicle_data.waybill_id, "schedule_no": vehicle_data.schedule_no, "last_updated": None}
     except HTTPException:
         # Re-raise HTTP exceptions as they are intentional
         raise
