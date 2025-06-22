@@ -37,6 +37,7 @@ CPU_THRESHOLD = float(os.getenv("GTFS_CPU_THRESHOLD", "80.0"))  # CPU usage thre
 CONNECTION_LIMIT = int(os.getenv("GTFS_CONNECTION_LIMIT", "100"))  # Maximum number of concurrent connections
 DNS_TTL = int(os.getenv("GTFS_DNS_TTL", "300"))  # DNS cache TTL in seconds
 MEMORY_THRESHOLD = int(os.getenv("GTFS_MEMORY_THRESHOLD", "5000"))  # Memory usage threshold in MB
+ENABLE_POLLING = os.getenv("GTFS_ENABLE_POLLING", "true").lower() == "true"  # Enable/disable polling
 
 # Add rate limiting semaphore
 api_semaphore = asyncio.Semaphore(5)  # Limit concurrent API calls
@@ -429,7 +430,14 @@ async def lifespan(app: FastAPI):
     # Startup: Load initial data and start polling task
     try:
         await initial_data_load()
-        polling_task_instance = asyncio.create_task(polling_task())
+        
+        # Only start polling task if enabled
+        polling_task_instance = None
+        if ENABLE_POLLING:
+            polling_task_instance = asyncio.create_task(polling_task())
+            logger.info("Polling task started")
+        else:
+            logger.info("Polling disabled - service will use initial data only")
         
         # Initialize database vehicle reader (with graceful failure handling)
         try:
@@ -440,11 +448,12 @@ async def lifespan(app: FastAPI):
         
         yield
         # Shutdown: Cancel the polling tasks and close session
-        polling_task_instance.cancel()
-        try:
-            await polling_task_instance
-        except asyncio.CancelledError:
-            pass
+        if polling_task_instance:
+            polling_task_instance.cancel()
+            try:
+                await polling_task_instance
+            except asyncio.CancelledError:
+                pass
         await OptimizedClientSession.close_instance()
     except Exception as e:
         logger.error(f"Failed to start service: {str(e)}")
