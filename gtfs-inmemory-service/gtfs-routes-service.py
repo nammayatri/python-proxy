@@ -15,8 +15,6 @@ from urllib.parse import unquote
 import psutil
 from aiohttp import TCPConnector
 import traceback
-import hashlib
-import json
 from db_vehicle_reader import db_vehicle_reader, initialize_db_vehicle_reader
 
 # Configure logging
@@ -36,7 +34,7 @@ RATE_LIMIT_DELAY = float(os.getenv("GTFS_RATE_LIMIT_DELAY", "0.1"))  # Delay bet
 CPU_THRESHOLD = float(os.getenv("GTFS_CPU_THRESHOLD", "80.0"))  # CPU usage threshold percentage
 CONNECTION_LIMIT = int(os.getenv("GTFS_CONNECTION_LIMIT", "100"))  # Maximum number of concurrent connections
 DNS_TTL = int(os.getenv("GTFS_DNS_TTL", "300"))  # DNS cache TTL in seconds
-MEMORY_THRESHOLD = int(os.getenv("GTFS_MEMORY_THRESHOLD", "5000"))  # Memory usage threshold in MB
+MEMORY_THRESHOLD = int(os.getenv("GTFS_MEMORY_THRESHOLD", "500"))  # Memory usage threshold in MB - reduced from 5000
 ENABLE_POLLING = os.getenv("GTFS_ENABLE_POLLING", "true").lower() == "true"  # Enable/disable polling
 
 # Add rate limiting semaphore
@@ -226,9 +224,10 @@ class GTFSData:
         self.last_update: Dict[str, datetime] = {
             "routes": datetime.min
         }
-        self.data_hash: Dict[str, str] = {}  # Store hash per gtfs_id
+        self.data_hash: Dict[str, str] = {}  # Store hash per gtfs_id - kept for compatibility
         self._lock = threading.Lock()
         self.children_by_parent: Dict[str, Dict[str, List[str]]] = {}  # gtfs_id -> parent stop_code -> [child stop_code]
+        self._processed_patterns: Set[str] = set()  # Track processed patterns to avoid duplicates
 
     def update_data(self, temp_data: 'GTFSData'):
         """Atomically update all data structures"""
@@ -244,11 +243,11 @@ class GTFSData:
 # At the top of your file
 is_ready = False
 
-# Helper function to compute a hash from a data structure
-def compute_data_hash(data) -> str:
-    # Use json.dumps with sort_keys for deterministic output
-    data_str = json.dumps(data, sort_keys=True, default=lambda o: o.__dict__ if hasattr(o, '__dict__') else str(o))
-    return hashlib.sha256(data_str.encode('utf-8')).hexdigest()
+# Helper function to compute a hash from a data structure - REMOVED for performance
+# def compute_data_hash(data) -> str:
+#     # Use json.dumps with sort_keys for deterministic output
+#     data_str = json.dumps(data, sort_keys=True, default=lambda o: o.__dict__ if hasattr(o, '__dict__') else str(o))
+#     return hashlib.sha256(data_str.encode('utf-8')).hexdigest()
 
 
 async def initial_data_load():
@@ -357,22 +356,22 @@ async def initial_data_load():
         current_time = datetime.now()
         gtfs_data.last_update["routes"] = current_time
 
-        # Compute and store hash for each gtfs_id
-        gtfs_data.data_hash = {}
-        for gtfs_id in routes_by_gtfs:
-            # Only hash the relevant data for this gtfs_id
-            relevant = {
-                'routes': {k: v.model_dump() if hasattr(v, 'model_dump') else v for k, v in routes_by_gtfs[gtfs_id].items()},
-                'route_stop_map': {k: [m.model_dump() if hasattr(m, 'model_dump') else m for m in v] for k, v in route_stop_map.get(gtfs_id, {}).items()},
-                'stop_route_map': {k: [m.model_dump() if hasattr(m, 'model_dump') else m for m in v] for k, v in stop_route_map.get(gtfs_id, {}).items()},
-            }
-            gtfs_data.data_hash[gtfs_id] = compute_data_hash(relevant)
+        # Compute and store hash for each gtfs_id - REMOVED for performance
+        # gtfs_data.data_hash = {}
+        # for gtfs_id in routes_by_gtfs:
+        #     # Only hash the relevant data for this gtfs_id
+        #     relevant = {
+        #         'routes': {k: v.model_dump() if hasattr(v, 'model_dump') else v for k, v in routes_by_gtfs[gtfs_id].items()},
+        #         'route_stop_map': {k: [m.model_dump() if hasattr(m, 'model_dump') else m for m in v] for k, v in route_stop_map.get(gtfs_id, {}).items()},
+        #         'stop_route_map': {k: [m.model_dump() if hasattr(m, 'model_dump') else m for m in v] for k, v in stop_route_map.get(gtfs_id, {}).items()},
+        #     }
+        #     gtfs_data.data_hash[gtfs_id] = compute_data_hash(relevant)
         logger.info(f"Initial data load complete: {len(routes)} routes, {total_patterns} patterns")
         # Set global is_ready to True
         global is_ready
         is_ready = True
 
-        # Fetch stops and build children mapping
+        # Fetch stops and build children mapping (only during initial load for performance)
         stops = await fetch_stops(session)
         gtfs_data.children_by_parent = {}
         stops_by_gtfs_temp = {}
@@ -545,20 +544,20 @@ async def process_pattern_batch(session: aiohttp.ClientSession, patterns: List[N
 async def polling_task():
     """Main polling task that updates all data periodically"""
     session = None
-    while True:
-        try:
-            if session is None:
-                session = await OptimizedClientSession.get_instance()
-            # Check CPU usage before starting update
-            process = psutil.Process()
-            cpu_percent = process.cpu_percent(interval=1.0)
-            memory_usage = process.memory_info().rss / 1024 / 1024
-            
-            if cpu_percent > CPU_THRESHOLD or memory_usage > MEMORY_THRESHOLD:  # Added memory threshold
-                logger.warning(f"High resource usage detected (CPU: {cpu_percent:.1f}%, Memory: {memory_usage:.1f}MB), delaying update")
-                await asyncio.sleep(POLLING_INTERVAL)
-                continue
+    try:
+        session = await OptimizedClientSession.get_instance()
+        while True:
             try:
+                # Check CPU usage before starting update
+                process = psutil.Process()
+                cpu_percent = process.cpu_percent(interval=1.0)
+                memory_usage = process.memory_info().rss / 1024 / 1024
+                
+                if cpu_percent > CPU_THRESHOLD or memory_usage > MEMORY_THRESHOLD:  # Use reduced memory threshold
+                    logger.warning(f"High resource usage detected (CPU: {cpu_percent:.1f}%, Memory: {memory_usage:.1f}MB), delaying update")
+                    await asyncio.sleep(POLLING_INTERVAL)
+                    continue
+                    
                 # Fetch routes
                 routes = await fetch_routes(session)
                 routes_by_gtfs = {}
@@ -637,33 +636,39 @@ async def polling_task():
                     current_time = datetime.now()
                     temp_data.last_update["routes"] = current_time
                     temp_data.routes_by_gtfs = routes_by_gtfs
-                    # Compute and store hash for each gtfs_id
-                    temp_data.data_hash = {}
-                    for gtfs_id in routes_by_gtfs:
-                        relevant = {
-                            'routes': {k: v.model_dump() if hasattr(v, 'model_dump') else v for k, v in routes_by_gtfs[gtfs_id].items()},
-                            'route_stop_map': {k: [m.model_dump() if hasattr(m, 'model_dump') else m for m in v] for k, v in route_stop_map.get(gtfs_id, {}).items()},
-                            'stop_route_map': {k: [m.model_dump() if hasattr(m, 'model_dump') else m for m in v] for k, v in stop_route_map.get(gtfs_id, {}).items()},
-                        }
-                        temp_data.data_hash[gtfs_id] = compute_data_hash(relevant)
-                    # Fetch stops and build children mapping
-                    stops = await fetch_stops(session)
-                    temp_data.children_by_parent = {}
-                    stops_by_gtfs_temp = {}
-                    for stop in stops:
-                        gtfs_id = stop.id.split(':')[0]
-                        if gtfs_id not in stops_by_gtfs_temp:
-                            stops_by_gtfs_temp[gtfs_id] = []
-                        stops_by_gtfs_temp[gtfs_id].append(stop)
-                    for gtfs_id, stops_list in stops_by_gtfs_temp.items():
-                        children_map = {}
-                        for stop in stops_list:
-                            if stop.stationId:
-                                parent_code = stop.stationId.split(':')[-1]
-                                if parent_code not in children_map:
-                                    children_map[parent_code] = []
-                                children_map[parent_code].append(stop.id.split(':')[-1])
-                        temp_data.children_by_parent[gtfs_id] = children_map
+                    
+                    # Preserve children_by_parent data from initial load (don't overwrite it)
+                    temp_data.children_by_parent = gtfs_data.children_by_parent
+                    
+                    # Remove expensive hash computation and stops fetching for performance
+                    # temp_data.data_hash = {}
+                    # for gtfs_id in routes_by_gtfs:
+                    #     relevant = {
+                    #         'routes': {k: v.model_dump() if hasattr(v, 'model_dump') else v for k, v in routes_by_gtfs[gtfs_id].items()},
+                    #         'route_stop_map': {k: [m.model_dump() if hasattr(m, 'model_dump') else m for m in v] for k, v in route_stop_map.get(gtfs_id, {}).items()},
+                    #         'stop_route_map': {k: [m.model_dump() if hasattr(m, 'model_dump') else m for m in v] for k, v in stop_route_map.get(gtfs_id, {}).items()},
+                    #     }
+                    #     temp_data.data_hash[gtfs_id] = compute_data_hash(relevant)
+                    
+                    # Remove stops fetching from polling loop for performance
+                    # stops = await fetch_stops(session)
+                    # temp_data.children_by_parent = {}
+                    # stops_by_gtfs_temp = {}
+                    # for stop in stops:
+                    #     gtfs_id = stop.id.split(':')[0]
+                    #     if gtfs_id not in stops_by_gtfs_temp:
+                    #         stops_by_gtfs_temp[gtfs_id] = []
+                    #     stops_by_gtfs_temp[gtfs_id].append(stop)
+                    # for gtfs_id, stops_list in stops_by_gtfs_temp.items():
+                    #     children_map = {}
+                    #     for stop in stops_list:
+                    #         if stop.stationId:
+                    #             parent_code = stop.stationId.split(':')[-1]
+                    #             if parent_code not in children_map:
+                    #                 children_map[parent_code] = []
+                    #             children_map[parent_code].append(stop.id.split(':')[-1])
+                    #     temp_data.children_by_parent[gtfs_id] = children_map
+                    
                     gtfs_data.update_data(temp_data)
                     logger.info(f"Successfully updated all data: {len(routes)} routes, {total_patterns} patterns")
                     
@@ -685,12 +690,12 @@ async def polling_task():
                 logger.error(f"Error in polling task iteration: {str(e)}")
                 logger.error(f"Error details: {traceback.format_exc()}")
             await asyncio.sleep(POLLING_INTERVAL)
-        except Exception as e:
-            logger.error(f"Fatal error in polling task: {str(e)}")
-            logger.error(f"Error details: {traceback.format_exc()}")
-            await asyncio.sleep(POLLING_INTERVAL)
-    if session:
-        await session.close()
+    except Exception as e:
+        logger.error(f"Fatal error in polling task: {str(e)}")
+        logger.error(f"Error details: {traceback.format_exc()}")
+    finally:
+        if session:
+            await session.close()
 
 # API endpoints
 @app.get("/route/{gtfs_id}/{route_id}", response_model=NandiRoutesRes)
@@ -794,24 +799,6 @@ async def readiness_probe():
         raise HTTPException(status_code=503, detail="Service not ready - still loading initial data")
     return {"status": "ok", "message": "Service is ready to handle requests"}
 
-# API endpoint to get the current data hash (version) for a GTFS ID
-@app.get("/version/{gtfs_id}")
-async def get_version(gtfs_id: str):
-    gtfs_id = clean_identifier(gtfs_id)
-    if gtfs_id not in gtfs_data.data_hash:
-        raise HTTPException(status_code=404, detail="GTFS ID not found")
-    return {"gtfs_id": gtfs_id, "version": gtfs_data.data_hash[gtfs_id]}
-
-# API endpoint to get children station codes for a given gtfs_id and stop_code
-@app.get("/station-children/{gtfs_id}/{stop_code}", response_model=List[str])
-async def get_station_children(gtfs_id: str, stop_code: str):
-    gtfs_id = clean_identifier(gtfs_id)
-    stop_code = clean_identifier(stop_code)
-    if gtfs_id not in gtfs_data.children_by_parent:
-        raise HTTPException(status_code=404, detail="GTFS ID not found")
-    children = gtfs_data.children_by_parent[gtfs_id].get(stop_code, [])
-    return children
-
 # Vehicle data endpoints from database
 @app.get("/vehicle/{vehicle_no}/service-type", response_model=VehicleServiceTypeResponse)
 async def get_service_type_by_vehicle(vehicle_no: str):
@@ -829,35 +816,15 @@ async def get_service_type_by_vehicle(vehicle_no: str):
         logger.error(f"Error in vehicle service type endpoint: {str(e)}")
         raise HTTPException(status_code=503, detail="Vehicle service temporarily unavailable")
 
-@app.get("/vehicle/cache/stats")
-async def get_vehicle_cache_stats():
-    """Get vehicle cache statistics"""
-    try:
-        stats = db_vehicle_reader.get_cache_stats()
-        return stats
-    except Exception as e:
-        logger.error(f"Error getting cache stats: {str(e)}")
-        raise HTTPException(status_code=503, detail="Cache stats temporarily unavailable")
-
-@app.post("/vehicle/cache/clear")
-async def clear_vehicle_cache():
-    """Clear the vehicle cache"""
-    try:
-        db_vehicle_reader.clear_cache()
-        return {"message": "Vehicle cache cleared successfully"}
-    except Exception as e:
-        logger.error(f"Error clearing cache: {str(e)}")
-        raise HTTPException(status_code=503, detail="Failed to clear cache")
-
-@app.get("/vehicle/status")
-async def get_vehicle_reader_status():
-    """Get vehicle reader status and cache information"""
-    try:
-        status = db_vehicle_reader.get_status()
-        return status
-    except Exception as e:
-        logger.error(f"Error getting vehicle reader status: {str(e)}")
-        raise HTTPException(status_code=503, detail="Status temporarily unavailable")
+# API endpoint to get children station codes for a given gtfs_id and stop_code
+@app.get("/station-children/{gtfs_id}/{stop_code}", response_model=List[str])
+async def get_station_children(gtfs_id: str, stop_code: str):
+    gtfs_id = clean_identifier(gtfs_id)
+    stop_code = clean_identifier(stop_code)
+    if gtfs_id not in gtfs_data.children_by_parent:
+        raise HTTPException(status_code=404, detail="GTFS ID not found")
+    children = gtfs_data.children_by_parent[gtfs_id].get(stop_code, [])
+    return children
 
 if __name__ == "__main__":
     uvicorn.run(app, host=API_HOST, port=API_PORT)
