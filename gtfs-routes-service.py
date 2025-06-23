@@ -37,6 +37,26 @@ DNS_TTL = int(os.getenv("GTFS_DNS_TTL", "300"))  # DNS cache TTL in seconds
 # Add rate limiting semaphore
 api_semaphore = asyncio.Semaphore(5)  # Limit concurrent API calls
 
+def clean_identifier(identifier: str) -> str:
+    """
+    Clean an identifier by:
+    1. URL decoding (e.g., %3A -> :)
+    2. Removing GTFS ID prefix if present (e.g., chennai_data:12345 -> 12345)
+    
+    Args:
+        identifier: The identifier to clean (could be route code, stop code, etc.)
+    
+    Returns:
+        Cleaned identifier without GTFS ID prefix
+    """
+    # First decode URL encoding
+    decoded = unquote(identifier).split(':')[-1]
+    
+    # Remove GTFS ID prefix if present (format: gtfs_id:code)
+    
+    
+    return decoded
+
 # Create a shared session with optimized settings
 class OptimizedClientSession:
     _instance = None
@@ -173,6 +193,15 @@ def castVehicleType(vehicle_type:str) -> str:
         return "METRO"
     else:
         return vehicle_type
+    
+class GTFSStop(BaseModel):
+    id: str
+    code: str
+    name: str
+    lat: float
+    lon: float
+    stationId: Optional[str] = None
+    cluster: Optional[str] = None
 
 class GTFSData:
     def __init__(self):
@@ -184,6 +213,7 @@ class GTFSData:
             "routes": datetime.min
         }
         self._lock = threading.Lock()
+        self.children_by_parent: Dict[str, Dict[str, List[str]]] = {}
 
     def update_data(self, temp_data: 'GTFSData'):
         """Atomically update all data structures"""
@@ -192,6 +222,7 @@ class GTFSData:
             self.route_stop_map = temp_data.route_stop_map
             self.stop_route_map = temp_data.stop_route_map
             self.last_update = temp_data.last_update
+            self.children_by_parent = temp_data.children_by_parent
 
 # At the top of your file
 is_ready = False
@@ -304,9 +335,32 @@ async def initial_data_load():
         # Set global is_ready to True
         global is_ready
         is_ready = True
+        # Fetch stops and build children mappingAdd commentMore actions
+        stops = await fetch_stops(session)
+        gtfs_data.children_by_parent = {}
+        stops_by_gtfs_temp = {}
+        for stop in stops:
+            gtfs_id = stop.id.split(':')[0]
+            if gtfs_id not in stops_by_gtfs_temp:
+                stops_by_gtfs_temp[gtfs_id] = []
+            stops_by_gtfs_temp[gtfs_id].append(stop)
+        for gtfs_id, stops_list in stops_by_gtfs_temp.items():
+            children_map = {}
+            for stop in stops_list:
+                if stop.stationId:
+                    parent_code = stop.stationId.split(':')[-1]
+                    if parent_code not in children_map:
+                        children_map[parent_code] = []
+                    children_map[parent_code].append(stop.id.split(':')[-1])
+            gtfs_data.children_by_parent[gtfs_id] = children_map
     except Exception as e:
         logger.error(f"Error during initial data load: {str(e)}")
         raise
+
+async def fetch_stops(session: aiohttp.ClientSession) -> List[GTFSStop]:
+    """Fetch all stops from the API and parse as GTFSStop models"""
+    data = await fetch_with_retry(session, f"{BASE_URL}/otp/routers/default/index/stops")
+    return [GTFSStop(**item) for item in data]
 
 def garbage_collector():
     """Background thread for periodic garbage collection"""
@@ -461,7 +515,17 @@ async def polling_task():
                         route_code = str(route.id.split(':')[-1])
                         if gtfs_id not in routes_by_gtfs:
                             routes_by_gtfs[gtfs_id] = {}
-                        routes_by_gtfs[gtfs_id][route_code] = route
+                        routes_by_gtfs[gtfs_id][route_code] = NandiRoutesRes(
+                            id=route_code,
+                            shortName=route.shortName,
+                            longName=route.longName,
+                            mode=castVehicleType(route.mode),
+                            agencyName=route.agencyName,
+                            tripCount=route.tripCount,
+                            stopCount=route.stopCount,
+                            startPoint=route.startPoint,
+                            endPoint=route.endPoint
+                        )
                     except Exception as e:
                         logger.error(f"Error processing route {route.id}: {str(e)}")
                         continue
@@ -527,8 +591,27 @@ async def polling_task():
                     temp_data.routes = {str(route.id): route for route in routes}
                     temp_data.route_stop_map = route_stop_map
                     temp_data.stop_route_map = stop_route_map
+                    temp_data.routes_by_gtfs = routes_by_gtfs
                     current_time = datetime.now()
                     temp_data.last_update["routes"] = current_time
+                    # Fetch stops and build children mappingAdd commentMore actions
+                    stops = await fetch_stops(session)
+                    temp_data.children_by_parent = {}
+                    stops_by_gtfs_temp = {}
+                    for stop in stops:
+                        gtfs_id = stop.id.split(':')[0]
+                        if gtfs_id not in stops_by_gtfs_temp:
+                            stops_by_gtfs_temp[gtfs_id] = []
+                        stops_by_gtfs_temp[gtfs_id].append(stop)
+                    for gtfs_id, stops_list in stops_by_gtfs_temp.items():
+                        children_map = {}
+                        for stop in stops_list:
+                            if stop.stationId:
+                                parent_code = stop.stationId.split(':')[-1]
+                                if parent_code not in children_map:
+                                    children_map[parent_code] = []
+                                children_map[parent_code].append(stop.id.split(':')[-1])
+                        temp_data.children_by_parent[gtfs_id] = children_map
                     gtfs_data.update_data(temp_data)
                     logger.info(f"Successfully updated all data: {len(routes)} routes, {total_patterns} patterns")
                     
@@ -561,39 +644,39 @@ async def polling_task():
 @app.get("/route/{gtfs_id}/{route_id}", response_model=NandiRoutesRes)
 async def get_route(gtfs_id: str, route_id: str):
     """Get specific route"""
-    gtfs_id = unquote(gtfs_id)
-    route_id = unquote(route_id)
+    gtfs_id = clean_identifier(gtfs_id)
+    route_id = clean_identifier(route_id)
     if gtfs_id not in gtfs_data.routes_by_gtfs or route_id not in gtfs_data.routes_by_gtfs[gtfs_id]:
         raise HTTPException(status_code=404, detail="Route not found")
     return gtfs_data.routes_by_gtfs[gtfs_id][route_id]
 
 @app.get("/routes/{gtfs_id}", response_model=List[NandiRoutesRes])
 async def get_routes(gtfs_id: str):
-    gtfs_id = unquote(gtfs_id)
+    gtfs_id = clean_identifier(gtfs_id)
     if gtfs_id not in gtfs_data.routes_by_gtfs:
         raise HTTPException(status_code=404, detail="GTFS ID not found")
     return list(gtfs_data.routes_by_gtfs[gtfs_id].values())
 
 @app.get("/route-stop-mapping/{gtfs_id}/route/{route_code}", response_model=List[RouteStopMapping])
 async def get_route_stop_mapping_by_route(gtfs_id: str, route_code: str):
-    gtfs_id = unquote(gtfs_id)
-    route_code = unquote(route_code)
+    gtfs_id = clean_identifier(gtfs_id)
+    route_code = clean_identifier(route_code)
     if gtfs_id not in gtfs_data.route_stop_map or route_code not in gtfs_data.route_stop_map[gtfs_id]:
         raise HTTPException(status_code=404, detail="Route code not found for GTFS ID")
     return gtfs_data.route_stop_map[gtfs_id][route_code]
 
 @app.get("/route-stop-mapping/{gtfs_id}/stop/{stop_code}", response_model=List[RouteStopMapping])
 async def get_route_stop_mapping_by_stop(gtfs_id: str, stop_code: str):
-    gtfs_id = unquote(gtfs_id)
-    stop_code = unquote(stop_code)
+    gtfs_id = clean_identifier(gtfs_id)
+    stop_code = clean_identifier(stop_code)
     if gtfs_id not in gtfs_data.stop_route_map or stop_code not in gtfs_data.stop_route_map[gtfs_id]:
         raise HTTPException(status_code=404, detail="Stop code not found for GTFS ID")
     return gtfs_data.stop_route_map[gtfs_id][stop_code]
 
 @app.get("/routes/{gtfs_id}/fuzzy/{query}", response_model=List[NandiRoutesRes])
 async def get_routes_fuzzy(gtfs_id: str, query: str, limit: Optional[int] = None):
-    gtfs_id = unquote(gtfs_id)
-    query = unquote(query)
+    gtfs_id = clean_identifier(gtfs_id)
+    query = clean_identifier(query)
     if gtfs_id not in gtfs_data.routes_by_gtfs:
         raise HTTPException(status_code=404, detail="GTFS ID not found")
     
@@ -611,7 +694,7 @@ async def get_routes_fuzzy(gtfs_id: str, query: str, limit: Optional[int] = None
 
 @app.get("/stops/{gtfs_id}", response_model=List[RouteStopMapping])
 async def get_stops(gtfs_id: str):
-    gtfs_id = unquote(gtfs_id)
+    gtfs_id = clean_identifier(gtfs_id)
     if gtfs_id not in gtfs_data.stop_route_map:
         raise HTTPException(status_code=404, detail="GTFS ID not found")
     
@@ -620,8 +703,8 @@ async def get_stops(gtfs_id: str):
 
 @app.get("/stop/{gtfs_id}/{stop_code}", response_model=RouteStopMapping)
 async def get_stop(gtfs_id: str, stop_code: str):
-    gtfs_id = unquote(gtfs_id)
-    stop_code = unquote(stop_code)
+    gtfs_id = clean_identifier(gtfs_id)
+    stop_code = clean_identifier(stop_code)
     if gtfs_id not in gtfs_data.stop_route_map or stop_code not in gtfs_data.stop_route_map[gtfs_id]:
         raise HTTPException(status_code=404, detail="Stop code not found for GTFS ID")
     result = gtfs_data.stop_route_map[gtfs_id][stop_code]
@@ -632,8 +715,8 @@ async def get_stop(gtfs_id: str, stop_code: str):
 
 @app.get("/stops/{gtfs_id}/fuzzy/{query}", response_model=List[RouteStopMapping])
 async def get_stops_fuzzy(gtfs_id: str, query: str, limit: Optional[int] = None):
-    gtfs_id = unquote(gtfs_id)
-    query = unquote(query).lower()
+    gtfs_id = clean_identifier(gtfs_id)
+    query = clean_identifier(query).lower()
     if gtfs_id not in gtfs_data.stop_route_map:
         raise HTTPException(status_code=404, detail="GTFS ID not found")
     
@@ -651,6 +734,16 @@ async def get_stops_fuzzy(gtfs_id: str, query: str, limit: Optional[int] = None)
                     return list(unique_stops.values())
     
     return list(unique_stops.values())
+
+# API endpoint to get children station codes for a given gtfs_id and stop_codeAdd commentMore actions
+@app.get("/station-children/{gtfs_id}/{stop_code}", response_model=List[str])
+async def get_station_children(gtfs_id: str, stop_code: str):
+    gtfs_id = clean_identifier(gtfs_id)
+    stop_code = clean_identifier(stop_code)
+    if gtfs_id not in gtfs_data.children_by_parent:
+        raise HTTPException(status_code=404, detail="GTFS ID not found")
+    children = gtfs_data.children_by_parent[gtfs_id].get(stop_code, [])
+    return children
 
 @app.get("/ready")
 async def readiness_probe():
