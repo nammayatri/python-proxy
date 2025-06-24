@@ -5,7 +5,7 @@ import asyncio
 import os
 from datetime import datetime
 import logging
-from pydantic import BaseModel, field_validator, RootModel, Field
+from pydantic import BaseModel, field_validator, RootModel
 import uvicorn
 from contextlib import asynccontextmanager
 import gc
@@ -34,8 +34,6 @@ RATE_LIMIT_DELAY = float(os.getenv("GTFS_RATE_LIMIT_DELAY", "0.1"))  # Delay bet
 CPU_THRESHOLD = float(os.getenv("GTFS_CPU_THRESHOLD", "80.0"))  # CPU usage threshold percentage
 CONNECTION_LIMIT = int(os.getenv("GTFS_CONNECTION_LIMIT", "100"))  # Maximum number of concurrent connections
 DNS_TTL = int(os.getenv("GTFS_DNS_TTL", "300"))  # DNS cache TTL in seconds
-MEMORY_THRESHOLD = int(os.getenv("GTFS_MEMORY_THRESHOLD", "500"))  # Memory usage threshold in MB - reduced from 5000
-ENABLE_POLLING = os.getenv("GTFS_ENABLE_POLLING", "true").lower() == "true"  # Enable/disable polling
 
 # Add rate limiting semaphore
 api_semaphore = asyncio.Semaphore(5)  # Limit concurrent API calls
@@ -59,6 +57,15 @@ def clean_identifier(identifier: str) -> str:
     
     
     return decoded
+
+# Response models for vehicle endpoints
+class VehicleServiceTypeResponse(BaseModel):
+    vehicle_no: str
+    service_type: str
+    waybill_id: Optional[str] = None
+    schedule_no: Optional[str] = None
+    last_updated: Optional[datetime] = None
+
 
 # Create a shared session with optimized settings
 class OptimizedClientSession:
@@ -191,21 +198,12 @@ class RouteStopMapping(BaseModel):
     stopPoint: LatLong
     vehicleType: str
 
-# Response models for vehicle endpoints
-class VehicleServiceTypeResponse(BaseModel):
-    vehicle_no: str
-    service_type: str
-    waybill_id: Optional[str] = None
-    schedule_no: Optional[str] = None
-    last_updated: Optional[datetime] = None
-
 def castVehicleType(vehicle_type:str) -> str:
     if vehicle_type == "RAIL":
         return "METRO"
     else:
         return vehicle_type
-
-# Pydantic model for GTFS stops
+    
 class GTFSStop(BaseModel):
     id: str
     code: str
@@ -224,10 +222,8 @@ class GTFSData:
         self.last_update: Dict[str, datetime] = {
             "routes": datetime.min
         }
-        self.data_hash: Dict[str, str] = {}  # Store hash per gtfs_id - kept for compatibility
         self._lock = threading.Lock()
-        self.children_by_parent: Dict[str, Dict[str, List[str]]] = {}  # gtfs_id -> parent stop_code -> [child stop_code]
-        self._processed_patterns: Set[str] = set()  # Track processed patterns to avoid duplicates
+        self.children_by_parent: Dict[str, Dict[str, List[str]]] = {}
 
     def update_data(self, temp_data: 'GTFSData'):
         """Atomically update all data structures"""
@@ -236,19 +232,10 @@ class GTFSData:
             self.route_stop_map = temp_data.route_stop_map
             self.stop_route_map = temp_data.stop_route_map
             self.last_update = temp_data.last_update
-            self.routes_by_gtfs = temp_data.routes_by_gtfs
-            self.data_hash = temp_data.data_hash
             self.children_by_parent = temp_data.children_by_parent
 
 # At the top of your file
 is_ready = False
-
-# Helper function to compute a hash from a data structure - REMOVED for performance
-# def compute_data_hash(data) -> str:
-#     # Use json.dumps with sort_keys for deterministic output
-#     data_str = json.dumps(data, sort_keys=True, default=lambda o: o.__dict__ if hasattr(o, '__dict__') else str(o))
-#     return hashlib.sha256(data_str.encode('utf-8')).hexdigest()
-
 
 async def initial_data_load():
     """Load initial data before server starts"""
@@ -328,7 +315,6 @@ async def initial_data_load():
                     routeCode=route_code,
                     sequenceNum=seq,
                     stopCode=stop.code,
-                    
                     stopName=stop.name,
                     stopPoint=LatLong(lat=stop.lat, lon=stop.lon),
                     vehicleType=castVehicleType(routes_by_gtfs[gtfs_id][route_code].mode if routes_by_gtfs[gtfs_id][route_code].mode != None else "UNKNOWN")
@@ -355,23 +341,11 @@ async def initial_data_load():
         # Update timestamp
         current_time = datetime.now()
         gtfs_data.last_update["routes"] = current_time
-
-        # Compute and store hash for each gtfs_id - REMOVED for performance
-        # gtfs_data.data_hash = {}
-        # for gtfs_id in routes_by_gtfs:
-        #     # Only hash the relevant data for this gtfs_id
-        #     relevant = {
-        #         'routes': {k: v.model_dump() if hasattr(v, 'model_dump') else v for k, v in routes_by_gtfs[gtfs_id].items()},
-        #         'route_stop_map': {k: [m.model_dump() if hasattr(m, 'model_dump') else m for m in v] for k, v in route_stop_map.get(gtfs_id, {}).items()},
-        #         'stop_route_map': {k: [m.model_dump() if hasattr(m, 'model_dump') else m for m in v] for k, v in stop_route_map.get(gtfs_id, {}).items()},
-        #     }
-        #     gtfs_data.data_hash[gtfs_id] = compute_data_hash(relevant)
         logger.info(f"Initial data load complete: {len(routes)} routes, {total_patterns} patterns")
         # Set global is_ready to True
         global is_ready
         is_ready = True
-
-        # Fetch stops and build children mapping (only during initial load for performance)
+        # Fetch stops and build children mappingAdd commentMore actions
         stops = await fetch_stops(session)
         gtfs_data.children_by_parent = {}
         stops_by_gtfs_temp = {}
@@ -392,6 +366,11 @@ async def initial_data_load():
     except Exception as e:
         logger.error(f"Error during initial data load: {str(e)}")
         raise
+
+async def fetch_stops(session: aiohttp.ClientSession) -> List[GTFSStop]:
+    """Fetch all stops from the API and parse as GTFSStop models"""
+    data = await fetch_with_retry(session, f"{BASE_URL}/otp/routers/default/index/stops")
+    return [GTFSStop(**item) for item in data]
 
 def garbage_collector():
     """Background thread for periodic garbage collection"""
@@ -429,30 +408,18 @@ async def lifespan(app: FastAPI):
     # Startup: Load initial data and start polling task
     try:
         await initial_data_load()
-        
-        # Only start polling task if enabled
-        polling_task_instance = None
-        if ENABLE_POLLING:
-            polling_task_instance = asyncio.create_task(polling_task())
-            logger.info("Polling task started")
-        else:
-            logger.info("Polling disabled - service will use initial data only")
-        
-        # Initialize database vehicle reader (with graceful failure handling)
+        polling_task_instance = asyncio.create_task(polling_task())
+        yield
+        # Shutdown: Cancel the polling task and close session
+        polling_task_instance.cancel()
+        try:
+            await polling_task_instance
+        except asyncio.CancelledError:
+            pass
         try:
             await initialize_db_vehicle_reader()
         except Exception as e:
             logger.error(f"Failed to initialize vehicle reader: {str(e)}")
-            logger.warning("Service will continue without vehicle data functionality")
-        
-        yield
-        # Shutdown: Cancel the polling tasks and close session
-        if polling_task_instance:
-            polling_task_instance.cancel()
-            try:
-                await polling_task_instance
-            except asyncio.CancelledError:
-                pass
         await OptimizedClientSession.close_instance()
     except Exception as e:
         logger.error(f"Failed to start service: {str(e)}")
@@ -507,11 +474,6 @@ async def fetch_routes(session: aiohttp.ClientSession) -> List[NandiRoutesRes]:
         endPoint=LatLong(lat=0.0, lon=0.0)
     ) for item in data]
 
-async def fetch_stops(session: aiohttp.ClientSession) -> List[GTFSStop]:
-    """Fetch all stops from the API and parse as GTFSStop models"""
-    data = await fetch_with_retry(session, f"{BASE_URL}/otp/routers/default/index/stops")
-    return [GTFSStop(**item) for item in data]
-
 async def process_pattern_batch(session: aiohttp.ClientSession, patterns: List[NandiPattern], 
                               batch_size: int = 50) -> Dict[str, NandiPatternDetails]:  # Reduced batch size
     """Process patterns in batches to manage memory"""
@@ -553,7 +515,7 @@ async def polling_task():
                 cpu_percent = process.cpu_percent(interval=1.0)
                 memory_usage = process.memory_info().rss / 1024 / 1024
                 
-                if cpu_percent > CPU_THRESHOLD or memory_usage > MEMORY_THRESHOLD:  # Use reduced memory threshold
+                if cpu_percent > CPU_THRESHOLD or memory_usage > 500:  # Added memory threshold
                     logger.warning(f"High resource usage detected (CPU: {cpu_percent:.1f}%, Memory: {memory_usage:.1f}MB), delaying update")
                     await asyncio.sleep(POLLING_INTERVAL)
                     continue
@@ -567,7 +529,17 @@ async def polling_task():
                         route_code = str(route.id.split(':')[-1])
                         if gtfs_id not in routes_by_gtfs:
                             routes_by_gtfs[gtfs_id] = {}
-                        routes_by_gtfs[gtfs_id][route_code] = route
+                        routes_by_gtfs[gtfs_id][route_code] = NandiRoutesRes(
+                            id=route_code,
+                            shortName=route.shortName,
+                            longName=route.longName,
+                            mode=castVehicleType(route.mode),
+                            agencyName=route.agencyName,
+                            tripCount=route.tripCount,
+                            stopCount=route.stopCount,
+                            startPoint=route.startPoint,
+                            endPoint=route.endPoint
+                        )
                     except Exception as e:
                         logger.error(f"Error processing route {route.id}: {str(e)}")
                         continue
@@ -633,42 +605,27 @@ async def polling_task():
                     temp_data.routes = {str(route.id): route for route in routes}
                     temp_data.route_stop_map = route_stop_map
                     temp_data.stop_route_map = stop_route_map
+                    temp_data.routes_by_gtfs = routes_by_gtfs
                     current_time = datetime.now()
                     temp_data.last_update["routes"] = current_time
-                    temp_data.routes_by_gtfs = routes_by_gtfs
-                    
-                    # Preserve children_by_parent data from initial load (don't overwrite it)
-                    temp_data.children_by_parent = gtfs_data.children_by_parent
-                    
-                    # Remove expensive hash computation and stops fetching for performance
-                    # temp_data.data_hash = {}
-                    # for gtfs_id in routes_by_gtfs:
-                    #     relevant = {
-                    #         'routes': {k: v.model_dump() if hasattr(v, 'model_dump') else v for k, v in routes_by_gtfs[gtfs_id].items()},
-                    #         'route_stop_map': {k: [m.model_dump() if hasattr(m, 'model_dump') else m for m in v] for k, v in route_stop_map.get(gtfs_id, {}).items()},
-                    #         'stop_route_map': {k: [m.model_dump() if hasattr(m, 'model_dump') else m for m in v] for k, v in stop_route_map.get(gtfs_id, {}).items()},
-                    #     }
-                    #     temp_data.data_hash[gtfs_id] = compute_data_hash(relevant)
-                    
-                    # Remove stops fetching from polling loop for performance
-                    # stops = await fetch_stops(session)
-                    # temp_data.children_by_parent = {}
-                    # stops_by_gtfs_temp = {}
-                    # for stop in stops:
-                    #     gtfs_id = stop.id.split(':')[0]
-                    #     if gtfs_id not in stops_by_gtfs_temp:
-                    #         stops_by_gtfs_temp[gtfs_id] = []
-                    #     stops_by_gtfs_temp[gtfs_id].append(stop)
-                    # for gtfs_id, stops_list in stops_by_gtfs_temp.items():
-                    #     children_map = {}
-                    #     for stop in stops_list:
-                    #         if stop.stationId:
-                    #             parent_code = stop.stationId.split(':')[-1]
-                    #             if parent_code not in children_map:
-                    #                 children_map[parent_code] = []
-                    #             children_map[parent_code].append(stop.id.split(':')[-1])
-                    #     temp_data.children_by_parent[gtfs_id] = children_map
-                    
+                    # Fetch stops and build children mappingAdd commentMore actions
+                    stops = await fetch_stops(session)
+                    temp_data.children_by_parent = {}
+                    stops_by_gtfs_temp = {}
+                    for stop in stops:
+                        gtfs_id = stop.id.split(':')[0]
+                        if gtfs_id not in stops_by_gtfs_temp:
+                            stops_by_gtfs_temp[gtfs_id] = []
+                        stops_by_gtfs_temp[gtfs_id].append(stop)
+                    for gtfs_id, stops_list in stops_by_gtfs_temp.items():
+                        children_map = {}
+                        for stop in stops_list:
+                            if stop.stationId:
+                                parent_code = stop.stationId.split(':')[-1]
+                                if parent_code not in children_map:
+                                    children_map[parent_code] = []
+                                children_map[parent_code].append(stop.id.split(':')[-1])
+                        temp_data.children_by_parent[gtfs_id] = children_map
                     gtfs_data.update_data(temp_data)
                     logger.info(f"Successfully updated all data: {len(routes)} routes, {total_patterns} patterns")
                     
@@ -792,6 +749,16 @@ async def get_stops_fuzzy(gtfs_id: str, query: str, limit: Optional[int] = None)
     
     return list(unique_stops.values())
 
+# API endpoint to get children station codes for a given gtfs_id and stop_codeAdd commentMore actions
+@app.get("/station-children/{gtfs_id}/{stop_code}", response_model=List[str])
+async def get_station_children(gtfs_id: str, stop_code: str):
+    gtfs_id = clean_identifier(gtfs_id)
+    stop_code = clean_identifier(stop_code)
+    if gtfs_id not in gtfs_data.children_by_parent:
+        raise HTTPException(status_code=404, detail="GTFS ID not found")
+    children = gtfs_data.children_by_parent[gtfs_id].get(stop_code, [])
+    return children
+
 @app.get("/ready")
 async def readiness_probe():
     """Readiness probe endpoint that checks if the service is ready to handle requests"""
@@ -815,16 +782,6 @@ async def get_service_type_by_vehicle(vehicle_no: str):
     except Exception as e:
         logger.error(f"Error in vehicle service type endpoint: {str(e)}")
         raise HTTPException(status_code=503, detail="Vehicle service temporarily unavailable")
-
-# API endpoint to get children station codes for a given gtfs_id and stop_code
-@app.get("/station-children/{gtfs_id}/{stop_code}", response_model=List[str])
-async def get_station_children(gtfs_id: str, stop_code: str):
-    gtfs_id = clean_identifier(gtfs_id)
-    stop_code = clean_identifier(stop_code)
-    if gtfs_id not in gtfs_data.children_by_parent:
-        raise HTTPException(status_code=404, detail="GTFS ID not found")
-    children = gtfs_data.children_by_parent[gtfs_id].get(stop_code, [])
-    return children
 
 if __name__ == "__main__":
     uvicorn.run(app, host=API_HOST, port=API_PORT)
