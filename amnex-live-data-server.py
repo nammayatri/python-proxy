@@ -898,6 +898,7 @@ def parse_chalo_payload(payload, serverTime, client_ip):
 
 def parse_amnex_payload(payload, serverTime, client_ip):
     """Parse the payload from Amnex format."""
+    print(payload, serverTime, client_ip)
     try:
         if len(payload) >= 14 and payload[0] == "&PEIS" and payload[1] == "N" and payload[2] == "VTS" and payload[10] == 'A':
             latitude = parse_coordinate(payload[11], payload[12], True)
