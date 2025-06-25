@@ -668,7 +668,15 @@ async def get_route_stop_mapping_by_route(gtfs_id: str, route_code: str):
     route_code = unquote(route_code)
     if gtfs_id not in gtfs_data.route_stop_map or route_code not in gtfs_data.route_stop_map[gtfs_id]:
         raise HTTPException(status_code=404, detail="Route code not found for GTFS ID")
-    return gtfs_data.route_stop_map[gtfs_id][route_code]
+    all_mappings = gtfs_data.route_stop_map[gtfs_id][route_code]
+    return get_max_sequence_route_stop_mapping(all_mappings)
+
+def get_max_sequence_route_stop_mapping(all_mappings: List[RouteStopMapping]) -> List[RouteStopMapping]:
+    if not all_mappings:
+        return []
+    seq_map = {m.sequenceNum: m for m in all_mappings}
+    max_seq = max(seq_map.keys())
+    return [seq_map[seq] for seq in range(max_seq + 1) if seq in seq_map]
 
 @app.get("/route-stop-mapping/{gtfs_id}/stop/{stop_code}", response_model=List[RouteStopMapping])
 async def get_route_stop_mapping_by_stop(gtfs_id: str, stop_code: str):
