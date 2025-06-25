@@ -1539,6 +1539,7 @@ def handle_client_data(payload, client_ip, serverTime, isNYGpsDevice = False, se
     """Handle client data and send it to Kafka"""
     try:
          # Try to send to Kafka with retries
+        print(payload, serverTime, client_ip)
         entity = parse_payload(payload, client_ip, serverTime, isNYGpsDevice)
 
         if not entity:
