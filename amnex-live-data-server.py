@@ -904,6 +904,7 @@ def parse_amnex_payload(payload, serverTime, client_ip):
             longitude = parse_coordinate(payload[13], payload[14], False)
             version = payload[4]
             deviceId = payload[5]
+            ign_status = payload[6]
             timestamp = payload[8]
             date = payload[9]
             date = dd_mm_ss_to_date(date + "-" + timestamp)
@@ -920,6 +921,7 @@ def parse_amnex_payload(payload, serverTime, client_ip):
                 "serverTime": date_to_unix(serverTime),
                 "raw": raw,
                 "provider": "amnex",
+                "ign_status": ign_status,
                 "client_ip": client_ip
             }
             return entity
