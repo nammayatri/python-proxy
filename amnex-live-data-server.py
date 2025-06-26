@@ -969,7 +969,7 @@ def parse_mqtt_payload(data_str, serverTime, client_ip):
 
 def parse_payload(data_decoded, client_ip, serverTime, isNYGpsDevice):
     """Parse payload data by determining the format"""
-    print(payload, serverTime, client_ip)
+    print(data_decoded, serverTime, client_ip)
     try:
         # First check if it's NY GPS device mqtt server data
         if isNYGpsDevice:
