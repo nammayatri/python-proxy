@@ -674,9 +674,13 @@ async def get_route_stop_mapping_by_route(gtfs_id: str, route_code: str):
 def get_max_sequence_route_stop_mapping(all_mappings: List[RouteStopMapping]) -> List[RouteStopMapping]:
     if not all_mappings:
         return []
-    seq_map = {m.sequenceNum: m for m in all_mappings}
-    max_seq = max(seq_map.keys())
-    return [seq_map[seq] for seq in range(max_seq + 1) if seq in seq_map]
+    maxSeq = 0
+    index = 0
+    for i, mapping in enumerate(all_mappings):
+        if mapping.sequenceNum > maxSeq:
+            maxSeq = mapping.sequenceNum
+            index = i
+    return all_mappings[index-maxSeq:index+1] if index-maxSeq >= 0 else all_mappings
 
 @app.get("/route-stop-mapping/{gtfs_id}/stop/{stop_code}", response_model=List[RouteStopMapping])
 async def get_route_stop_mapping_by_stop(gtfs_id: str, stop_code: str):
