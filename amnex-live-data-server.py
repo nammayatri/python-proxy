@@ -898,7 +898,6 @@ def parse_chalo_payload(payload, serverTime, client_ip):
 
 def parse_amnex_payload(payload, serverTime, client_ip):
     """Parse the payload from Amnex format."""
-    print(payload, serverTime, client_ip)
     try:
         if len(payload) >= 14 and payload[0] == "&PEIS" and payload[1] == "N" and payload[2] == "VTS" and payload[10] == 'A':
             latitude = parse_coordinate(payload[11], payload[12], True)
@@ -970,6 +969,7 @@ def parse_mqtt_payload(data_str, serverTime, client_ip):
 
 def parse_payload(data_decoded, client_ip, serverTime, isNYGpsDevice):
     """Parse payload data by determining the format"""
+    print(payload, serverTime, client_ip)
     try:
         # First check if it's NY GPS device mqtt server data
         if isNYGpsDevice:
@@ -1539,7 +1539,6 @@ def handle_client_data(payload, client_ip, serverTime, isNYGpsDevice = False, se
     """Handle client data and send it to Kafka"""
     try:
          # Try to send to Kafka with retries
-        print(payload, serverTime, client_ip)
         entity = parse_payload(payload, client_ip, serverTime, isNYGpsDevice)
 
         if not entity:
@@ -1557,7 +1556,7 @@ def handle_client_data(payload, client_ip, serverTime, isNYGpsDevice = False, se
                 logger.info(f"Skipping NY gps device: {deviceId}, mqtt server data for other processing")
                 return
 
-        if not isNYGpsDevice and ('dataState' not in entity or entity.get('dataState') not in ['L', 'LP', 'LO'] or entity.get('provider') == 'amnex'):
+        if not isNYGpsDevice and ('dataState' not in entity or entity.get('dataState') not in ['L', 'LP', 'LO'] or entity.get('provider') == 'chalo'):
             push_to_kafka(entity)
             print(f"Skipping chalo data")
             return
