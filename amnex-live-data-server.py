@@ -1387,7 +1387,7 @@ def clean_outdated_vehicle_mappings():
                 prod_cursor, prod_keys = prod_redis_client.scan(cursor, match="route:*", count=1000)
                 route_keys.extend(prod_keys)
             iteration_count += 1
-            if cursor == 0 && prod_cursor == 0:
+            if cursor == 0 and prod_cursor == 0:
                 break
         route_keys = list(set(route_keys))
         logger.debug(f"Found {len(route_keys)} route keys for cleanup after {iteration_count} iterations")
