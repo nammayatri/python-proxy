@@ -1376,14 +1376,19 @@ def clean_outdated_vehicle_mappings():
         cursor = 0
         max_iterations = 100
         iteration_count = 0
+        start = True
         
         while iteration_count < max_iterations:
-            cursor, keys = redis_client.scan(cursor, match="route:*", count=1000)
-            route_keys.extend(keys)
+            if (start and cursor == 0) or (not start and cursor != 0):
+                cursor, keys = redis_client.scan(cursor, match="route:*", count=1000)
+                route_keys.extend(keys)
+            if (start and prod_cursor == 0) or (not start and prod_cursor != 0):
+                prod_cursor, prod_keys = prod_redis_client.scan(cursor, match="route:*", count=1000)
+                route_keys.extend(prod_keys)
             iteration_count += 1
-            if cursor == 0:
+            if cursor == 0 && prod_cursor == 0:
                 break
-                
+        route_keys = list(set(route_keys))
         logger.debug(f"Found {len(route_keys)} route keys for cleanup after {iteration_count} iterations")
         if not route_keys:
             logger.debug("No route data found for cleanup")
