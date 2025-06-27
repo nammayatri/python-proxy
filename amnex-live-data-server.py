@@ -1374,6 +1374,7 @@ def clean_outdated_vehicle_mappings():
         # Use a more robust approach to get all keys matching the pattern
         route_keys = []
         cursor = 0
+        prod_cursor = 0
         max_iterations = 100
         iteration_count = 0
         start = True
@@ -1385,6 +1386,7 @@ def clean_outdated_vehicle_mappings():
             if (start and prod_cursor == 0) or (not start and prod_cursor != 0):
                 prod_cursor, prod_keys = prod_redis_client.scan(cursor, match="route:*", count=1000)
                 route_keys.extend(prod_keys)
+            start = False
             iteration_count += 1
             if cursor == 0 and prod_cursor == 0:
                 break
