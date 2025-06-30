@@ -23,6 +23,7 @@ WAYBILLS_DB_PASS = os.getenv("WAYBILLS_DB_PASS", "postgres")
 WAYBILLS_DB_HOST = os.getenv("WAYBILLS_DB_HOST", "localhost")
 WAYBILLS_DB_PORT = int(os.getenv("WAYBILLS_DB_PORT", "5432"))
 WAYBILLS_DB_NAME = os.getenv("WAYBILLS_DB_NAME", "waybills")
+WAYBILLS_DB_MAX_CONNECTIONS = int(os.getenv("WAYBILLS_DB_MAX_CONNECTIONS", "10"))
 
 class VehicleData(BaseModel):
     waybill_id: str
@@ -45,6 +46,7 @@ class DBVehicleReader:
         self.last_error = None
         self.error_count = 0
         self.max_errors = 5  # Max consecutive errors before giving up
+        self._initialization_lock = asyncio.Lock()  # Prevent multiple simultaneous initializations
         
         # Date-based in-memory cache: {vehicle_no: (vehicle_data, cache_date)}
         self.vehicle_cache: Dict[str, Tuple[VehicleData, date]] = {}
@@ -52,42 +54,69 @@ class DBVehicleReader:
         self.cache_misses = 0
 
     async def initialize_db_connection(self) -> bool:
-        """Initialize database connection with error handling"""
-        try:
-            logger.debug("Starting database connection initialization...")
-            if self.db_pool:
-                await self.db_pool.close()
+        """Initialize database connection with error handling - only creates one pool"""
+        async with self._initialization_lock:
+            # If already initialized and pool is healthy, return True
+            if self.is_initialized and self.db_pool and not self.db_pool.is_closed():
+                try:
+                    # Test the connection to make sure it's still working
+                    async with self.db_pool.acquire() as conn:
+                        await conn.execute("SELECT 1")
+                    logger.debug("Database connection already initialized and healthy")
+                    return True
+                except Exception as e:
+                    logger.warning(f"Existing pool is unhealthy, recreating: {str(e)}")
+                    # Fall through to recreate the pool
             
-            logger.debug(f"Connecting to database: {WAYBILLS_DB_HOST}:{WAYBILLS_DB_PORT}/{WAYBILLS_DB_NAME}")
-            self.db_pool = await asyncpg.create_pool(
-                user=WAYBILLS_DB_USER,
-                password=WAYBILLS_DB_PASS,
-                host=WAYBILLS_DB_HOST,
-                port=WAYBILLS_DB_PORT,
-                database=WAYBILLS_DB_NAME,
-                min_size=1,
-                max_size=10
-            )
-            
-            # Test the connection
-            logger.debug("Testing database connection...")
-            async with self.db_pool.acquire() as conn:
-                await conn.execute("SELECT 1")
-            
-            self.is_initialized = True
-            self.error_count = 0
-            self.last_error = None
-            logger.info("Database connection initialized successfully")
-            return True
-            
-        except Exception as e:
-            self.is_initialized = False
-            self.last_error = str(e)
-            self.error_count += 1
-            logger.error(f"Failed to initialize database connection: {str(e)}")
-            logger.error(f"Error count: {self.error_count}/{self.max_errors}")
-            logger.error(f"Exception details: {traceback.format_exc()}")
-            return False
+            try:
+                logger.debug("Starting database connection initialization...")
+                
+                # Close existing pool if it exists
+                if self.db_pool and not self.db_pool.is_closed():
+                    await self.db_pool.close()
+                
+                logger.debug(f"Connecting to database: {WAYBILLS_DB_HOST}:{WAYBILLS_DB_PORT}/{WAYBILLS_DB_NAME}")
+                logger.debug(f"Max connections: {WAYBILLS_DB_MAX_CONNECTIONS}")
+                
+                self.db_pool = await asyncpg.create_pool(
+                    user=WAYBILLS_DB_USER,
+                    password=WAYBILLS_DB_PASS,
+                    host=WAYBILLS_DB_HOST,
+                    port=WAYBILLS_DB_PORT,
+                    database=WAYBILLS_DB_NAME,
+                    min_size=1,
+                    max_size=WAYBILLS_DB_MAX_CONNECTIONS,
+                    command_timeout=60,
+                    server_settings={
+                        'application_name': 'gtfs_vehicle_reader'
+                    }
+                )
+                
+                # Test the connection
+                logger.debug("Testing database connection...")
+                async with self.db_pool.acquire() as conn:
+                    await conn.execute("SELECT 1")
+                
+                self.is_initialized = True
+                self.error_count = 0
+                self.last_error = None
+                logger.info(f"Database connection initialized successfully with max {WAYBILLS_DB_MAX_CONNECTIONS} connections")
+                return True
+                
+            except Exception as e:
+                self.is_initialized = False
+                self.last_error = str(e)
+                self.error_count += 1
+                logger.error(f"Failed to initialize database connection: {str(e)}")
+                logger.error(f"Error count: {self.error_count}/{self.max_errors}")
+                logger.error(f"Exception details: {traceback.format_exc()}")
+                return False
+
+    async def _ensure_connection(self) -> bool:
+        """Ensure database connection is available, initialize if needed"""
+        if not self.is_initialized or not self.db_pool or self.db_pool.is_closed():
+            return await self.initialize_db_connection()
+        return True
 
     def _get_cached_vehicle_data(self, vehicle_no: str) -> Optional[VehicleData]:
         """Get vehicle data from cache if it exists for today's date"""
@@ -130,18 +159,15 @@ class DBVehicleReader:
             if cached_data:
                 return cached_data
             
-            # Try to initialize if not already done
-            if not self.is_initialized:
-                success = await self.initialize_db_connection()
-                if not success:
-                    logger.warning("Could not initialize database, returning None for vehicle data")
-                    return None
+            # Ensure connection is available
+            if not await self._ensure_connection():
+                logger.warning("Could not establish database connection, returning None for vehicle data")
+                return None
             
             # Check if we've had too many consecutive errors
             if self.error_count >= self.max_errors:
                 logger.warning(f"Too many consecutive errors ({self.error_count}), attempting to reinitialize")
-                success = await self.initialize_db_connection()
-                if not success:
+                if not await self.initialize_db_connection():
                     logger.error("Failed to reinitialize database after multiple errors")
                     return None
             
@@ -212,11 +238,9 @@ class DBVehicleReader:
     async def get_all_vehicles(self) -> List[VehicleData]:
         """Get all vehicles directly from database with error handling"""
         try:
-            if not self.is_initialized:
-                success = await self.initialize_db_connection()
-                if not success:
-                    logger.warning("Could not initialize database, returning empty list")
-                    return []
+            if not await self._ensure_connection():
+                logger.warning("Could not establish database connection, returning empty list")
+                return []
             
             async with self.db_pool.acquire() as conn:
                 query = """
@@ -257,11 +281,9 @@ class DBVehicleReader:
     async def get_vehicles_by_service_type(self, service_type: str) -> List[VehicleData]:
         """Get vehicles by service type directly from database with error handling"""
         try:
-            if not self.is_initialized:
-                success = await self.initialize_db_connection()
-                if not success:
-                    logger.warning("Could not initialize database, returning empty list")
-                    return []
+            if not await self._ensure_connection():
+                logger.warning("Could not establish database connection, returning empty list")
+                return []
             
             async with self.db_pool.acquire() as conn:
                 query = """
@@ -303,11 +325,9 @@ class DBVehicleReader:
     async def search_vehicles(self, query: str) -> List[VehicleData]:
         """Search vehicles directly from database with error handling"""
         try:
-            if not self.is_initialized:
-                success = await self.initialize_db_connection()
-                if not success:
-                    logger.warning("Could not initialize database, returning empty list")
-                    return []
+            if not await self._ensure_connection():
+                logger.warning("Could not establish database connection, returning empty list")
+                return []
             
             async with self.db_pool.acquire() as conn:
                 search_pattern = f"%{query}%"
@@ -350,11 +370,9 @@ class DBVehicleReader:
     async def get_vehicle_count(self) -> int:
         """Get vehicle count directly from database with error handling"""
         try:
-            if not self.is_initialized:
-                success = await self.initialize_db_connection()
-                if not success:
-                    logger.warning("Could not initialize database, returning 0")
-                    return 0
+            if not await self._ensure_connection():
+                logger.warning("Could not establish database connection, returning 0")
+                return 0
             
             async with self.db_pool.acquire() as conn:
                 query = "SELECT COUNT(DISTINCT vehicle_no) as count FROM waybills"
@@ -403,14 +421,34 @@ class DBVehicleReader:
     def get_status(self) -> Dict[str, Any]:
         """Get status information"""
         cache_stats = self.get_cache_stats()
+        pool_info = {}
+        if self.db_pool and not self.db_pool.is_closed():
+            pool_info = {
+                "pool_size": self.db_pool.get_size(),
+                "free_size": self.db_pool.get_free_size(),
+                "is_closed": self.db_pool.is_closed()
+            }
+        
         return {
             "is_initialized": self.is_initialized,
             "error_count": self.error_count,
             "last_error": self.last_error,
             "db_host": WAYBILLS_DB_HOST,
             "db_name": WAYBILLS_DB_NAME,
+            "max_connections": WAYBILLS_DB_MAX_CONNECTIONS,
+            "pool_info": pool_info,
             "cache_stats": cache_stats
         }
+
+    async def close(self):
+        """Close the database connection pool"""
+        try:
+            if self.db_pool and not self.db_pool.is_closed():
+                await self.db_pool.close()
+                logger.info("Database connection pool closed")
+            self.is_initialized = False
+        except Exception as e:
+            logger.error(f"Error closing database pool: {str(e)}")
 
 # Global instance
 db_vehicle_reader = DBVehicleReader()
@@ -428,4 +466,12 @@ async def initialize_db_vehicle_reader():
     except Exception as e:
         logger.error(f"Failed to initialize database vehicle reader: {str(e)}")
         logger.error(f"Exception details: {traceback.format_exc()}")
-        logger.warning("Service will continue without vehicle data functionality") 
+        logger.warning("Service will continue without vehicle data functionality")
+
+async def cleanup_db_vehicle_reader():
+    """Cleanup the database vehicle reader"""
+    try:
+        await db_vehicle_reader.close()
+        logger.info("Database vehicle reader cleanup completed")
+    except Exception as e:
+        logger.error(f"Error during database vehicle reader cleanup: {str(e)}") 
