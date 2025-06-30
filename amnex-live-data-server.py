@@ -20,6 +20,7 @@ from geopy.distance import geodesic
 import logging
 import atexit
 import paho.mqtt.client as mqtt
+import requests
 
 # Configure logging
 logging.basicConfig(
@@ -93,6 +94,9 @@ WAYBILLS_DB_HOST = os.getenv('WAYBILLS_DB_HOST', 'localhost')
 WAYBILLS_DB_PORT = os.getenv('WAYBILLS_DB_PORT', '5432')
 WAYBILLS_DB_NAME = os.getenv('WAYBILLS_DB_NAME', 'waybills')
 INTEGRATED_BPP_CONFIG_ID = os.getenv('INTEGRATED_BPP_CONFIG_ID_HD', 'b0454b15-9755-470d-a16a-71e87695e003')
+MERCHANT_OPERATING_CITY_ID = os.getenv('MERCHANT_OPERATING_CITY_ID', 'fc87c15e-29aa-492b-835f-bda8ff00c840')
+GTFS_ID = os.getenv('GTFS_ID', 'chennai_data')
+ROUTE_STOP_MAPPING_API_URL = os.getenv('ROUTE_STOP_MAPPING_API_URL', 'http://gtfs-inmemory-data-server.nandi.svc.cluster.local:8000')
 
 # SQLAlchemy setup for main database
 DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
@@ -132,26 +136,13 @@ class DeviceVehicleMapping(Base):
     vehicle_no = Column(Text, index=True)
     device_id = Column(Text, index=True, primary_key=True)
 
-class RouteStopMapping(Base):
-    __tablename__ = "route_stop_mapping"
+class RoutePolyline(Base):
+    __tablename__ = "route_polylines"
     __table_args__ = {'schema': 'atlas_app'}
     
-    stop_code = Column(Integer, primary_key=True)
-    route_code = Column(Text, index=True)
-    sequence_num = Column(Integer)
-    stop_lat = Column(Text)
-    integrated_bpp_config_id = Column(Text)
-    stop_lon = Column(Text)
-    stop_name = Column(Text)
-
-class Route(Base):
-    __tablename__ = "route"
-    __table_args__ = {'schema': 'atlas_app'}
-    
-    id = Column(Integer, primary_key=True)
-    code = Column(Text, index=True)
-    integrated_bpp_config_id = Column(Text)
-    polyline = Column(Text)  # Google encoded polyline for the route
+    route_id = Column(BigInteger, primary_key=True)
+    polyline = Column(Text)
+    merchant_operating_city_id = Column(Text, primary_key=True)
 
 # Waybills database models
 class Waybill(Base):
@@ -283,48 +274,60 @@ class StopTracker:
         if cached:
             return cached
             
-        # Get from DB
         try:
+            # Get stops for the route from API
+            stops_api_url = f"{ROUTE_STOP_MAPPING_API_URL}/route-stop-mapping/{GTFS_ID}/route/{route_id}"
+            response = requests.get(stops_api_url)
+            response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
+            stops_data = response.json()
+
+            # Get the route polyline from DB
+            route_polyline = None
             with SessionLocal() as db:
-                # Get stops for the route
-                stops = db.query(RouteStopMapping)\
-                    .filter(RouteStopMapping.route_code == route_id, RouteStopMapping.integrated_bpp_config_id == INTEGRATED_BPP_CONFIG_ID)\
-                    .order_by(RouteStopMapping.sequence_num)\
-                    .all()
-                
-                if not stops:
-                    return {
-                        'stops': [],
-                        'polyline': None
-                    }
-                
-                # Get the route polyline if available
-                route_info = db.query(Route)\
-                    .filter(Route.code == route_id, Route.integrated_bpp_config_id == INTEGRATED_BPP_CONFIG_ID)\
+                polyline_info = db.query(RoutePolyline)\
+                    .filter(RoutePolyline.route_id == route_id, RoutePolyline.merchant_operating_city_id == MERCHANT_OPERATING_CITY_ID)\
                     .first()
+                if polyline_info and polyline_info.polyline:
+                    route_polyline = polyline_info.polyline
                 
-                # Format results
-                resultStops = [
-                    {
-                        'stop_id': stop.stop_code,
-                        'sequence': stop.sequence_num,
-                        'name': stop.stop_name,
-                        'stop_lat': float(stop.stop_lat),
-                        'stop_lon': float(stop.stop_lon)
-                    }
-                    for stop in stops
-                ]
-                result = {
-                    'stops': resultStops,
+            if not stops_data:
+                return {
+                    'stops': [],
+                    'polyline': None
                 }
-                # Add polyline to the result if available
-                if route_info and route_info.polyline:
-                    result['polyline'] = route_info.polyline
-                # Cache result
-                cache.set(cache_key, result)
-                return result
+            
+            # Format results
+            resultStops = [
+                {
+                    'stop_id': stop['stopCode'],
+                    'sequence': stop['sequenceNum'],
+                    'name': stop['stopName'],
+                    'stop_lat': float(stop['stopPoint']['lat']),
+                    'stop_lon': float(stop['stopPoint']['lon'])
+                }
+                for stop in stops_data
+            ]
+            result = {
+                'stops': resultStops,
+                'polyline': route_polyline
+            }
+            # Cache result
+            cache.set(cache_key, result)
+            return result
+        except requests.exceptions.RequestException as e:
+            print(f"Error fetching route stops or polyline from API for route {route_id}: {e}")
+            return {
+                'stops': [],
+                'polyline': None
+            }
+        except json.JSONDecodeError as e:
+            print(f"Error decoding JSON response for route {route_id}: {e}")
+            return {
+                'stops': [],
+                'polyline': None
+            }
         except Exception as e:
-            print(f"Error getting stops for route {route_id}: {e}")
+            print(f"An unexpected error occurred getting stops for route {route_id}: {e}")
             return {
                 'stops': [],
                 'polyline': None
@@ -551,6 +554,7 @@ class StopTracker:
             bearing = math.degrees(bearing)
             # Normalize to 0-360
             bearing = (bearing + 360) % 360
+            
             
             return bearing
         
