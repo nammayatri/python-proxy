@@ -176,7 +176,7 @@ class BusScheduleTripDetail(Base):
     deleted = Column(Boolean, nullable=False, default=False)
     route_number_id = Column(BigInteger, nullable=False)
 
-def get_route_ids_from_waybills(vehicle_no: str, current_lat: float = None, current_lon: float = None, timestamp: int = None) -> Optional[str]:
+def get_route_ids_from_waybills(vehicle_no: str, current_lat: float = None, current_lon: float = None, timestamp: int = None, provider: str = None) -> Optional[str]:
     """Get the route_id from waybills database for a given vehicle number"""
     try:
         with WaybillsSessionLocal() as db:
@@ -191,7 +191,7 @@ def get_route_ids_from_waybills(vehicle_no: str, current_lat: float = None, curr
                 .first()
             
             if not waybill:
-                print(f"Route ID: Bus {vehicle_no} No active waybill")
+                print(f"Route ID: Bus {vehicle_no} No active waybill (Provider: {provider})")
                 return None
                 
             if current_lat is not None and current_lon is not None:
@@ -199,7 +199,7 @@ def get_route_ids_from_waybills(vehicle_no: str, current_lat: float = None, curr
             # Add current location to history if provided
             location_history = get_vehicle_location_history(vehicle_no)
             if len(location_history) < 5:
-                print(f"Route ID: Bus {vehicle_no} Not enough location history {len(location_history)}")
+                print(f"Route ID: Bus {vehicle_no} Not enough location history {len(location_history)} (Provider: {provider})")
                 return None
 
             # Then get all possible routes from bus_schedule
@@ -211,7 +211,7 @@ def get_route_ids_from_waybills(vehicle_no: str, current_lat: float = None, curr
                 .all()  # Execute the query to get results
             
             if len(schedules) == 0:
-                print(f"Route ID: Bus {vehicle_no} No schedules found")
+                print(f"Route ID: Bus {vehicle_no} No schedules found (Provider: {provider})")
                 return None
             print(f"Route ID: Bus scheudle len {len(schedules)}")
 
@@ -221,14 +221,14 @@ def get_route_ids_from_waybills(vehicle_no: str, current_lat: float = None, curr
                 if schedule.route_number_id not in routes_match_score:
                     route_stops = stop_tracker.get_route_stops(str(schedule.route_number_id))
                     if 'polyline' not in route_stops or ('polyline' in route_stops and route_stops['polyline'] is None):
-                        print(f"Route ID: Bus route_stops polyline not found {schedule.route_number_id}")
+                        print(f"Route ID: Bus route_stops polyline not found {schedule.route_number_id} (Provider: {provider})")
                         
                     # Calculate match score using location history
                     score = calculate_route_match_score(schedule.route_number_id, vehicle_no, route_stops, location_history)
                     # Ensure score is not None
                     if score is None:
                         score = 0.0
-                    print(f"Route ID: Bus score {vehicle_no} Score for route {schedule.route_number_id}: {score}")
+                    print(f"Route ID: Bus score {vehicle_no} Score for route {schedule.route_number_id}: {score} (Provider: {provider})")
                     if score > 0.8:
                         best_route_ids.append(schedule.route_number_id)
                     routes_match_score[schedule.route_number_id] = score
@@ -236,7 +236,7 @@ def get_route_ids_from_waybills(vehicle_no: str, current_lat: float = None, curr
             
     except Exception as e:
         error_details = traceback.format_exc()
-        logger.error(f"Error querying waybills database for vehicle {vehicle_no}: {e}\nTraceback: {error_details}")
+        logger.error(f"Error querying waybills database for vehicle {vehicle_no} (Provider: {provider}): {e}\nTraceback: {error_details}")
         return []
 
 # Don't create tables since we're using existing tables
@@ -780,7 +780,7 @@ class SimpleCache:
 # Create single cache instance
 cache = SimpleCache()
 
-def get_fleet_info(device_id: str, current_lat: float = None, current_lon: float = None, timestamp: int = None) -> dict:
+def get_fleet_info(device_id: str, current_lat: float = None, current_lon: float = None, timestamp: int = None, provider: str = None) -> dict:
     """Get both fleet number and route ID for a device"""
     cache_key = f"fleetInfo:{device_id}"
     cache_key_saved = cache_key + ":saved"
@@ -795,43 +795,40 @@ def get_fleet_info(device_id: str, current_lat: float = None, current_lon: float
             if current_lat is not None and current_lon is not None:
                 store_vehicle_location_history(fleet_info['vehicle_no'], current_lat, current_lon, timestamp)
         return fleet_infos
+    
     try:
-        with SessionLocal() as db:
-            # Get fleet number for device
-            fleet_mapping = db.query(DeviceVehicleMapping)\
-                .filter(DeviceVehicleMapping.device_id == device_id)\
-                .first()
-            
-            if not fleet_mapping:
-                return {}
+        vehicle_no = device_vehicle_map.get(device_id)
+        if not vehicle_no:
+            logger.info(f"No vehicle mapping found for device {device_id}")
+            return []
 
-            # Get route for fleet
-            route_ids = get_route_ids_from_waybills(fleet_mapping.vehicle_no, current_lat, current_lon, timestamp)
-            logger.info(f"Route ID: {fleet_mapping.vehicle_no}, {route_ids}")
-            for route_id in route_ids:
-                val = {
-                    'vehicle_no': fleet_mapping.vehicle_no,
-                    'device_id': device_id,
-                    'route_id': route_id
-                }
-                try:
-                    fleet_info_saved = redis_client.get(cache_key_saved)
-                    if fleet_info_saved is not None:
-                        fleet_info_saved = json.loads(fleet_info_saved)
-                        print("going to delete route info")
-                        if ('route_id' in fleet_info_saved and 
-                            fleet_info_saved['route_id'] is not None and 
-                            route_id != fleet_info_saved['route_id']):
-                            print(f"going to delete route info: {fleet_info_saved['route_id']}")
-                            route_key = "route:" + fleet_info_saved['route_id']
-                            clean_redis_key_for_route_info(fleet_info_saved['route_id'], route_key)
-                except Exception as e:
-                    logger.error(f"Error cleaning redis key for route info: {e}")
-                fleet_mapping_values.append(val)
-            if len(route_ids) > 0:
-                redis_client.setex(cache_key_saved, BUS_LOCATION_MAX_AGE + BUS_CLEANUP_INTERVAL, json.dumps(fleet_mapping_values)) # hack for cleanup if route changes
-                redis_client.setex(cache_key, BUS_CLEANUP_INTERVAL, json.dumps(fleet_mapping_values))
-            return fleet_mapping_values
+        # Get route for fleet
+        route_ids = get_route_ids_from_waybills(vehicle_no, current_lat, current_lon, timestamp, provider)
+        logger.info(f"Route ID: {vehicle_no}, {route_ids}")
+        for route_id in route_ids:
+            val = {
+                'vehicle_no': vehicle_no,
+                'device_id': device_id,
+                'route_id': route_id
+            }
+            try:
+                fleet_info_saved = redis_client.get(cache_key_saved)
+                if fleet_info_saved is not None:
+                    fleet_info_saved = json.loads(fleet_info_saved)
+                    print("going to delete route info")
+                    if ('route_id' in fleet_info_saved and 
+                        fleet_info_saved['route_id'] is not None and 
+                        route_id != fleet_info_saved['route_id']):
+                        print(f"going to delete route info: {fleet_info_saved['route_id']}")
+                        route_key = "route:" + fleet_info_saved['route_id']
+                        clean_redis_key_for_route_info(fleet_info_saved['route_id'], route_key)
+            except Exception as e:
+                logger.error(f"Error cleaning redis key for route info: {e}")
+            fleet_mapping_values.append(val)
+        if len(route_ids) > 0:
+            redis_client.setex(cache_key_saved, BUS_LOCATION_MAX_AGE + BUS_CLEANUP_INTERVAL, json.dumps(fleet_mapping_values)) # hack for cleanup if route changes
+            redis_client.setex(cache_key, BUS_CLEANUP_INTERVAL, json.dumps(fleet_mapping_values))
+        return fleet_mapping_values
     except Exception as e:
         print(f"Error querying fleet info for device {device_id}: {e}")
         return fleet_mapping_values
@@ -1569,6 +1566,17 @@ def get_blacklisted_amnex_deviceIds():
     print("deviceIds black", deviceIds)
     return deviceIds
 
+def load_device_vehicle_mappings():
+    global device_vehicle_map
+    try:
+        with SessionLocal() as db:
+            mappings = db.query(DeviceVehicleMapping).all()
+            for mapping in mappings:
+                device_vehicle_map[mapping.device_id] = mapping.vehicle_no
+        logger.info(f"Loaded {len(device_vehicle_map)} device-vehicle mappings at startup.")
+    except Exception as e:
+        logger.error(f"Error loading device-vehicle mappings at startup: {e}")
+
 def handle_client_data(payload, client_ip, serverTime, isNYGpsDevice = False, session=None):
     """Handle client data and send it to Kafka"""
     try:
@@ -1590,9 +1598,9 @@ def handle_client_data(payload, client_ip, serverTime, isNYGpsDevice = False, se
                 logger.info(f"Skipping NY gps device: {deviceId}, mqtt server data for other processing")
                 return
 
-        if not isNYGpsDevice and ('dataState' not in entity or entity.get('dataState') not in ['L', 'LP', 'LO'] or entity.get('provider') == 'chalo'):
+        if not isNYGpsDevice and ('dataState' not in entity or entity.get('dataState') not in ['L', 'LP', 'LO'] or deviceId not in device_vehicle_map):
             push_to_kafka(entity)
-            print(f"Skipping chalo data")
+            print(f"Skipping non-live data or unknown device {deviceId}")
             return
 
         vehicle_lat = float(entity['lat'])
@@ -1606,7 +1614,7 @@ def handle_client_data(payload, client_ip, serverTime, isNYGpsDevice = False, se
                 return
         
         # Get route information for this vehicle
-        fleet_infos = get_fleet_info(deviceId, vehicle_lat, vehicle_lon, entity.get('timestamp'))
+        fleet_infos = get_fleet_info(deviceId, vehicle_lat, vehicle_lon, entity.get('timestamp'), entity.get('provider'))
         if not fleet_infos:
             push_to_kafka(entity)
         for fleet_info in fleet_infos:
@@ -1916,10 +1924,13 @@ def main_server():
                 print(f"Error accepting connection: {e}")
                 time.sleep(1)  # Avoid tight loop if accept is failing
 
+device_vehicle_map = {}
+
 if __name__ == "__main__":
     # Start MQTT client, no separate thread required 
     # as we already called loop_start() and we already registered a shutdown function
     mqtt_client_obj = mqtt_client()
+    load_device_vehicle_mappings()
     start_vehicle_cleanup_thread()
     main_server()
 
