@@ -285,7 +285,7 @@ class StopTracker:
             route_polyline = None
             with SessionLocal() as db:
                 polyline_info = db.query(RoutePolyline)\
-                    .filter(RoutePolyline.route_id == route_id, RoutePolyline.merchant_operating_city_id == MERCHANT_OPERATING_CITY_ID)\
+                    .filter(RoutePolyline.route_id == str(route_id), RoutePolyline.merchant_operating_city_id == MERCHANT_OPERATING_CITY_ID)\
                     .first()
                 if polyline_info and polyline_info.polyline:
                     route_polyline = polyline_info.polyline
@@ -312,7 +312,7 @@ class StopTracker:
                 'polyline': route_polyline
             }
             # Cache result
-            cache.set(cache_key, result)
+            cache.set(cache_key, result, 3600)
             return result
         except requests.exceptions.RequestException as e:
             print(f"Error fetching route stops or polyline from API for route {route_id}: {e}")
@@ -743,19 +743,40 @@ class SimpleCache:
 
     def get(self, key: str):
         res = self.cache.get(key)
+        if res:
+            value, expiry_timestamp = res
+            if expiry_timestamp is not None and expiry_timestamp < time.time():
+                del self.cache[key] # Expired
+                res = None
+            else:
+                return value
+
         if res == None:
             res_from_redis = redis_client.get(f"simpleCache:{key}")
             if res_from_redis:
                 parsed_res = json.loads(res_from_redis)
-                self.cache[key] = parsed_res
+                # When loading from Redis, get the TTL from Redis and apply it to the in-memory cache
+                redis_ttl = redis_client.ttl(f"simpleCache:{key}")
+                in_memory_expiry_timestamp = None
+                if redis_ttl is not None and redis_ttl > -1: # -1 means no expire, -2 means key doesn't exist
+                    in_memory_expiry_timestamp = time.time() + redis_ttl
+
+                self.cache[key] = (parsed_res, in_memory_expiry_timestamp)
                 return parsed_res
             else:
                 return None
         return res
 
-    def set(self, key: str, value):
-        self.cache[key] = value
-        redis_client.setex(f"simpleCache:{key}", 3600, json.dumps(value))
+    def set(self, key: str, value, ttl: Optional[int] = None):
+        expiry_timestamp = None
+        if ttl is not None:
+            expiry_timestamp = time.time() + ttl
+        self.cache[key] = (value, expiry_timestamp)
+        
+        if ttl is None:
+            redis_client.set(f"simpleCache:{key}", json.dumps(value))
+        else:
+            redis_client.setex(f"simpleCache:{key}", ttl, json.dumps(value))
 # Create single cache instance
 cache = SimpleCache()
 
