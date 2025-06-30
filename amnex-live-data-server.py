@@ -121,8 +121,8 @@ print(f"WAYBILLS_DATABASE_URL: {WAYBILLS_DATABASE_URL}")
 waybills_engine = create_engine(
     WAYBILLS_DATABASE_URL,
     poolclass=QueuePool,
-    pool_size=20,
-    max_overflow=30,
+    pool_size=10,
+    max_overflow=20,
     pool_timeout=30,
     pool_recycle=1800
 )
