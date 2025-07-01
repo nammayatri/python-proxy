@@ -191,7 +191,6 @@ def get_route_ids_from_waybills(vehicle_no: str, current_lat: float = None, curr
                 .first()
             
             if not waybill:
-                print(f"Route ID: Bus {vehicle_no} No active waybill (Provider: {provider})")
                 return None
                 
             if current_lat is not None and current_lon is not None:
@@ -199,7 +198,6 @@ def get_route_ids_from_waybills(vehicle_no: str, current_lat: float = None, curr
             # Add current location to history if provided
             location_history = get_vehicle_location_history(vehicle_no)
             if len(location_history) < 5:
-                print(f"Route ID: Bus {vehicle_no} Not enough location history {len(location_history)} (Provider: {provider})")
                 return None
 
             # Then get all possible routes from bus_schedule
@@ -211,7 +209,6 @@ def get_route_ids_from_waybills(vehicle_no: str, current_lat: float = None, curr
                 .all()  # Execute the query to get results
             
             if len(schedules) == 0:
-                print(f"Route ID: Bus {vehicle_no} No schedules found (Provider: {provider})")
                 return None
             print(f"Route ID: Bus scheudle len {len(schedules)}")
 
@@ -220,9 +217,6 @@ def get_route_ids_from_waybills(vehicle_no: str, current_lat: float = None, curr
             for schedule in schedules:
                 if schedule.route_number_id not in routes_match_score:
                     route_stops = stop_tracker.get_route_stops(str(schedule.route_number_id))
-                    if 'polyline' not in route_stops or ('polyline' in route_stops and route_stops['polyline'] is None):
-                        print(f"Route ID: Bus route_stops polyline not found {schedule.route_number_id} (Provider: {provider})")
-                        
                     # Calculate match score using location history
                     score = calculate_route_match_score(schedule.route_number_id, vehicle_no, route_stops, location_history)
                     # Ensure score is not None
@@ -251,6 +245,7 @@ ROUTE_CACHE_TTL = int(os.getenv('ROUTE_CACHE_TTL', '3600'))  # 1 hour default
 BUS_LOCATION_MAX_AGE = int(os.getenv('BUS_LOCATION_MAX_AGE', '120'))  # 2 minutes default
 BUS_CLEANUP_INTERVAL = int(os.getenv('BUS_CLEANUP_INTERVAL', '180'))  # 3 minute default
 CLEANUP_LOCK_TTL = 30  # 30 seconds lock TTL to prevent multiple cleanups
+ENABLE_TIMESTAMP_VALIDATION = os.getenv('ENABLE_TIMESTAMP_VALIDATION', 'false').lower() == 'true'  # Feature flag for timestamp validation
 
 class StopTracker:
     def __init__(self, db_engine, redis_client, use_osrm=USE_OSRM, 
@@ -613,12 +608,10 @@ class StopTracker:
                     )
                     if crossed_stop:
                         is_at_stop = True
-                        logger.info(f"Vehicle {vehicle_id} crossed stop {stop['stop_id']} between updates")
             if is_at_stop:
                 # Vehicle is at this stop
                 if stop['stop_id'] not in visited_stops:
                     # Add to visited stops if not already there
-                    logger.info(f"Vehicle {vehicle_id} is at stop {stop['stop_id']}")
                     self.update_visited_stops(route_id, vehicle_id, stop['stop_id'])
                     visited_stops.append(stop['stop_id'])
                     calculation_method = "visited_stops"
@@ -799,12 +792,10 @@ def get_fleet_info(device_id: str, current_lat: float = None, current_lon: float
     try:
         vehicle_no = device_vehicle_map.get(device_id)
         if not vehicle_no:
-            logger.info(f"No vehicle mapping found for device {device_id}")
             return []
 
         # Get route for fleet
         route_ids = get_route_ids_from_waybills(vehicle_no, current_lat, current_lon, timestamp, provider)
-        logger.info(f"Route ID: {vehicle_no}, {route_ids}")
         for route_id in route_ids:
             val = {
                 'vehicle_no': vehicle_no,
@@ -819,7 +810,6 @@ def get_fleet_info(device_id: str, current_lat: float = None, current_lon: float
                     if ('route_id' in fleet_info_saved and 
                         fleet_info_saved['route_id'] is not None and 
                         route_id != fleet_info_saved['route_id']):
-                        print(f"going to delete route info: {fleet_info_saved['route_id']}")
                         route_key = "route:" + fleet_info_saved['route_id']
                         clean_redis_key_for_route_info(fleet_info_saved['route_id'], route_key)
             except Exception as e:
@@ -1566,6 +1556,52 @@ def get_blacklisted_amnex_deviceIds():
     print("deviceIds black", deviceIds)
     return deviceIds
 
+def validate_and_update_timestamp(entity: dict, vehicle_number: str) -> bool:
+    """
+    Check if the entity's timestamp is valid and update Redis with the latest timestamp.
+    
+    Args:
+        entity: The parsed GPS entity
+        vehicle_number: The vehicle number
+    
+    Returns:
+        True if timestamp is valid and should proceed, False if outdated
+    """
+    if not ENABLE_TIMESTAMP_VALIDATION:
+        return True
+    
+    try:
+        entity_timestamp = entity.get('timestamp')
+        if not entity_timestamp:
+            return True  # Allow if no timestamp
+        
+        # Use dedicated key for vehicle timestamps
+        timestamp_key = f"vehicle_timestamp:{vehicle_number}"
+        stored_timestamp = redis_client.get(timestamp_key)
+        
+        entity_timestamp = int(entity_timestamp)
+        
+        if stored_timestamp is None:
+            # No previous timestamp found, store current and allow
+            redis_client.setex(timestamp_key, 86400, str(entity_timestamp))  # 24 hour TTL
+            return True
+        
+        stored_timestamp = int(stored_timestamp)
+        
+        # Compare timestamps
+        if entity_timestamp >= stored_timestamp:
+            # Entity timestamp is newer or equal, update Redis and allow
+            redis_client.setex(timestamp_key, 86400, str(entity_timestamp))  # 24 hour TTL
+            return True
+        else:
+            # Entity timestamp is older, don't allow processing
+            logger.info(f"Outdated data detected for vehicle {vehicle_number}: entity={entity_timestamp}, stored={stored_timestamp}")
+            return False
+        
+    except Exception as e:
+        logger.error(f"Error validating timestamp for vehicle {vehicle_number}: {e}")
+        return True  # Allow on error to avoid blocking valid data
+
 def load_device_vehicle_mappings():
     global device_vehicle_map
     try:
@@ -1595,12 +1631,22 @@ def handle_client_data(payload, client_ip, serverTime, isNYGpsDevice = False, se
             push_to_kafka(entity)
             ny_whitelisted_device_ids = get_whitelisted_ny_gps_deviceIds()
             if deviceId not in ny_whitelisted_device_ids:
-                logger.info(f"Skipping NY gps device: {deviceId}, mqtt server data for other processing")
                 return
 
-        if not isNYGpsDevice and ('dataState' not in entity or entity.get('dataState') not in ['L', 'LP', 'LO'] or deviceId not in device_vehicle_map):
+        # Check for timestamp validation
+        vehicle_number = None
+        is_timestamp_valid = True
+        
+        if not isNYGpsDevice and deviceId in device_vehicle_map:
+            vehicle_number = device_vehicle_map[deviceId]
+            is_timestamp_valid = validate_and_update_timestamp(entity, vehicle_number)
+        
+        if not isNYGpsDevice and ('dataState' not in entity or entity.get('dataState') not in ['L', 'LP', 'LO'] or deviceId not in device_vehicle_map or not is_timestamp_valid):
             push_to_kafka(entity)
-            print(f"Skipping non-live data or unknown device {deviceId}")
+            if not is_timestamp_valid:
+                print(f"Skipping outdated data for vehicle {vehicle_number}, device {deviceId}")
+            else:
+                print(f"Skipping non-live data or unknown device {deviceId}")
             return
 
         vehicle_lat = float(entity['lat'])
@@ -1855,7 +1901,6 @@ def mqtt_client():
             
             # Use the existing handle_client_data function
             serverTime = datetime.now()
-            logger.info(f"✅ Message received on topic: {MQTT_TOPIC}")
             executor.submit(handle_client_data, payload, None, serverTime, True)
             
         except Exception as e:
@@ -1916,8 +1961,6 @@ def main_server():
                 
                 # Clean up completed connection threads
                 connection_threads = [(t, a) for t, a in connection_threads if t.is_alive()]
-                
-                print(f"Active connections: {len(connection_threads)}")
                 
             except Exception as e:
                 print(f"Error accepting connection: {e}")
