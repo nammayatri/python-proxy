@@ -1689,20 +1689,19 @@ def handle_client_data(payload, client_ip, serverTime, isNYGpsDevice = False, se
                     redis_client.hset(redis_key, vehicle_number, vehicle_data)
                     redis_client.expire(redis_key, 86400)  # Expire after 24 hours
                     
-                    # Store location in Redis Geo set
-                    geo_key = "bus_locations"  # Single key for all bus locations
-                    geo_key_new = "bus_locations_metadata"  # Single key for all bus locations with metadata
+                    geo_key = "bus_locations"
+                    vehicle_meta_key = "bus_metadata"
                     if vehicle_lon is not None and vehicle_lat is not None and vehicle_number:
                         prod_redis_client.geoadd(geo_key, vehicle_lon, vehicle_lat, vehicle_number)
-                        prod_redis_client.geoadd(geo_key_new, vehicle_lon, vehicle_lat, min_vehicle_data)
+                        prod_redis_client.hset(vehicle_meta_key, vehicle_number, min_vehicle_data)
                         redis_client.geoadd(geo_key, vehicle_lon, vehicle_lat, vehicle_number)
-                        redis_client.geoadd(geo_key_new, vehicle_lon, vehicle_lat, min_vehicle_data)
+                        redis_client.hset(vehicle_meta_key, vehicle_number, min_vehicle_data)
                     else:
                         logger.error(f"Invalid location data: lon={vehicle_lon}, lat={vehicle_lat}, member={vehicle_number}")
-                    prod_redis_client.expire(geo_key, 86400)  # Expire after 24 hours
-                    prod_redis_client.expire(geo_key_new, 86400)  # Expire after 24 hours
-                    redis_client.expire(geo_key, 86400)  # Expire after 24 hours
-                    redis_client.expire(geo_key_new, 86400)  # Expire after 24 hours
+                    prod_redis_client.expire(geo_key, 86400)
+                    prod_redis_client.expire(vehicle_meta_key, 86400)
+                    redis_client.expire(geo_key, 86400)
+                    redis_client.expire(vehicle_meta_key, 86400)
                     
                 except Exception as e:
                     logger.error(f"Error storing data in Redis: {str(e)}")
