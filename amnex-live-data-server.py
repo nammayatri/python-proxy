@@ -246,6 +246,7 @@ BUS_LOCATION_MAX_AGE = int(os.getenv('BUS_LOCATION_MAX_AGE', '120'))  # 2 minute
 BUS_CLEANUP_INTERVAL = int(os.getenv('BUS_CLEANUP_INTERVAL', '180'))  # 3 minute default
 CLEANUP_LOCK_TTL = 30  # 30 seconds lock TTL to prevent multiple cleanups
 ENABLE_TIMESTAMP_VALIDATION = os.getenv('ENABLE_TIMESTAMP_VALIDATION', 'false').lower() == 'true'  # Feature flag for timestamp validation
+FUTURE_TIMESTAMP_TOLERANCE = int(os.getenv('FUTURE_TIMESTAMP_TOLERANCE', '300'))  # 5 minutes tolerance for future timestamps
 
 class StopTracker:
     def __init__(self, db_engine, redis_client, use_osrm=USE_OSRM, 
@@ -1565,7 +1566,7 @@ def validate_and_update_timestamp(entity: dict, vehicle_number: str) -> bool:
         vehicle_number: The vehicle number
     
     Returns:
-        True if timestamp is valid and should proceed, False if outdated
+        True if timestamp is valid and should proceed, False if outdated or from future
     """
     if not ENABLE_TIMESTAMP_VALIDATION:
         return True
@@ -1575,11 +1576,17 @@ def validate_and_update_timestamp(entity: dict, vehicle_number: str) -> bool:
         if not entity_timestamp:
             return True  # Allow if no timestamp
         
+        entity_timestamp = int(entity_timestamp)
+        current_timestamp = int(time.time())
+        
+        # Check if timestamp is from the future (allow tolerance for clock skew)
+        if entity_timestamp > current_timestamp + FUTURE_TIMESTAMP_TOLERANCE:
+            logger.info(f"Future timestamp detected for vehicle {vehicle_number}: entity={entity_timestamp}, current={current_timestamp}, diff={entity_timestamp - current_timestamp}s")
+            return False
+        
         # Use dedicated key for vehicle timestamps
         timestamp_key = f"vehicle_timestamp:{vehicle_number}"
         stored_timestamp = redis_client.get(timestamp_key)
-        
-        entity_timestamp = int(entity_timestamp)
         
         if stored_timestamp is None:
             # No previous timestamp found, store current and allow
@@ -1644,7 +1651,7 @@ def handle_client_data(payload, client_ip, serverTime, isNYGpsDevice = False, se
         if not isNYGpsDevice and ('dataState' not in entity or entity.get('dataState') not in ['L', 'LP', 'LO'] or deviceId not in device_vehicle_map or not is_timestamp_valid):
             push_to_kafka(entity)
             if not is_timestamp_valid:
-                print(f"Skipping outdated data for vehicle {vehicle_number}, device {deviceId}")
+                print(f"Skipping invalid timestamp data for vehicle {vehicle_number}, device {deviceId}")
             else:
                 print(f"Skipping non-live data or unknown device {deviceId}")
             return
