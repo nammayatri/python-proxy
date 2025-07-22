@@ -1518,8 +1518,15 @@ def push_to_kafka(entity):
 
     while retries < max_retries and not success:
         try:
-            # For confluent_kafka.Producer, we need to provide the data as a string
-            producer.produce(KAFKA_TOPIC, json.dumps(entity).encode('utf-8'), callback=delivery_report)
+            # Use a specific key (e.g., deviceId) to select partition
+            kafka_key = str(entity['deviceId']) if entity.get('deviceId') is not None else None
+
+            producer.produce(
+                KAFKA_TOPIC,
+                json.dumps(entity).encode('utf-8'),
+                key=kafka_key.encode('utf-8') if kafka_key else None,
+                callback=delivery_report
+            )
             producer.poll(0)  # Trigger any callbacks
             success = True
         except BufferError as e:
