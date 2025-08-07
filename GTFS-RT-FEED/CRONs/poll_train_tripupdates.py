@@ -32,12 +32,20 @@ REDIS_PORT = os.getenv('REDIS_PORT')
 REDIS_DB = os.getenv('REDIS_DB')
 TRAIN_REDIS_KEY = os.getenv('TRAIN_REDIS_KEY')
 
+# New environment variables for grouped train data Redis
+GROUPED_REDIS_HOST = os.getenv('GROUPED_REDIS_HOST', REDIS_HOST)
+GROUPED_REDIS_PORT = os.getenv('GROUPED_REDIS_PORT', REDIS_PORT)
+GROUPED_REDIS_DB = os.getenv('GROUPED_REDIS_DB', '1')  # Default to DB 1 for grouped data
+
 # New environment variables for API and auth
 TRAIN_API_URL = os.getenv('TRAIN_API_URL', 'https://enquiry.indianrail.gov.in/ntesagent/get-train-running')
 AUTH_API_URL = os.getenv('AUTH_API_URL')
 AUTH_TOKEN = os.getenv('AUTH_TOKEN')
 CLIENT_ID = os.getenv('CLIENT_ID')
 CLIENT_SECRET = os.getenv('CLIENT_SECRET')
+
+# Redis expiration configuration
+GROUPED_REDIS_EXPIRY = int(os.getenv('GROUPED_REDIS_EXPIRY', '70'))  # Default 70 seconds
 
 # In-memory token storage
 bearer_token = None
@@ -50,6 +58,14 @@ redis_client = redis.Redis(
     host=REDIS_HOST,
     port=REDIS_PORT,
     db=REDIS_DB,
+    decode_responses=True
+)
+
+# New Redis client for grouped train data
+grouped_redis_client = redis.Redis(
+    host=GROUPED_REDIS_HOST,
+    port=GROUPED_REDIS_PORT,
+    db=GROUPED_REDIS_DB,
     decode_responses=True
 )
 
@@ -222,12 +238,12 @@ def get_train_status():
 def transform_to_gtfs_rt(data):
     """Transform railway API data to GTFS-RT format"""
     if not data:
-        return None
+        return None, None
 
     # Check if data is a string (error message or HTML)
     if isinstance(data, str):
         logger.error(f"API returned string instead of JSON object: {data[:200]}...")
-        return None
+        return None, None
     
     # Handle the new API response structure
     if isinstance(data, dict):
@@ -237,10 +253,10 @@ def transform_to_gtfs_rt(data):
             data = train_list
         else:
             logger.error(f"API returned dict but no vTrainRunningList found. Keys: {list(data.keys())}")
-            return None
+            return None, None
     elif not isinstance(data, list):
         logger.error(f"API returned unexpected data type: {type(data)}. Data: {str(data)[:200]}...")
-        return None
+        return None, None
 
     logger.info(f"Processing {len(data)} items from API response")
     
@@ -328,7 +344,7 @@ def transform_to_gtfs_rt(data):
 
         gtfs_rt["entity"].append(trip_update)
 
-    return gtfs_rt
+    return gtfs_rt, trains_data
 
 def store_gtfs_rt_in_redis(gtfs_rt_data):
     """Store the GTFS-RT data in Redis"""
@@ -350,6 +366,34 @@ def store_gtfs_rt_in_redis(gtfs_rt_data):
         logger.error(f"Unexpected error while storing data: {e}")
         raise
 
+def store_grouped_train_data_in_redis(trains_data):
+    """Store grouped train data in the second Redis instance"""
+    if not trains_data:
+        logger.warning("No grouped train data to store")
+        return
+
+    try:
+        for train_no, stations in trains_data.items():
+            # Create key name in format "suburban:<train_no>"
+            key_name = f"suburban:{train_no}"
+            
+            # Store the grouped data as JSON
+            grouped_redis_client.set(key_name, json.dumps(stations))
+            
+            # Set expiry using environment variable
+            grouped_redis_client.expire(key_name, GROUPED_REDIS_EXPIRY)
+            
+            logger.info(f"Successfully stored grouped data for train {train_no} with {len(stations)} stations")
+        
+        logger.info(f"Successfully stored grouped data for {len(trains_data)} trains")
+
+    except redis.RedisError as e:
+        logger.error(f"Error storing grouped data in Redis: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error while storing grouped data: {e}")
+        raise
+
 def main():
     """Main function to fetch and store train status data"""
     logger.info("Starting train status data fetch")
@@ -369,9 +413,10 @@ def main():
         else:
             logger.warning("No status data received")
         
-        gtfs_rt_data = transform_to_gtfs_rt(status_data)
+        gtfs_rt_data, grouped_trains_data = transform_to_gtfs_rt(status_data)
 
         store_gtfs_rt_in_redis(gtfs_rt_data)
+        store_grouped_train_data_in_redis(grouped_trains_data)
         
         logger.info("Successfully completed train status data fetch and storage")
             
