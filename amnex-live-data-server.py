@@ -14,6 +14,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import QueuePool
 from typing import Optional, List
 from concurrent.futures import ThreadPoolExecutor
+from pydantic import BaseModel
 import math
 import traceback
 from geopy.distance import geodesic
@@ -774,7 +775,13 @@ class SimpleCache:
 # Create single cache instance
 cache = SimpleCache()
 
-def get_fleet_info(device_id: str, current_lat: float = None, current_lon: float = None, timestamp: int = None, provider: str = None) -> dict:
+class FleetInfo(BaseModel):
+    """Pydantic model for fleet information returned by get_fleet_info function"""
+    vehicle_no: str
+    device_id: str
+    route_id: str
+
+def get_fleet_info(device_id: str, current_lat: float = None, current_lon: float = None, timestamp: int = None, provider: str = None) -> List[FleetInfo]:
     """Get both fleet number and route ID for a device"""
     cache_key = f"fleetInfo:{device_id}"
     cache_key_saved = cache_key + ":saved"
@@ -784,10 +791,11 @@ def get_fleet_info(device_id: str, current_lat: float = None, current_lon: float
     # Check cache first
     fleet_info_str = redis_client.get(cache_key)
     if fleet_info_str is not None:
-        fleet_infos = json.loads(fleet_info_str)
+        fleet_infos_data = json.loads(fleet_info_str)
+        fleet_infos = [FleetInfo(**fleet_info) for fleet_info in fleet_infos_data]
         for fleet_info in fleet_infos:
             if current_lat is not None and current_lon is not None:
-                store_vehicle_location_history(fleet_info['vehicle_no'], current_lat, current_lon, timestamp)
+                store_vehicle_location_history(fleet_info.vehicle_no, current_lat, current_lon, timestamp)
         return fleet_infos
     
     try:
@@ -798,11 +806,11 @@ def get_fleet_info(device_id: str, current_lat: float = None, current_lon: float
         # Get route for fleet
         route_ids = get_route_ids_from_waybills(vehicle_no, current_lat, current_lon, timestamp, provider)
         for route_id in route_ids:
-            val = {
-                'vehicle_no': vehicle_no,
-                'device_id': device_id,
-                'route_id': route_id
-            }
+            fleet_info = FleetInfo(
+                vehicle_no=vehicle_no,
+                device_id=device_id,
+                route_id=route_id
+            )
             try:
                 fleet_info_saved = redis_client.get(cache_key_saved)
                 if fleet_info_saved is not None:
@@ -815,10 +823,12 @@ def get_fleet_info(device_id: str, current_lat: float = None, current_lon: float
                         clean_redis_key_for_route_info(fleet_info_saved['route_id'], route_key)
             except Exception as e:
                 logger.error(f"Error cleaning redis key for route info: {e}")
-            fleet_mapping_values.append(val)
+            fleet_mapping_values.append(fleet_info)
         if len(route_ids) > 0:
-            redis_client.setex(cache_key_saved, BUS_LOCATION_MAX_AGE + BUS_CLEANUP_INTERVAL, json.dumps(fleet_mapping_values)) # hack for cleanup if route changes
-            redis_client.setex(cache_key, BUS_CLEANUP_INTERVAL, json.dumps(fleet_mapping_values))
+            # Convert FleetInfo objects to dicts for JSON serialization to Redis
+            fleet_mapping_dicts = [fleet_info.model_dump() for fleet_info in fleet_mapping_values]
+            redis_client.setex(cache_key_saved, BUS_LOCATION_MAX_AGE + BUS_CLEANUP_INTERVAL, json.dumps(fleet_mapping_dicts)) # hack for cleanup if route changes
+            redis_client.setex(cache_key, BUS_CLEANUP_INTERVAL, json.dumps(fleet_mapping_dicts))
         return fleet_mapping_values
     except Exception as e:
         print(f"Error querying fleet info for device {device_id}: {e}")
@@ -1678,9 +1688,9 @@ def handle_client_data(payload, client_ip, serverTime, isNYGpsDevice = False, se
         if not fleet_infos:
             push_to_kafka(entity)
         for fleet_info in fleet_infos:
-            entity['routeNumber'] = fleet_info.get('route_id')
-            if fleet_info and 'route_id' in fleet_info and fleet_info["route_id"] != None:
-                route_id = fleet_info['route_id']
+            entity['routeNumber'] = fleet_info.route_id
+            if fleet_info and fleet_info.route_id is not None:
+                route_id = fleet_info.route_id
                 
                 stopsInfo = stop_tracker.get_route_stops(route_id)
                 
@@ -1698,7 +1708,7 @@ def handle_client_data(payload, client_ip, serverTime, isNYGpsDevice = False, se
                     serverTime,
                     vehicle_id=deviceId,
                     visited_stops=visited_stops,
-                    vehicle_no=fleet_info.get('vehicle_no', deviceId)
+                    vehicle_no=fleet_info.vehicle_no
                 )
                 if len(visited_stops) > len(before_curr_point_visited_stops):
                     entity['stopId'] = visited_stops[-1]
