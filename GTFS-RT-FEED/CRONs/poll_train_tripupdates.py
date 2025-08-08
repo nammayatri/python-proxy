@@ -285,6 +285,11 @@ def transform_to_gtfs_rt(data):
             logger.warning(f"No trainNo found in station at index {i}")
             continue
 
+        # Convert MASS to MAS if station code is MASS
+        if station.get('stationCode') == 'MASS':
+            station = station.copy()  # Create a copy to avoid modifying the original
+            station['stationCode'] = 'MAS'
+        
         if train_no not in trains_data:
             trains_data[train_no] = []
         trains_data[train_no].append(station)
