@@ -30,6 +30,7 @@ paho-mqtt>=2.1.0
 
 # Geospatial/Math
 geopy>=2.4.0
+python-geohash>=0.8.5
 haversine>=2.8.0
 shapely>=2.0.0
 polyline>=2.0.0

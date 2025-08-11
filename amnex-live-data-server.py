@@ -21,6 +21,7 @@ import logging
 import atexit
 import paho.mqtt.client as mqtt
 import requests
+import geohash 
 
 # Configure logging
 logging.basicConfig(
@@ -62,6 +63,37 @@ producer_config = {
 }
 
 producer = Producer(producer_config)
+
+# --- Geohash → routes mapping setup ---
+GEOHASH_PRECISION = 7          # ~153m cells
+route_polylines_in_memory = []
+geohash_to_routes = {}         # { geohash: set(route_id) }
+
+def generate_route_geohashes(polyline_str: str):
+    """Return geohashes for the route polyline using only the original decoded points."""
+    pts = decode_polyline(polyline_str)
+    if not pts:
+        return set()
+    # Directly encode each original point
+    return { geohash.encode(lat, lon, GEOHASH_PRECISION) for lat, lon in pts }
+
+def get_routes_for_point(lat: float, lon: float):
+    gh = geohash.encode(lat, lon, GEOHASH_PRECISION)
+    return list(geohash_to_routes.get(gh, []))
+
+# Convenience wrapper returning both geohash and routes
+def geohash_to_route(lat: float, lon: float) -> dict:
+    """Return the geohash (precision=GEOHASH_PRECISION) and route IDs covering that cell.
+    Args:
+        lat: Latitude in decimal degrees
+        lon: Longitude in decimal degrees
+    Returns:
+        { "geohash": <str>, "routes": [<route_id str>, ...] }
+    """
+    if lat is None or lon is None:
+        return {"geohash": None, "routes": []}
+    gh = geohash.encode(lat, lon, GEOHASH_PRECISION)
+    return {"geohash": gh, "routes": list(geohash_to_routes.get(gh, []))}
 
 # Redis connection setup
 if IS_CLUSTER_REDIS:
@@ -795,28 +827,57 @@ def get_fleet_info(device_id: str, current_lat: float = None, current_lon: float
         if not vehicle_no:
             return []
 
-        # Get route for fleet
-        route_ids = get_route_ids_from_waybills(vehicle_no, current_lat, current_lon, timestamp, provider)
-        for route_id in route_ids:
+        # Get route(s) for fleet via waybills first
+        waybill_route_ids = get_route_ids_from_waybills(vehicle_no, current_lat, current_lon, timestamp, provider)
+        geohash_info = geohash_to_route(current_lat, current_lon)
+        geohash_route_ids = geohash_info.get('routes', [])
+
+        # Get location history for route matching
+        location_history = get_vehicle_location_history(vehicle_no)
+
+        combined_route_ids = []
+        def append_route(route_id, state):
             val = {
                 'vehicle_no': vehicle_no,
                 'device_id': device_id,
-                'route_id': route_id
+                'route_id': route_id,
+                'state': state,
             }
+            combined_route_ids.append(val)
+
+        confirmed_route_ids = set(waybill_route_ids or [])
+        for rid in (waybill_route_ids or []):
+            append_route(rid, 'Confirmed')
+        for rid in geohash_route_ids:
+            if rid not in confirmed_route_ids:
+                route_stops = stop_tracker.get_route_stops(str(rid))
+                score = calculate_route_match_score(rid, vehicle_no, route_stops, location_history)
+                if score > 0.8:
+                    append_route(rid, 'All')
+        
+        
+        saved_fleet_info = redis_client.get(cache_key_saved)
+        if saved_fleet_info:
             try:
-                fleet_info_saved = redis_client.get(cache_key_saved)
-                if fleet_info_saved is not None:
-                    fleet_info_saved = json.loads(fleet_info_saved)
-                    print("going to delete route info")
-                    if ('route_id' in fleet_info_saved and 
-                        fleet_info_saved['route_id'] is not None and 
-                        route_id != fleet_info_saved['route_id']):
-                        route_key = "route:" + fleet_info_saved['route_id']
-                        clean_redis_key_for_route_info(fleet_info_saved['route_id'], route_key)
-            except Exception as e:
-                logger.error(f"Error cleaning redis key for route info: {e}")
-            fleet_mapping_values.append(val)
-        if len(route_ids) > 0:
+                saved_fleet_info = json.loads(saved_fleet_info)
+                # Get all current route IDs for comparison
+                current_route_ids = set(val['route_id'] for val in combined_route_ids)
+                
+                # Extract route IDs from saved fleet info
+                saved_routes = [item['route_id'] for item in saved_fleet_info if item.get('route_id')]
+                
+                # Clean up routes that are no longer current
+                for prev_route_id in saved_routes:
+                    if prev_route_id and prev_route_id not in current_route_ids:
+                        print(f"going to delete route info for route {prev_route_id}")
+                        route_key = "route:" + prev_route_id
+                        clean_redis_key_for_route_info(prev_route_id, route_key)
+            except Exception as e_inner:
+                logger.error(f"Error cleaning redis key for route info: {e_inner}")
+        
+        fleet_mapping_values = combined_route_ids
+
+        if len(fleet_mapping_values) > 0:
             redis_client.setex(cache_key_saved, BUS_LOCATION_MAX_AGE + BUS_CLEANUP_INTERVAL, json.dumps(fleet_mapping_values)) # hack for cleanup if route changes
             redis_client.setex(cache_key, BUS_CLEANUP_INTERVAL, json.dumps(fleet_mapping_values))
         return fleet_mapping_values
@@ -1616,6 +1677,43 @@ def validate_and_update_timestamp(entity: dict, vehicle_number: str) -> bool:
         logger.error(f"Error validating timestamp for vehicle {vehicle_number}: {e}")
         return True  # Allow on error to avoid blocking valid data
 
+def load_route_polylines():
+    global route_polylines_in_memory, geohash_to_routes
+    try:
+        with SessionLocal() as db:
+            # Correct filter usage: pass separate conditions, avoid Python 'and' short-circuit
+            route_polylines_in_memory = (
+                db.query(RoutePolyline)
+                  .filter(
+                      RoutePolyline.merchant_operating_city_id == MERCHANT_OPERATING_CITY_ID,
+                      RoutePolyline.polyline != None
+                  ).all()
+            )
+        # Build geohash -> routes mapping (precision ~38m, acceptable for 50m requirement)
+        geohash_to_routes.clear()
+        routes_processed = 0
+        cells_populated = 0
+        for rp in route_polylines_in_memory:
+            if not rp.polyline:
+                continue
+            try:
+                gh_set = generate_route_geohashes(rp.polyline)
+            except Exception as ge:
+                logger.error(f"Error generating geohashes for route {rp.route_id}: {ge}")
+                continue
+            rid = str(rp.route_id)
+            for gh in gh_set:
+                bucket = geohash_to_routes.get(gh)
+                if bucket is None:
+                    geohash_to_routes[gh] = {rid}
+                    cells_populated += 1
+                else:
+                    bucket.add(rid)
+            routes_processed += 1
+        logger.info(f"Loaded {len(route_polylines_in_memory)} polylines; {routes_processed} routes mapped into {cells_populated} geohash cells (precision={GEOHASH_PRECISION})")
+    except Exception as e:
+        logger.error(f"Error loading route polylines at startup: {e}")
+
 def load_device_vehicle_mappings():
     global device_vehicle_map
     try:
@@ -1679,6 +1777,8 @@ def handle_client_data(payload, client_ip, serverTime, isNYGpsDevice = False, se
             push_to_kafka(entity)
         for fleet_info in fleet_infos:
             entity['routeNumber'] = fleet_info.get('route_id')
+            # Always include state (guaranteed present in fleet_info)
+            entity['route_state'] = fleet_info['state']
             if fleet_info and 'route_id' in fleet_info and fleet_info["route_id"] != None:
                 route_id = fleet_info['route_id']
                 
@@ -1729,6 +1829,7 @@ def handle_client_data(payload, client_ip, serverTime, isNYGpsDevice = False, se
                     "device_id": deviceId,
                     "vehicle_number": vehicle_number,
                     "route_id": str(route_id),
+                    "route_state": fleet_info['state'],
                     "serverTime": int(time.time())  # Add current server time
                 }
 
@@ -1987,6 +2088,7 @@ if __name__ == "__main__":
     # as we already called loop_start() and we already registered a shutdown function
     mqtt_client_obj = mqtt_client()
     load_device_vehicle_mappings()
+    load_route_polylines()
     start_vehicle_cleanup_thread()
     main_server()
 
