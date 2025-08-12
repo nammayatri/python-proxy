@@ -1677,42 +1677,48 @@ def validate_and_update_timestamp(entity: dict, vehicle_number: str) -> bool:
         logger.error(f"Error validating timestamp for vehicle {vehicle_number}: {e}")
         return True  # Allow on error to avoid blocking valid data
 
+ROUTE_GEOHASH_KEY = 'route_geohash_stuff'
 def load_route_polylines():
     global route_polylines_in_memory, geohash_to_routes
-    try:
-        with SessionLocal() as db:
-            # Correct filter usage: pass separate conditions, avoid Python 'and' short-circuit
-            route_polylines_in_memory = (
-                db.query(RoutePolyline)
-                  .filter(
-                      RoutePolyline.merchant_operating_city_id == MERCHANT_OPERATING_CITY_ID,
-                      RoutePolyline.polyline != None
-                  ).all()
-            )
-        # Build geohash -> routes mapping (precision ~38m, acceptable for 50m requirement)
-        geohash_to_routes.clear()
-        routes_processed = 0
-        cells_populated = 0
-        for rp in route_polylines_in_memory:
-            if not rp.polyline:
-                continue
-            try:
-                gh_set = generate_route_geohashes(rp.polyline)
-            except Exception as ge:
-                logger.error(f"Error generating geohashes for route {rp.route_id}: {ge}")
-                continue
-            rid = str(rp.route_id)
-            for gh in gh_set:
-                bucket = geohash_to_routes.get(gh)
-                if bucket is None:
-                    geohash_to_routes[gh] = {rid}
-                    cells_populated += 1
-                else:
-                    bucket.add(rid)
-            routes_processed += 1
-        logger.info(f"Loaded {len(route_polylines_in_memory)} polylines; {routes_processed} routes mapped into {cells_populated} geohash cells (precision={GEOHASH_PRECISION})")
-    except Exception as e:
-        logger.error(f"Error loading route polylines at startup: {e}")
+    mb_route_geohash_stuff = redis_client.get(ROUTE_GEOHASH_KEY)
+    if mb_route_geohash_stuff:
+        geohash_to_routes = json.loads(mb_route_geohash_stuff)
+    else:
+        try:
+            with SessionLocal() as db:
+                # Correct filter usage: pass separate conditions, avoid Python 'and' short-circuit
+                route_polylines_in_memory = (
+                    db.query(RoutePolyline)
+                      .filter(
+                          RoutePolyline.merchant_operating_city_id == MERCHANT_OPERATING_CITY_ID,
+                          RoutePolyline.polyline != None
+                      ).all()
+                )
+            # Build geohash -> routes mapping (precision ~38m, acceptable for 50m requirement)
+            geohash_to_routes.clear()
+            routes_processed = 0
+            cells_populated = 0
+            for rp in route_polylines_in_memory:
+                if not rp.polyline:
+                    continue
+                try:
+                    gh_set = generate_route_geohashes(rp.polyline)
+                except Exception as ge:
+                    logger.error(f"Error generating geohashes for route {rp.route_id}: {ge}")
+                    continue
+                rid = str(rp.route_id)
+                for gh in gh_set:
+                    bucket = geohash_to_routes.get(gh)
+                    if bucket is None:
+                        geohash_to_routes[gh] = {rid}
+                        cells_populated += 1
+                    else:
+                        bucket.add(rid)
+                routes_processed += 1
+            logger.info(f"Loaded {len(route_polylines_in_memory)} polylines; {routes_processed} routes mapped into {cells_populated} geohash cells (precision={GEOHASH_PRECISION})")
+            redis_client.setex(geohash_to_routes, 86400 * 10, json.dumps(geohash_to_routes))
+        except Exception as e:
+            logger.error(f"Error loading route polylines at startup: {e}")
 
 def load_device_vehicle_mappings():
     global device_vehicle_map
