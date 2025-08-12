@@ -129,6 +129,7 @@ INTEGRATED_BPP_CONFIG_ID = os.getenv('INTEGRATED_BPP_CONFIG_ID_HD', 'b0454b15-97
 MERCHANT_OPERATING_CITY_ID = os.getenv('MERCHANT_OPERATING_CITY_ID', 'fc87c15e-29aa-492b-835f-bda8ff00c840')
 GTFS_ID = os.getenv('GTFS_ID', 'chennai_data')
 ROUTE_STOP_MAPPING_API_URL = os.getenv('ROUTE_STOP_MAPPING_API_URL', 'http://gtfs-inmemory-data-server.nandi.svc.cluster.local:8000')
+START_TIME_THRESHOLD_MS = int(os.getenv('START_TIME_THRESHOLD_MS', '3600000'))  # 1 hour in milliseconds
 
 # SQLAlchemy setup for main database
 DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
@@ -207,6 +208,13 @@ class BusScheduleTripDetail(Base):
     schedule_trip_id = Column(BigInteger)
     deleted = Column(Boolean, nullable=False, default=False)
     route_number_id = Column(BigInteger, nullable=False)
+    schedule_number = Column(Text)
+    running_time = Column(Integer)
+    start_time = Column(DateTime)
+
+def parse_schedule_number(schedule_number: str) -> str:
+    """Parse the schedule number to get the route number"""
+    return schedule_number.split('-')[1]
 
 def get_route_ids_from_waybills(vehicle_no: str, current_lat: float = None, current_lon: float = None, timestamp: int = None, provider: str = None) -> Optional[str]:
     """Get the route_id from waybills database for a given vehicle number"""
@@ -244,9 +252,14 @@ def get_route_ids_from_waybills(vehicle_no: str, current_lat: float = None, curr
                 return None
             print(f"Route ID: Bus scheudle len {len(schedules)}")
 
+            state = 'ConfirmedHigh'
             best_route_ids = []
+            route_numbers_map = {}
             routes_match_score = {}
             for schedule in schedules:
+                route_number = parse_schedule_number(schedule.schedule_number)
+                route_numbers_map[schedule.route_number_id] = route_number
+
                 if schedule.route_number_id not in routes_match_score:
                     route_stops = stop_tracker.get_route_stops(str(schedule.route_number_id))
                     # Calculate match score using location history
@@ -258,7 +271,26 @@ def get_route_ids_from_waybills(vehicle_no: str, current_lat: float = None, curr
                     if score > 0.8:
                         best_route_ids.append(schedule.route_number_id)
                     routes_match_score[schedule.route_number_id] = score
-            return best_route_ids
+
+            # If no best_route_ids with score > 0.8, try to look for those with score > 0.6
+            if len(best_route_ids) == 0:
+                state = 'ConfirmedMed'
+                for route_id, score in routes_match_score.items():
+                    if score > 0.6:
+                        best_route_ids.append(route_id)
+
+            if len(best_route_ids) == 0:
+                state = 'Schedule'
+                for schedule in schedules:
+                    # Only add route_number_id if current time is within start_time and (start_time + running_time)
+                    now_ms = int(time.time() * 1000)
+                    start_time_ms = int(schedule.start_time.timestamp() * 1000)
+                    end_time_ms = start_time_ms + int(schedule.running_time)
+                    # Add a threshold of 1 hour (3600000 ms) before start_time, using a variable
+                    if (start_time_ms - START_TIME_THRESHOLD_MS) <= now_ms <= end_time_ms:
+                        best_route_ids.append(schedule.route_number_id)
+
+            return best_route_ids, route_numbers_map, state
             
     except Exception as e:
         error_details = traceback.format_exc()
@@ -828,7 +860,7 @@ def get_fleet_info(device_id: str, current_lat: float = None, current_lon: float
             return []
 
         # Get route(s) for fleet via waybills first
-        waybill_route_ids = get_route_ids_from_waybills(vehicle_no, current_lat, current_lon, timestamp, provider)
+        waybill_route_ids, route_numbers_map, state = get_route_ids_from_waybills(vehicle_no, current_lat, current_lon, timestamp, provider)
         geohash_info = geohash_to_route(current_lat, current_lon)
         geohash_route_ids = geohash_info.get('routes', [])
 
@@ -836,24 +868,25 @@ def get_fleet_info(device_id: str, current_lat: float = None, current_lon: float
         location_history = get_vehicle_location_history(vehicle_no)
 
         combined_route_ids = []
-        def append_route(route_id, state):
+        def append_route(route_id, route_number, state):
             val = {
                 'vehicle_no': vehicle_no,
                 'device_id': device_id,
                 'route_id': route_id,
-                'state': state,
+                'route_number': route_number,
+                'state': state
             }
             combined_route_ids.append(val)
 
         confirmed_route_ids = set(waybill_route_ids or [])
         for rid in (waybill_route_ids or []):
-            append_route(rid, 'Confirmed')
+            append_route(rid, route_numbers_map[rid], state)
         for rid in geohash_route_ids:
             if rid not in confirmed_route_ids:
                 route_stops = stop_tracker.get_route_stops(str(rid))
                 score = calculate_route_match_score(rid, vehicle_no, route_stops, location_history)
                 if score > 0.8:
-                    append_route(rid, 'All')
+                    append_route(rid, route_numbers_map[rid], 'All')
         
         
         saved_fleet_info = redis_client.get(cache_key_saved)
@@ -1835,6 +1868,7 @@ def handle_client_data(payload, client_ip, serverTime, isNYGpsDevice = False, se
                     "device_id": deviceId,
                     "vehicle_number": vehicle_number,
                     "route_id": str(route_id),
+                    "route_number": fleet_info['route_number'],
                     "route_state": fleet_info['state'],
                     "serverTime": int(time.time())  # Add current server time
                 }
