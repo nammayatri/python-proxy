@@ -129,7 +129,7 @@ INTEGRATED_BPP_CONFIG_ID = os.getenv('INTEGRATED_BPP_CONFIG_ID_HD', 'b0454b15-97
 MERCHANT_OPERATING_CITY_ID = os.getenv('MERCHANT_OPERATING_CITY_ID', 'fc87c15e-29aa-492b-835f-bda8ff00c840')
 GTFS_ID = os.getenv('GTFS_ID', 'chennai_data')
 ROUTE_STOP_MAPPING_API_URL = os.getenv('ROUTE_STOP_MAPPING_API_URL', 'http://gtfs-inmemory-data-server.nandi.svc.cluster.local:8000')
-START_TIME_THRESHOLD_MS = int(os.getenv('START_TIME_THRESHOLD_MS', '3600000'))  # 1 hour in milliseconds
+SCHEDULE_DELAY_BUFFER = int(os.getenv('SCHEDULE_DELAY_BUFFER', '3600000'))  # 1 hour in milliseconds
 
 # SQLAlchemy setup for main database
 DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
@@ -286,8 +286,8 @@ def get_route_ids_from_waybills(vehicle_no: str, current_lat: float = None, curr
                     now_ms = int(time.time() * 1000)
                     start_time_ms = int(schedule.start_time.timestamp() * 1000)
                     end_time_ms = start_time_ms + int(schedule.running_time)
-                    # Add a threshold of 1 hour (3600000 ms) before start_time, using a variable
-                    if (start_time_ms - START_TIME_THRESHOLD_MS) <= now_ms <= end_time_ms:
+                    # Add a buffer time to account for schedule delay
+                    if start_time_ms <= now_ms <= end_time_ms + SCHEDULE_DELAY_BUFFER:
                         best_route_ids.append(schedule.route_number_id)
 
             return best_route_ids, route_numbers_map, state
