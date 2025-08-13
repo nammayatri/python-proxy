@@ -209,8 +209,8 @@ class BusScheduleTripDetail(Base):
     deleted = Column(Boolean, nullable=False, default=False)
     route_number_id = Column(BigInteger, nullable=False)
     schedule_number = Column(Text)
-    running_time = Column(Integer)
     start_time = Column(Text)
+    end_time = Column(Text)
 
 def parse_schedule_number(schedule_number: str) -> str:
     """Parse the schedule number to get the route number"""
@@ -339,7 +339,7 @@ def get_route_ids_from_waybills(vehicle_no: str, current_lat: float = None, curr
             if len(best_route_ids) == 0:
                 state = 'Schedule'
                 for schedule in schedules:
-                    # Only add route_number_id if current time is within start_time and (start_time + running_time)
+                    # Only add route_number_id if current time is within start_time and end_time
                     now_ms = int(time.time() * 1000)
                     
                     # Parse start_time string using type-safe function
@@ -352,7 +352,15 @@ def get_route_ids_from_waybills(vehicle_no: str, current_lat: float = None, curr
                         logger.error(f"Could not parse start_time string: {schedule.start_time}, error: {e}")
                         continue
                     
-                    end_time_ms = start_time_ms + int(schedule.running_time)
+                    # Parse end_time string using type-safe function
+                    try:
+                        end_time_ms = parse_ist_time_to_milliseconds(schedule.end_time)
+                        if end_time_ms is None:
+                            # No valid end_time, skip this schedule
+                            continue
+                    except (ValueError, TypeError) as e:
+                        logger.error(f"Could not parse end_time string: {schedule.end_time}, error: {e}")
+                        continue
                     # Add a buffer time to account for schedule delay
                     if start_time_ms <= now_ms <= end_time_ms + SCHEDULE_DELAY_BUFFER:
                         best_route_ids.append(schedule.route_number_id)
