@@ -7,6 +7,8 @@ COPY requirements.txt .
 
 RUN apt-get update && apt-get install -y \
     curl \
+    gcc \
+    g++ \
     htop
 
 RUN pip install --no-cache-dir -r requirements.txt
