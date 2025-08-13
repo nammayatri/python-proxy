@@ -3,7 +3,7 @@ import polyline as gpolyline
 from confluent_kafka import Producer, KafkaError, KafkaException
 import os
 import json
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone, time as dt_time
 import threading
 from rediscluster import RedisCluster
 import redis
@@ -12,7 +12,7 @@ from sqlalchemy import create_engine, Column, Integer, String, DateTime, Boolean
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import QueuePool
-from typing import Optional, List
+from typing import Optional, List, Union
 from concurrent.futures import ThreadPoolExecutor
 import math
 import traceback
@@ -210,11 +210,68 @@ class BusScheduleTripDetail(Base):
     route_number_id = Column(BigInteger, nullable=False)
     schedule_number = Column(Text)
     running_time = Column(Integer)
-    start_time = Column(DateTime)
+    start_time = Column(Text)
 
 def parse_schedule_number(schedule_number: str) -> str:
     """Parse the schedule number to get the route number"""
     return schedule_number.split('-')[1]
+
+def parse_ist_time_to_milliseconds(time_str: Optional[str]) -> Optional[int]:
+    """
+    Parse IST time string in HH:MM format to milliseconds since epoch.
+    
+    Args:
+        time_str: Time string in "HH:MM" format (e.g., "05:15") or None
+        
+    Returns:
+        Milliseconds since epoch as integer, or None if parsing fails
+        
+    Raises:
+        ValueError: If time_str format is invalid
+        TypeError: If time_str is not a string or None
+    """
+    if time_str is None:
+        return None
+        
+    if not isinstance(time_str, str):
+        raise TypeError(f"Expected string or None, got {type(time_str)}")
+    
+    time_str = time_str.strip()
+    if not time_str:
+        return None
+        
+    try:
+        # Parse time string like "05:15"
+        time_parts = time_str.split(':')
+        if len(time_parts) != 2:
+            raise ValueError(f"Invalid time format '{time_str}'. Expected 'HH:MM'")
+            
+        hours = int(time_parts[0])
+        minutes = int(time_parts[1])
+        
+        # Validate time components
+        if not (0 <= hours <= 23):
+            raise ValueError(f"Invalid hour value: {hours}. Must be 0-23")
+        if not (0 <= minutes <= 59):
+            raise ValueError(f"Invalid minute value: {minutes}. Must be 0-59")
+        
+        # Get current date in IST and create datetime with the parsed time
+        # IST is UTC+5:30
+        ist_timezone = timezone(timedelta(hours=5, minutes=30))
+        today = datetime.now(ist_timezone).date()
+        start_time_dt = datetime.combine(today, dt_time(hours, minutes), ist_timezone)
+        
+        return int(start_time_dt.timestamp() * 1000)
+        
+    except (ValueError, IndexError) as e:
+        if isinstance(e, ValueError) and "Invalid" in str(e):
+            # Re-raise our custom validation errors
+            raise
+        else:
+            # Convert parsing errors to more descriptive ones
+            raise ValueError(f"Failed to parse time string '{time_str}': {str(e)}")
+    except Exception as e:
+        raise ValueError(f"Unexpected error parsing time string '{time_str}': {str(e)}")
 
 def get_route_ids_from_waybills(vehicle_no: str, current_lat: float = None, current_lon: float = None, timestamp: int = None, provider: str = None) -> Optional[str]:
     """Get the route_id from waybills database for a given vehicle number"""
@@ -284,7 +341,17 @@ def get_route_ids_from_waybills(vehicle_no: str, current_lat: float = None, curr
                 for schedule in schedules:
                     # Only add route_number_id if current time is within start_time and (start_time + running_time)
                     now_ms = int(time.time() * 1000)
-                    start_time_ms = int(schedule.start_time.timestamp() * 1000)
+                    
+                    # Parse start_time string using type-safe function
+                    try:
+                        start_time_ms = parse_ist_time_to_milliseconds(schedule.start_time)
+                        if start_time_ms is None:
+                            # No valid start_time, skip this schedule
+                            continue
+                    except (ValueError, TypeError) as e:
+                        logger.error(f"Could not parse start_time string: {schedule.start_time}, error: {e}")
+                        continue
+                    
                     end_time_ms = start_time_ms + int(schedule.running_time)
                     # Add a buffer time to account for schedule delay
                     if start_time_ms <= now_ms <= end_time_ms + SCHEDULE_DELAY_BUFFER:
