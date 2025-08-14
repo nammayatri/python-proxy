@@ -1824,7 +1824,7 @@ def load_route_polylines():
                         bucket.add(rid)
                 routes_processed += 1
             logger.info(f"Loaded {len(route_polylines_in_memory)} polylines; {routes_processed} routes mapped into {cells_populated} geohash cells (precision={GEOHASH_PRECISION})")
-            redis_client.setex(geohash_to_routes, 86400 * 10, json.dumps(geohash_to_routes))
+            redis_client.setex(ROUTE_GEOHASH_KEY, 86400 * 10, json.dumps(geohash_to_routes))
         except Exception as e:
             logger.error(f"Error loading route polylines at startup: {e}")
 
