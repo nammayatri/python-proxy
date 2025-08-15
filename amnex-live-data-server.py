@@ -48,6 +48,9 @@ FORWARD_TCP = os.getenv('FORWARD_TCP', 'true').lower() == 'true'
 TCP_FORWARD_TIMEOUT = int(os.getenv('TCP_FORWARD_TIMEOUT', '5'))  # Socket timeout in seconds
 TCP_MAX_RETRIES = int(os.getenv('TCP_MAX_RETRIES', '3'))  # Maximum retry attempts
 TCP_RECONNECT_INTERVAL = int(os.getenv('TCP_RECONNECT_INTERVAL', '2555'))  # Seconds between reconnection attempts
+MAX_VEHICLE_LOCATION_HISTORY_POINTS = int(os.getenv('MAX_VEHICLE_LOCATION_HISTORY_POINTS', '30'))
+GEO_KEY = "bus_locations"
+VEHICLE_META_KEY = "bus_metadata_v2"
 
 # Setup Kafka producer with better config for high load
 producer_config = {
@@ -960,9 +963,11 @@ def get_fleet_info(device_id: str, current_lat: float = None, current_lon: float
             if rid not in confirmed_route_ids:
                 route_stops = stop_tracker.get_route_stops(str(rid))
                 score = calculate_route_match_score(rid, vehicle_no, route_stops, location_history)
+                print(f"Route ID: Bus Possible score {vehicle_no} Score for route {rid}: {score}")
+                if score is None:
+                    score = 0.0
                 if score > 0.8:
-                    append_route(rid, route_numbers_map[rid], 'All')
-        
+                    append_route(rid, route_numbers_map.get(rid, "not-known"), 'All')
         
         saved_fleet_info = redis_client.get(cache_key_saved)
         if saved_fleet_info:
@@ -1434,7 +1439,7 @@ def is_point_near_polyline(point_lat, point_lon, polyline_points, max_distance_m
     max_distance_km = max_distance_meter / 1000
     return min_distance <= max_distance_km, min_distance, min_segment
 
-def store_vehicle_location_history(device_id: str, lat: float, lon: float, timestamp: int, max_points: int = 25):
+def store_vehicle_location_history(device_id: str, lat: float, lon: float, timestamp: int):
     """Store vehicle location history in Redis with TTL"""
     history = None
     try:
@@ -1460,8 +1465,8 @@ def store_vehicle_location_history(device_id: str, lat: float, lon: float, times
         points.append(point)
         
         # Keep only last max_points
-        if len(points) > max_points:
-            points = points[-max_points:]
+        if len(points) > MAX_VEHICLE_LOCATION_HISTORY_POINTS:
+            points = points[-MAX_VEHICLE_LOCATION_HISTORY_POINTS:]
         
         points.sort(key=lambda x: x['timestamp'])
         # Store updated history with 1 hour TTL
@@ -1823,8 +1828,8 @@ def load_route_polylines():
                     else:
                         bucket.add(rid)
                 routes_processed += 1
-            logger.info(f"Loaded {len(route_polylines_in_memory)} polylines; {routes_processed} routes mapped into {cells_populated} geohash cells (precision={GEOHASH_PRECISION})")
-            redis_client.setex(ROUTE_GEOHASH_KEY, 86400 * 10, json.dumps(geohash_to_routes))
+            data_serializable = {k: list(v) for k, v in geohash_to_routes.items()}
+            redis_client.setex(ROUTE_GEOHASH_KEY, 86400 * 10, json.dumps(data_serializable))
         except Exception as e:
             logger.error(f"Error loading route polylines at startup: {e}")
 
@@ -1889,6 +1894,7 @@ def handle_client_data(payload, client_ip, serverTime, isNYGpsDevice = False, se
         fleet_infos = get_fleet_info(deviceId, vehicle_lat, vehicle_lon, entity.get('timestamp'), entity.get('provider'))
         if not fleet_infos:
             push_to_kafka(entity)
+        min_vehicle_data = None
         for fleet_info in fleet_infos:
             entity['routeNumber'] = fleet_info.get('route_id')
             # Always include state (guaranteed present in fleet_info)
@@ -1948,7 +1954,7 @@ def handle_client_data(payload, client_ip, serverTime, isNYGpsDevice = False, se
                     "serverTime": int(time.time())  # Add current server time
                 }
 
-                min_vehicle_data = json.dumps(vehicle_data_obj)
+                min_vehicle_data = 1 # means atlease one fleet mapping is there
                 
                 
                 # Add ETA data if available
@@ -1965,22 +1971,29 @@ def handle_client_data(payload, client_ip, serverTime, isNYGpsDevice = False, se
                     redis_client.hset(redis_key, vehicle_number, vehicle_data)
                     redis_client.expire(redis_key, 86400)  # Expire after 24 hours
                     
-                    geo_key = "bus_locations"
-                    vehicle_meta_key = "bus_metadata"
-                    if vehicle_lon is not None and vehicle_lat is not None and vehicle_number:
-                        prod_redis_client.geoadd(geo_key, vehicle_lon, vehicle_lat, vehicle_number)
-                        prod_redis_client.hset(vehicle_meta_key, vehicle_number, min_vehicle_data)
-                        redis_client.geoadd(geo_key, vehicle_lon, vehicle_lat, vehicle_number)
-                        redis_client.hset(vehicle_meta_key, vehicle_number, min_vehicle_data)
-                    else:
-                        logger.error(f"Invalid location data: lon={vehicle_lon}, lat={vehicle_lat}, member={vehicle_number}")
-                    prod_redis_client.expire(geo_key, 86400)
-                    prod_redis_client.expire(vehicle_meta_key, 86400)
-                    redis_client.expire(geo_key, 86400)
-                    redis_client.expire(vehicle_meta_key, 86400)
-                    
                 except Exception as e:
                     logger.error(f"Error storing data in Redis: {str(e)}")
+
+        if vehicle_lon is not None and vehicle_lat is not None and vehicle_number and min_vehicle_data is not None:
+            vehicle_info_data = {
+                    "latitude": entity["lat"],
+                    "longitude": entity["long"],
+                    "timestamp": entity["timestamp"],
+                    "speed": entity.get("speed", 0),
+                    "device_id": deviceId,
+                    "vehicle_number": vehicle_number,
+                    "routes_info": dict(map(lambda x: (x['route_id'], { "route_number": x['route_number'], "route_state": x['state']}), fleet_infos))
+                }
+            prod_redis_client.geoadd(GEO_KEY, vehicle_lon, vehicle_lat, vehicle_number)
+            prod_redis_client.hset(VEHICLE_META_KEY, vehicle_number, json.dumps(vehicle_info_data))
+            redis_client.geoadd(GEO_KEY, vehicle_lon, vehicle_lat, vehicle_number)
+            redis_client.hset(VEHICLE_META_KEY, vehicle_number, json.dumps(vehicle_info_data))
+            prod_redis_client.expire(GEO_KEY, 86400)
+            prod_redis_client.expire(VEHICLE_META_KEY, 86400)
+            redis_client.expire(GEO_KEY, 86400)
+            redis_client.expire(VEHICLE_META_KEY, 86400)
+        else:
+            logger.error(f"Invalid location data: lon={vehicle_lon}, lat={vehicle_lat}, member={vehicle_number}")
     except Exception as e:
         logger.error(f"Error handling client data: {str(e)}")
         traceback.print_exc()
