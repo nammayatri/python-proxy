@@ -299,6 +299,20 @@ def transform_to_gtfs_rt(data):
             continue
 
         first_station = stations[0]
+        
+        if first_station.get('exceptionFlag') == 1 and first_station.get('trainRunStatus') == 0:
+            trip_update = {
+                "id": f"{train_no}_T1",
+                "tripUpdate": {
+                    "trip": {
+                        "tripId": f"{train_no}_T1",
+                        "scheduleRelationship": "CANCELED"
+                    }
+                }
+            }
+            gtfs_rt["entity"].append(trip_update)
+            continue
+        
         train_start_date = datetime.strptime(first_station['trainStartDate'], "%Y/%m/%d %H:%M:%S")
         
         trip_update = {
@@ -321,6 +335,15 @@ def transform_to_gtfs_rt(data):
         }
 
         for station in stations:
+            if station.get('arrCancelFlag') == 1:
+                stop_update = {
+                    "stopSequence": station['sequence'],
+                    "stopId": station['stationCode'],
+                    "scheduleRelationship": "SKIPPED"
+                }
+                trip_update["tripUpdate"]["stopTimeUpdate"].append(stop_update)
+                continue
+
             sched_arrival_time = datetime.strptime(station['schedArrivalTime'], "%H:%M:%S").time()
             sched_departure_time = datetime.strptime(station['schedDepartureTime'], "%H:%M:%S").time()
             
