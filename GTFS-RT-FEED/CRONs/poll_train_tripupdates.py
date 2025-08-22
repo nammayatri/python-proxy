@@ -368,6 +368,12 @@ def transform_to_gtfs_rt(data):
                 "stopId": station['stationCode']
             }
             
+            platform_code = station.get('platformCode', '')
+            if platform_code and platform_code.strip():
+                stop_update["stopTimeProperties"] = {
+                    "assignedStopId": f"{station['stationCode']}_{platform_code}"
+                }
+            
             trip_update["tripUpdate"]["stopTimeUpdate"].append(stop_update)
 
         gtfs_rt["entity"].append(trip_update)
