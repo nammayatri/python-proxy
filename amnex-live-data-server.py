@@ -48,6 +48,7 @@ FORWARD_TCP = os.getenv('FORWARD_TCP', 'true').lower() == 'true'
 TCP_FORWARD_TIMEOUT = int(os.getenv('TCP_FORWARD_TIMEOUT', '5'))  # Socket timeout in seconds
 TCP_MAX_RETRIES = int(os.getenv('TCP_MAX_RETRIES', '3'))  # Maximum retry attempts
 TCP_RECONNECT_INTERVAL = int(os.getenv('TCP_RECONNECT_INTERVAL', '2555'))  # Seconds between reconnection attempts
+SHOULD_DO_CALCULATIONS = os.getenv('SHOULD_DO_CALCULATIONS', 'true').lower() == 'true'
 MAX_VEHICLE_LOCATION_HISTORY_POINTS = int(os.getenv('MAX_VEHICLE_LOCATION_HISTORY_POINTS', '30'))
 GEO_KEY = "bus_locations"
 VEHICLE_META_KEY = "bus_metadata_v2"
@@ -951,7 +952,7 @@ def get_fleet_info(device_id: str, current_lat: float = None, current_lon: float
                 'vehicle_no': vehicle_no,
                 'device_id': device_id,
                 'route_id': route_id,
-                'route_number': route_number,
+                'route_number': route_number or "not-known-v2",
                 'state': state
             }
             combined_route_ids.append(val)
@@ -1627,6 +1628,33 @@ def start_vehicle_cleanup_thread():
     
     return cleanup_thread
 
+def start_redis_monitoring_thread():
+    """Start a background thread for Redis connection monitoring"""
+    def monitoring_worker():
+        logger.info("Redis connection monitoring thread started (interval: 300s)")
+        monitor = RedisConnectionMonitor()
+        
+        while True:
+            try:
+                # Check for connection leaks every 5 minutes
+                leak_check = monitor.check_connection_leaks()
+                if leak_check['status'] != 'ok':
+                    logger.warning(f"Redis connection monitoring alert: {leak_check}")
+                
+                # Log connection stats periodically
+                stats = monitor.get_detailed_connection_stats()
+                logger.info(f"Redis connections - Total active: {stats['total_active_connections']}/{stats['total_max_connections']} ({stats['overall_utilization_percent']:.1f}%)")
+                
+            except Exception as e:
+                logger.error(f"Error in Redis monitoring worker: {e}")
+            
+            time.sleep(300)  # Check every 5 minutes
+    
+    monitoring_thread = threading.Thread(target=monitoring_worker, daemon=True)
+    monitoring_thread.start()
+    
+    return monitoring_thread
+
 def calculate_route_match_score(route_id, vehicle_no, stops: dict, vehicle_points: List[dict], max_distance_meter: float = 100) -> float:
     """
     Calculate how well a route matches a series of vehicle_points, considering direction.
@@ -1891,109 +1919,113 @@ def handle_client_data(payload, client_ip, serverTime, isNYGpsDevice = False, se
                 return
         
         # Get route information for this vehicle
-        fleet_infos = get_fleet_info(deviceId, vehicle_lat, vehicle_lon, entity.get('timestamp'), entity.get('provider'))
+        fleet_infos = None
+        if SHOULD_DO_CALCULATIONS:
+            fleet_infos = get_fleet_info(deviceId, vehicle_lat, vehicle_lon, entity.get('timestamp'), entity.get('provider'))
         if not fleet_infos:
             push_to_kafka(entity)
+            return 
         min_vehicle_data = None
-        for fleet_info in fleet_infos:
-            entity['routeNumber'] = fleet_info.get('route_id')
-            # Always include state (guaranteed present in fleet_info)
-            entity['route_state'] = fleet_info['state']
-            if fleet_info and 'route_id' in fleet_info and fleet_info["route_id"] != None:
-                route_id = fleet_info['route_id']
-                
-                stopsInfo = stop_tracker.get_route_stops(route_id)
-                
-                # Pass vehicle_id (deviceId) to track visited stops
-                if deviceId:
-                    visited_stops = stop_tracker.get_visited_stops(route_id, deviceId)
-                else:
-                    visited_stops = []
-                before_curr_point_visited_stops = [x for x in visited_stops]
-                eta_data = stop_tracker.calculate_eta(
-                    stopsInfo,
-                    route_id, 
-                    vehicle_lat, 
-                    vehicle_lon, 
-                    serverTime,
-                    vehicle_id=deviceId,
-                    visited_stops=visited_stops,
-                    vehicle_no=fleet_info.get('vehicle_no', deviceId)
-                )
-                if len(visited_stops) > len(before_curr_point_visited_stops):
-                    entity['stopId'] = visited_stops[-1]
-                push_to_kafka(entity)
-                
-                if eta_data:
-                    entity['closest_stop'] = eta_data['closest_stop']
-                    entity['distance_to_stop'] = eta_data['closest_stop']['distance']
-                    entity['eta_list'] = eta_data['eta']
-                    entity['calculation_method'] = eta_data['calculation_method']
-                    entity['visited_stops'] = visited_stops
-            else: 
-                push_to_kafka(entity)
-            # Store in Redis
-            if fleet_info and 'route_id' in fleet_info and fleet_info["route_id"] != None:
-                route_id = fleet_info['route_id']
-                redis_key = f"route:{route_id}"
-                
-                # Get vehicle number
-                vehicle_number = fleet_info.get('vehicle_no', deviceId)
-                
-                # Create vehicle data
-                vehicle_data_obj = {
-                    "latitude": entity["lat"],
-                    "longitude": entity["long"],
-                    "timestamp": entity["timestamp"],
-                    "speed": entity.get("speed", 0),
-                    "device_id": deviceId,
-                    "vehicle_number": vehicle_number,
-                    "route_id": str(route_id),
-                    "route_number": fleet_info['route_number'],
-                    "route_state": fleet_info['state'],
-                    "serverTime": int(time.time())  # Add current server time
-                }
-
-                min_vehicle_data = 1 # means atlease one fleet mapping is there
-                
-                
-                # Add ETA data if available
-                if 'eta_list' in entity:
-                    vehicle_data_obj['eta_data'] = entity['eta_list']
-                    vehicle_data_obj['visited_stops'] = entity['visited_stops']
-                vehicle_data = json.dumps(vehicle_data_obj)
-                
-                try:
-                    # Store vehicle data in hash
-                    logger.info(f"Route ID: Bus vehicle {vehicle_number} is on route, {route_id}")
-                    prod_redis_client.hset(redis_key, vehicle_number, vehicle_data)
-                    prod_redis_client.expire(redis_key, 86400)  # Expire after 24 hours
-                    redis_client.hset(redis_key, vehicle_number, vehicle_data)
-                    redis_client.expire(redis_key, 86400)  # Expire after 24 hours
+        if SHOULD_DO_CALCULATIONS:
+            for fleet_info in fleet_infos:
+                entity['routeNumber'] = fleet_info.get('route_id')
+                # Always include state (guaranteed present in fleet_info)
+                entity['route_state'] = fleet_info['state']
+                if fleet_info and 'route_id' in fleet_info and fleet_info["route_id"] != None:
+                    route_id = fleet_info['route_id']
                     
-                except Exception as e:
-                    logger.error(f"Error storing data in Redis: {str(e)}")
+                    stopsInfo = stop_tracker.get_route_stops(route_id)
+                    
+                    # Pass vehicle_id (deviceId) to track visited stops
+                    if deviceId:
+                        visited_stops = stop_tracker.get_visited_stops(route_id, deviceId)
+                    else:
+                        visited_stops = []
+                    before_curr_point_visited_stops = [x for x in visited_stops]
+                    eta_data = stop_tracker.calculate_eta(
+                        stopsInfo,
+                        route_id, 
+                        vehicle_lat, 
+                        vehicle_lon, 
+                        serverTime,
+                        vehicle_id=deviceId,
+                        visited_stops=visited_stops,
+                        vehicle_no=fleet_info.get('vehicle_no', deviceId)
+                    )
+                    if len(visited_stops) > len(before_curr_point_visited_stops):
+                        entity['stopId'] = visited_stops[-1]
+                    push_to_kafka(entity)
+                    
+                    if eta_data:
+                        entity['closest_stop'] = eta_data['closest_stop']
+                        entity['distance_to_stop'] = eta_data['closest_stop']['distance']
+                        entity['eta_list'] = eta_data['eta']
+                        entity['calculation_method'] = eta_data['calculation_method']
+                        entity['visited_stops'] = visited_stops
+                else: 
+                    push_to_kafka(entity)
+                # Store in Redis
+                if fleet_info and 'route_id' in fleet_info and fleet_info["route_id"] != None:
+                    route_id = fleet_info['route_id']
+                    redis_key = f"route:{route_id}"
+                    
+                    # Get vehicle number
+                    vehicle_number = fleet_info.get('vehicle_no', deviceId)
+                    
+                    # Create vehicle data
+                    vehicle_data_obj = {
+                        "latitude": entity["lat"],
+                        "longitude": entity["long"],
+                        "timestamp": entity["timestamp"],
+                        "speed": entity.get("speed", 0),
+                        "device_id": deviceId,
+                        "vehicle_number": vehicle_number,
+                        "route_id": str(route_id),
+                        "route_number": fleet_info['route_number'],
+                        "route_state": fleet_info['state'],
+                        "serverTime": int(time.time())  # Add current server time
+                    }
 
-        if vehicle_lon is not None and vehicle_lat is not None and vehicle_number and min_vehicle_data is not None:
-            vehicle_info_data = {
-                    "latitude": entity["lat"],
-                    "longitude": entity["long"],
-                    "timestamp": entity["timestamp"],
-                    "speed": entity.get("speed", 0),
-                    "device_id": deviceId,
-                    "vehicle_number": vehicle_number,
-                    "routes_info": dict(map(lambda x: (x['route_id'], { "route_number": x['route_number'], "route_state": x['state']}), fleet_infos))
-                }
-            prod_redis_client.geoadd(GEO_KEY, vehicle_lon, vehicle_lat, vehicle_number)
-            prod_redis_client.hset(VEHICLE_META_KEY, vehicle_number, json.dumps(vehicle_info_data))
-            redis_client.geoadd(GEO_KEY, vehicle_lon, vehicle_lat, vehicle_number)
-            redis_client.hset(VEHICLE_META_KEY, vehicle_number, json.dumps(vehicle_info_data))
-            prod_redis_client.expire(GEO_KEY, 86400)
-            prod_redis_client.expire(VEHICLE_META_KEY, 86400)
-            redis_client.expire(GEO_KEY, 86400)
-            redis_client.expire(VEHICLE_META_KEY, 86400)
-        else:
-            logger.error(f"Invalid location data: lon={vehicle_lon}, lat={vehicle_lat}, member={vehicle_number}")
+                    min_vehicle_data = 1 # means atlease one fleet mapping is there
+                    
+                    
+                    # Add ETA data if available
+                    if 'eta_list' in entity:
+                        vehicle_data_obj['eta_data'] = entity['eta_list']
+                        vehicle_data_obj['visited_stops'] = entity['visited_stops']
+                    vehicle_data = json.dumps(vehicle_data_obj)
+                    
+                    try:
+                        # Store vehicle data in hash
+                        logger.info(f"Route ID: Bus vehicle {vehicle_number} is on route, {route_id}")
+                        prod_redis_client.hset(redis_key, vehicle_number, vehicle_data)
+                        prod_redis_client.expire(redis_key, 86400)  # Expire after 24 hours
+                        redis_client.hset(redis_key, vehicle_number, vehicle_data)
+                        redis_client.expire(redis_key, 86400)  # Expire after 24 hours
+                        
+                    except Exception as e:
+                        logger.error(f"Error storing data in Redis: {str(e)}")
+
+            if vehicle_lon is not None and vehicle_lat is not None and vehicle_number and min_vehicle_data is not None:
+                vehicle_info_data = {
+                        "latitude": entity["lat"],
+                        "longitude": entity["long"],
+                        "timestamp": entity["timestamp"],
+                        "speed": entity.get("speed", 0),
+                        "device_id": deviceId,
+                        "vehicle_number": vehicle_number,
+                        "routes_info": dict(map(lambda x: (x['route_id'], { "route_number": x['route_number'], "route_state": x['state']}), fleet_infos))
+                    }
+                prod_redis_client.geoadd(GEO_KEY, vehicle_lon, vehicle_lat, vehicle_number)
+                prod_redis_client.hset(VEHICLE_META_KEY, vehicle_number, json.dumps(vehicle_info_data))
+                redis_client.geoadd(GEO_KEY, vehicle_lon, vehicle_lat, vehicle_number)
+                redis_client.hset(VEHICLE_META_KEY, vehicle_number, json.dumps(vehicle_info_data))
+                prod_redis_client.expire(GEO_KEY, 86400)
+                prod_redis_client.expire(VEHICLE_META_KEY, 86400)
+                redis_client.expire(GEO_KEY, 86400)
+                redis_client.expire(VEHICLE_META_KEY, 86400)
+            else:
+                logger.error(f"Invalid location data: lon={vehicle_lon}, lat={vehicle_lat}, member={vehicle_number}")
     except Exception as e:
         logger.error(f"Error handling client data: {str(e)}")
         traceback.print_exc()
@@ -2215,8 +2247,10 @@ if __name__ == "__main__":
     # Start MQTT client, no separate thread required 
     # as we already called loop_start() and we already registered a shutdown function
     mqtt_client_obj = mqtt_client()
-    load_device_vehicle_mappings()
-    load_route_polylines()
-    start_vehicle_cleanup_thread()
+    if SHOULD_DO_CALCULATIONS:
+        load_device_vehicle_mappings()
+        load_route_polylines()
+        start_vehicle_cleanup_thread()
+        start_redis_monitoring_thread()
     main_server()
 
