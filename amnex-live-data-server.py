@@ -1881,8 +1881,8 @@ def handle_client_data(payload, client_ip, serverTime, isNYGpsDevice = False, se
         if not entity:
             return
 
-        if FORWARD_TCP and not isNYGpsDevice:
-            forward_to_tcp(payload)
+        if FORWARD_TCP and not isNYGpsDevice and entity.get('provider') == 'amnex':
+            forward_to_tcp(payload) # forwarding only amnex payloads to chalo
         
         deviceId = entity.get("deviceId")
 
@@ -2076,9 +2076,10 @@ def handle_connection(conn, addr):
                     data_decoded = data_decoded.split('\r\n\r\n')[-1]
                 
                 serverTime = datetime.now()
-                
-                executor.submit(handle_client_data, data_decoded, addr, serverTime)
-                
+
+                decoded_data_list = data_decoded.split('\n')
+                for data in decoded_data_list:
+                    executor.submit(handle_client_data, data, addr, serverTime)
                 # Reset the timeout after each successful read
                 conn.settimeout(300)
                 
