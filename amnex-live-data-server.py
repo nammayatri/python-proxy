@@ -1023,11 +1023,17 @@ def parse_coordinate(coord_str, dir_char, is_latitude):
     
     return decimal_deg
 
-def dd_mm_ss_to_date(date_str: str) -> datetime.date:
-    try:
-        return datetime.strptime(date_str, "%d/%m/%Y-%H:%M:%S")
-    except:
-        return datetime.strptime(date_str, "%d/%m/%y-%H:%M:%S")
+def dd_mm_ss_to_date(date_str: str, serverTime):
+    def __convert():
+        try:
+            return datetime.strptime(date_str, "%d/%m/%Y-%H:%M:%S")
+        except:
+            return datetime.strptime(date_str, "%d/%m/%y-%H:%M:%S")
+    value = __convert()
+    if value.timestamp() - serverTime.timestamp() > 5 * 3600: # off by more than 5 hours means its sending in IST.
+        return value.__add__(timedelta(hours=-5, minutes=-30)) # IST is 5 hours and 30 minutes ahead of UTC
+    else:
+        return value
 
 def delivery_report(err, msg):
     if err is not None:
@@ -1096,7 +1102,7 @@ def parse_amnex_payload(payload, serverTime, client_ip):
             ign_status = payload[6]
             timestamp = payload[8]
             date = payload[9]
-            date = dd_mm_ss_to_date(date + "-" + timestamp)
+            date = dd_mm_ss_to_date(date + "-" + timestamp, serverTime)
             dataState = payload[3]
             raw = payload
             entity = {
