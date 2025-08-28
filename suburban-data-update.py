@@ -154,7 +154,9 @@ def main():
             status_data = get_train_status()
             # print("get_train_status() response:", status_data)  # Debug print
             if status_data and 'vTrainRunningList' in status_data:
-                store_in_redis(status_data['vTrainRunningList'])
+                # This caused redis timeouts. Disabling it for now
+                logger.info("Train running status data received, skipping redis store for now")
+                # store_in_redis(status_data['vTrainRunningList'])
             else:
                 logger.error("API response missing 'vTrainRunningList'")
             time.sleep(SLEEP_INTERVAL)
