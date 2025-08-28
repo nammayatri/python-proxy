@@ -2088,6 +2088,7 @@ def handle_connection(conn, addr):
                 decoded_data_list = data_decoded.split('\n')
                 print("decoded_data_list", len(decoded_data_list), decoded_data_list)
                 for data in decoded_data_list:
+                    print("data", data)
                     # executor.submit(handle_client_data, data, addr, serverTime)
                 # Reset the timeout after each successful read
                 conn.settimeout(300)
