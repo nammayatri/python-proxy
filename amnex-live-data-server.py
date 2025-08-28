@@ -1304,27 +1304,27 @@ class TCPClient:
     def _send_message(self, data):
         """Send a single message over TCP connection"""
         with self.lock:
-            if not self.connected or not self.socket:
-                logger.error("Not connected, queuing message for later")
-                with self._queue_lock:
-                    self._message_queue.append(data)
-                return False
-                
-            try:
-                # Make sure data ends with newline
-                if not data.endswith('\n'):
-                    data += '\n'
-                
-                self.socket.sendall(data.encode())
-                return True
-            except Exception as e:
-                logger.error(f"Error sending data: {str(e)}")
-                self.connected = False  # Mark as disconnected for reconnection
-                
-                # Re-queue the message
-                with self._queue_lock:
-                    self._message_queue.append(data)
-                return False
+            if not data.endswith('\n'):
+                data += '\n'
+            self._send_message_impl(data)
+    
+    def _send_message_impl(self, data):
+        if not self.connected or not self.socket:
+            logger.error("Not connected, queuing message for later")
+            with self._queue_lock:
+                self._message_queue.append(data)
+            return False
+        try:
+            self.socket.sendall(data.encode())
+            return True
+        except Exception as e:
+            logger.error(f"Error sending data: {str(e)}")
+            self.connected = False  # Mark as disconnected for reconnection
+            
+            # Re-queue the message
+            with self._queue_lock:
+                self._message_queue.append(data)
+            return False
 
 # Create and start singleton TCP client
 tcp_client = None
@@ -1346,7 +1346,7 @@ def forward_to_tcp(data_str):
         return False
         
     # Queue the message for sending
-    tcp_client.queue_message(data_str)
+    tcp_client._send_message_impl(data_str.strip() + '#\n')
     return True
 
     # Use the library's implementation when available
@@ -1889,6 +1889,10 @@ def handle_client_data(payload, client_ip, serverTime, isNYGpsDevice = False, se
 
         if FORWARD_TCP and not isNYGpsDevice and entity.get('provider') == 'amnex':
             forward_to_tcp(payload) # forwarding only amnex payloads to chalo
+
+        if not SHOULD_DO_CALCULATIONS:
+            push_to_kafka(entity)
+            return
         
         deviceId = entity.get("deviceId")
 
@@ -1925,9 +1929,7 @@ def handle_client_data(payload, client_ip, serverTime, isNYGpsDevice = False, se
                 return
         
         # Get route information for this vehicle
-        fleet_infos = None
-        if SHOULD_DO_CALCULATIONS:
-            fleet_infos = get_fleet_info(deviceId, vehicle_lat, vehicle_lon, entity.get('timestamp'), entity.get('provider'))
+        fleet_infos = get_fleet_info(deviceId, vehicle_lat, vehicle_lon, entity.get('timestamp'), entity.get('provider'))
         if not fleet_infos:
             push_to_kafka(entity)
             return 
