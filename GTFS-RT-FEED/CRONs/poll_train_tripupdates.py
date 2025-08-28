@@ -450,7 +450,7 @@ def main():
         gtfs_rt_data, grouped_trains_data = transform_to_gtfs_rt(status_data)
 
         store_gtfs_rt_in_redis(gtfs_rt_data)
-        store_grouped_train_data_in_redis(grouped_trains_data)
+        # store_grouped_train_data_in_redis(grouped_trains_data) # This caused time table issues so disabling it for now
         
         logger.info("Successfully completed train status data fetch and storage")
             
