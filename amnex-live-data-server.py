@@ -2064,7 +2064,7 @@ def handle_connection(conn, addr):
         # Keep reading from the connection as long as it's open
         while True:
             try:
-                data = conn.recv(4096)
+                data = conn.recv(300)
                 if not data:
                     # Client closed the connection
                     print(f"Client {addr} closed connection")
