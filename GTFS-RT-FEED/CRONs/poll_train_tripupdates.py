@@ -311,6 +311,7 @@ def transform_to_gtfs_rt(data):
                 }
             }
             gtfs_rt["entity"].append(trip_update)
+            logger.info(f"Successfully cancelled train {train_no}")
             continue
         
         train_start_date = datetime.strptime(first_station['trainStartDate'], "%Y/%m/%d %H:%M:%S")
@@ -342,6 +343,7 @@ def transform_to_gtfs_rt(data):
                     "scheduleRelationship": "SKIPPED"
                 }
                 trip_update["tripUpdate"]["stopTimeUpdate"].append(stop_update)
+                logger.info(f"Successfully skipped station {station['stationCode']} for train {train_no}")
                 continue
 
             sched_arrival_time = datetime.strptime(station['schedArrivalTime'], "%H:%M:%S").time()
@@ -371,8 +373,9 @@ def transform_to_gtfs_rt(data):
             platform_code = station.get('platformCode', '')
             if platform_code and platform_code.strip():
                 stop_update["stopTimeProperties"] = {
-                    "assignedStopId": f"{station['stationCode']}_{platform_code}"
+                    "assignedStopId": f"{station['stationCode']}_P_{platform_code}"
                 }
+                logger.info(f"Successfully changed platform number for {station['stationCode']} to {platform_code}")
             
             trip_update["tripUpdate"]["stopTimeUpdate"].append(stop_update)
 
