@@ -370,7 +370,8 @@ def transform_to_gtfs_rt(data):
                 "stopId": station['stationCode']
             }
             
-            platform_code = station.get('platformCode', '')
+            platform_code = station.get('platformNo', '')
+            logger.info(f"Platform code for {station['stationCode']} is {platform_code}")
             if platform_code and platform_code.strip():
                 stop_update["stopTimeProperties"] = {
                     "assignedStopId": f"{station['stationCode']}_P_{platform_code}"
