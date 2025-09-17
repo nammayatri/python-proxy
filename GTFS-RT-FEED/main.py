@@ -150,7 +150,7 @@ def get_bus_trip_updates_from_redis(redis_key):
             logger.warning(f"Empty bus trip updates found in Redis key {redis_key}")
             raise HTTPException(status_code=404, detail=f"Empty bus trip updates found in Redis")
         
-        logger.debug(f"Retrieved bus trip data: {trip_updates}")
+        # logger.debug(f"Retrieved bus trip data: {trip_updates}")
         
         feed = gtfs_realtime_pb2.FeedMessage()
         
