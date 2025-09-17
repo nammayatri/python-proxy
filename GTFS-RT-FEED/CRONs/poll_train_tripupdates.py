@@ -81,6 +81,27 @@ grouped_redis_client = redis.Redis(
     decode_responses=True
 )
 
+def construct_trip_id(route_id, service_type_code, route_direction, schedule_trip_detail_id):
+    """
+    Construct trip ID using the standardized format.
+    
+    Args:
+        route_id: The route ID
+        service_type_code: The service type code
+        route_direction: The route direction
+        schedule_trip_detail_id: The schedule trip detail ID (trip_uniq_identifier)
+    
+    Returns:
+        str: Constructed trip ID in format: {normalized_route_id}-{service_type_code}-{route_direction}-{schedule_trip_detail_id}
+    """
+    # Normalize route_id by replacing spaces with underscores
+    normalized_route_id = str(route_id).replace(' ', '_')
+    
+    # Construct trip ID using the specified format
+    trip_id = f"{normalized_route_id}-{service_type_code}-{route_direction}-{schedule_trip_detail_id}"
+    
+    return trip_id
+
 def get_auth_token():
     """Get authentication token from the auth API"""
     global bearer_token, token_expiry
@@ -320,9 +341,29 @@ def get_bus_status():
             today_trips = cursor.fetchall()
             logger.info(f"Fetched {len(today_trips)} trips happening today from database")
             
-            # Convert to sets for comparison
-            all_trip_ids = {trip['trip_uniq_identifier'] for trip in all_trips}
-            today_trip_ids = {trip['trip_uniq_identifier'] for trip in today_trips}
+            # Convert to sets for comparison using constructed trip IDs
+            all_trip_ids = set()
+            today_trip_ids = set()
+            
+            # Construct trip IDs for all trips
+            for trip in all_trips:
+                trip_id = construct_trip_id(
+                    trip['route_id'], 
+                    trip['service_type_code'], 
+                    trip['route_direction'], 
+                    trip['trip_uniq_identifier']
+                )
+                all_trip_ids.add(trip_id)
+            
+            # Construct trip IDs for today's trips
+            for trip in today_trips:
+                trip_id = construct_trip_id(
+                    trip['route_id'], 
+                    trip['service_type_code'], 
+                    trip['route_direction'], 
+                    trip['trip_uniq_identifier']
+                )
+                today_trip_ids.add(trip_id)
             
             # Find cancelled trips (trips in all_trips but not in today_trips)
             cancelled_trip_ids = all_trip_ids - today_trip_ids
@@ -332,7 +373,7 @@ def get_bus_status():
             response_data = {
                 'all_trips': [dict(trip) for trip in all_trips],
                 'today_trips': [dict(trip) for trip in today_trips],
-                'cancelled_trip_ids': list(cancelled_trip_ids)
+                'cancelled_trip_ids': cancelled_trip_ids  # Keep as set for O(1) lookup
             }
             
             logger.info(f"Successfully fetched bus data from PostgreSQL")
@@ -540,7 +581,7 @@ def transform_bus_to_gtfs_rt(data):
             continue
             
         # Extract trip information from database
-        trip_id = trip.get('trip_uniq_identifier')
+        schedule_trip_detail_id = trip.get('trip_uniq_identifier')
         route_id = trip.get('route_id')
         route_name = trip.get('route_name')
         schedule_route_code = trip.get('schedule_route_code')
@@ -549,57 +590,35 @@ def transform_bus_to_gtfs_rt(data):
         start_time = trip.get('schedule_trip_start_time')
         service_type_code = trip.get('service_type_code')
         
-        if not trip_id:
-            logger.warning(f"No trip ID found in bus trip at index {i}")
+        if not schedule_trip_detail_id:
+            logger.warning(f"No schedule trip detail ID found in bus trip at index {i}")
             continue
+            
+        # Construct trip ID using the standardized format
+        trip_id = construct_trip_id(route_id, service_type_code, route_direction, schedule_trip_detail_id)
 
         # Check if this trip is cancelled
         is_cancelled = trip_id in cancelled_trip_ids
         
         # Create trip update entity
         trip_update = {
-            "id": f"bus_{trip_id}",
+            "id": f"{trip_id}",
             "tripUpdate": {
                 "trip": {
-                    "tripId": f"bus_{trip_id}",
-                    "routeId": str(route_id) if route_id else f"route_{trip_id}",
-                    "directionId": int(route_direction) if route_direction else 0
-                },
-                "stopTimeUpdate": [],
-                "vehicle": {
-                    "id": f"bus_vehicle_{trip_id}",
-                    "label": schedule_number or trip_id
+                    "tripId": f"{trip_id}",
                 },
                 "timestamp": str(current_timestamp)
             }
         }
 
-        # Add start time if available
-        if start_time:
-            try:
-                if isinstance(start_time, str):
-                    # Parse time string if needed
-                    start_dt = datetime.strptime(start_time, "%H:%M:%S")
-                    trip_update["tripUpdate"]["trip"]["startTime"] = start_dt.strftime("%H:%M:%S")
-                else:
-                    trip_update["tripUpdate"]["trip"]["startTime"] = str(start_time)
-            except Exception as e:
-                logger.warning(f"Could not parse start time for trip {trip_id}: {start_time}, error: {e}")
-
-        # Add start date (today's date)
-        today = datetime.now()
-        trip_update["tripUpdate"]["trip"]["startDate"] = today.strftime("%Y%m%d")
-
-        # If trip is cancelled, mark it as CANCELED
+        # Only include cancelled trips in the final JSON
         if is_cancelled:
             trip_update["tripUpdate"]["trip"]["scheduleRelationship"] = "CANCELED"
             logger.info(f"Marked bus trip {trip_id} as CANCELLED")
+            gtfs_rt["entity"].append(trip_update)
         else:
-            # For active trips, we can add additional processing here if needed
-            # For now, we'll just mark them as SCHEDULED (default)
-            trip_update["tripUpdate"]["trip"]["scheduleRelationship"] = "SCHEDULED"
-
-        gtfs_rt["entity"].append(trip_update)
+            # Skip non-cancelled trips - don't add them to the final JSON
+            logger.debug(f"Skipping non-cancelled bus trip {trip_id}")
 
     logger.info(f"Successfully transformed {len(gtfs_rt['entity'])} bus trips to GTFS-RT format")
     return gtfs_rt
