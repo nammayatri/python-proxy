@@ -30,7 +30,7 @@ REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 REDIS_DB = int(os.getenv("REDIS_DB", 0))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", None)
 APP_PORT = int(os.getenv("APP_PORT", 8004))
-BUS_REDIS_KEY = os.getenv("BUS_REDIS_KEY", "trip_updates:bus")
+BUS_REDIS_KEY = os.getenv("BUS_REDIS_KEY", "gtfs-rt-tripupdates:bus")
 TRAIN_REDIS_KEY = os.getenv("TRAIN_REDIS_KEY", "gtfs-rt-tripupdates:train")
 
 DEV_MODE = os.getenv("DEV_MODE", "false").lower() == "true"
@@ -137,10 +137,18 @@ def get_bus_trip_updates_from_redis(redis_key):
     try:
         logger.info(f"Fetching bus trip updates from Redis key: {redis_key}")
         trip_updates_str = redis_client.get(redis_key)
+        
+        # Debug: Check if key exists and what we got
+        if trip_updates_str is None:
+            logger.warning(f"Redis key '{redis_key}' does not exist")
+            raise HTTPException(status_code=404, detail=f"No bus trip updates found in Redis key: {redis_key}")
+        
+        logger.info(f"Retrieved data from Redis key '{redis_key}': {len(trip_updates_str)} bytes")
+        
         trip_updates = json.loads(trip_updates_str)
         if not trip_updates:
-            logger.warning(f"No bus trip updates found in Redis key {redis_key}")
-            raise HTTPException(status_code=404, detail=f"No bus trip updates found in Redis")
+            logger.warning(f"Empty bus trip updates found in Redis key {redis_key}")
+            raise HTTPException(status_code=404, detail=f"Empty bus trip updates found in Redis")
         
         logger.debug(f"Retrieved bus trip data: {trip_updates}")
         
@@ -164,62 +172,12 @@ def get_bus_trip_updates_from_redis(redis_key):
                 if 'trip' in trip_update_data:
                     trip_data = trip_update_data['trip']
                     entity.trip_update.trip.trip_id = trip_data.get('tripId', '')
-                    entity.trip_update.trip.start_time = trip_data.get('startTime', '')
-                    entity.trip_update.trip.start_date = trip_data.get('startDate', '')
-                    entity.trip_update.trip.route_id = trip_data.get('routeId', '')
-                    entity.trip_update.trip.direction_id = trip_data.get('directionId', 0)
                     
                     # Handle schedule relationship for bus trips (cancelled trips)
                     if 'scheduleRelationship' in trip_data:
                         schedule_rel = trip_data['scheduleRelationship']
                         if schedule_rel == 'CANCELED':
                             entity.trip_update.trip.schedule_relationship = gtfs_realtime_pb2.TripDescriptor.CANCELED
-                        elif schedule_rel == 'ADDED':
-                            entity.trip_update.trip.schedule_relationship = gtfs_realtime_pb2.TripDescriptor.ADDED
-                        elif schedule_rel == 'UNSCHEDULED':
-                            entity.trip_update.trip.schedule_relationship = gtfs_realtime_pb2.TripDescriptor.UNSCHEDULED
-                        else:
-                            entity.trip_update.trip.schedule_relationship = gtfs_realtime_pb2.TripDescriptor.SCHEDULED
-                
-                if 'vehicle' in trip_update_data:
-                    vehicle_data = trip_update_data['vehicle']
-                    entity.trip_update.vehicle.id = vehicle_data.get('id', '')
-                    entity.trip_update.vehicle.label = vehicle_data.get('label', '')
-                
-                for stop_time_update in trip_update_data.get('stopTimeUpdate', []):
-                    update = entity.trip_update.stop_time_update.add()
-                    update.stop_sequence = stop_time_update.get('stopSequence', 0)
-                    update.stop_id = stop_time_update.get('stopId', '')
-                    
-                    # Handle schedule relationship for stop time updates
-                    if 'scheduleRelationship' in stop_time_update:
-                        schedule_rel = stop_time_update['scheduleRelationship']
-                        if schedule_rel == 'SKIPPED':
-                            update.schedule_relationship = gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.SKIPPED
-                        elif schedule_rel == 'NO_DATA':
-                            update.schedule_relationship = gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.NO_DATA
-                        else:
-                            update.schedule_relationship = gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.SCHEDULED
-                    
-                    if 'arrival' in stop_time_update:
-                        arrival_time = stop_time_update['arrival'].get('time', 0)
-                        if isinstance(arrival_time, str):
-                            arrival_time = int(arrival_time)
-                        update.arrival.time = arrival_time
-                        
-                        # Handle delay if present
-                        if 'delay' in stop_time_update['arrival']:
-                            update.arrival.delay = int(stop_time_update['arrival']['delay'])
-                    
-                    if 'departure' in stop_time_update:
-                        departure_time = stop_time_update['departure'].get('time', 0)
-                        if isinstance(departure_time, str):
-                            departure_time = int(departure_time)
-                        update.departure.time = departure_time
-                        
-                        # Handle delay if present
-                        if 'delay' in stop_time_update['departure']:
-                            update.departure.delay = int(stop_time_update['departure']['delay'])
                 
                 timestamp = trip_update_data.get('timestamp')
                 if isinstance(timestamp, str):

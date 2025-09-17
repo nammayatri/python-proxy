@@ -47,7 +47,7 @@ CLIENT_ID = os.getenv('CLIENT_ID')
 CLIENT_SECRET = os.getenv('CLIENT_SECRET')
 
 # Bus API configuration
-BUS_REDIS_KEY = os.getenv('BUS_REDIS_KEY', 'trip_updates:bus')
+BUS_REDIS_KEY = os.getenv('BUS_REDIS_KEY', 'gtfs-rt-tripupdates:bus')
 
 # PostgreSQL configuration for bus data
 DB_HOST = os.getenv('DB_HOST')
