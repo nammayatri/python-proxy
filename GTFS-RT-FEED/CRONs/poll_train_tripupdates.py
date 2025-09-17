@@ -8,6 +8,8 @@ import logging
 from dotenv import load_dotenv
 from pathlib import Path
 import pytz
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 ist = pytz.timezone("Asia/Kolkata")
 
@@ -43,6 +45,16 @@ AUTH_API_URL = os.getenv('AUTH_API_URL')
 AUTH_TOKEN = os.getenv('AUTH_TOKEN')
 CLIENT_ID = os.getenv('CLIENT_ID')
 CLIENT_SECRET = os.getenv('CLIENT_SECRET')
+
+# Bus API configuration
+BUS_REDIS_KEY = os.getenv('BUS_REDIS_KEY', 'trip_updates:bus')
+
+# PostgreSQL configuration for bus data
+DB_HOST = os.getenv('DB_HOST')
+DB_PORT = os.getenv('DB_PORT', '5432')
+DB_NAME = os.getenv('DB_NAME')
+DB_USER = os.getenv('DB_USER')
+DB_PASSWORD = os.getenv('DB_PASSWORD')
 
 # Redis expiration configuration
 GROUPED_REDIS_EXPIRY = int(os.getenv('GROUPED_REDIS_EXPIRY', '70'))  # Default 70 seconds
@@ -235,6 +247,107 @@ def get_train_status():
         logger.error(f"Error making get train status API request: {e}")
         return None
 
+def get_bus_status():
+    """Get bus trip updates from PostgreSQL database"""
+    if not all([DB_HOST, DB_NAME, DB_USER, DB_PASSWORD]):
+        logger.warning("PostgreSQL configuration not complete, skipping bus data fetch")
+        return None
+    
+    try:
+        # Connect to PostgreSQL
+        conn = psycopg2.connect(
+            host=DB_HOST,
+            port=DB_PORT,
+            database=DB_NAME,
+            user=DB_USER,
+            password=DB_PASSWORD
+        )
+        
+        with conn.cursor(cursor_factory=RealDictCursor) as cursor:
+            # Query 1: Get all trips (without waybills)
+            all_trips_query = """
+            SELECT
+              "public"."bus_route"."route_id" AS "route_id",
+              "public"."bus_route"."route_name" AS "route_name",
+              "public"."bus_route"."route_number" AS "schedule_route_code",
+              "Bus Schedule Trip Detail - Route"."schedule_number" AS "schedule_number",
+              "Bus Schedule Trip Detail - Route"."schedule_trip_detail_id" AS "trip_uniq_identifier",
+              "public"."bus_route"."route_direction" AS "route_direction",
+              "Bus Schedule Trip Detail - Route"."start_time" AS "schedule_trip_start_time",
+              split_part(schedule_number, '-', 1) as "service_type_code"
+            FROM
+              "public"."bus_route"
+              INNER JOIN "public"."bus_schedule_trip_detail" AS "Bus Schedule Trip Detail - Route" ON "public"."bus_route"."route_id" = "Bus Schedule Trip Detail - Route"."route_number_id"
+              INNER JOIN "public"."bus_schedule_trip" AS "bus_schedule_trip__via__schedule_trip_id" ON "Bus Schedule Trip Detail - Route"."schedule_trip_id" = "bus_schedule_trip__via__schedule_trip_id"."schedule_trip_id"
+            WHERE
+              ("public"."bus_route"."status" = 'Active')
+              AND ("public"."bus_route"."deleted" = FALSE)
+              AND ("Bus Schedule Trip Detail - Route"."deleted" = FALSE)
+              AND ("bus_schedule_trip__via__schedule_trip_id"."deleted" = FALSE)
+              AND ("bus_schedule_trip__via__schedule_trip_id"."status" = 'Active')
+            """
+            
+            cursor.execute(all_trips_query)
+            all_trips = cursor.fetchall()
+            logger.info(f"Fetched {len(all_trips)} total trips from database")
+            
+            # Query 2: Get trips happening today (with waybills)
+            today_trips_query = """
+            SELECT
+              "public"."bus_route"."route_id" AS "route_id",
+              "public"."bus_route"."route_name" AS "route_name",
+              "public"."bus_route"."route_number" AS "schedule_route_code",
+              "Bus Schedule Trip Detail - Route"."schedule_number" AS "schedule_number",
+              "Bus Schedule Trip Detail - Route"."schedule_trip_detail_id" AS "trip_uniq_identifier",
+              "public"."bus_route"."route_direction" AS "route_direction",
+              "Bus Schedule Trip Detail - Route"."start_time" AS "schedule_trip_start_time",
+              split_part(schedule_number, '-', 1) as "service_type_code"
+            FROM
+              "public"."bus_route"
+              INNER JOIN "public"."bus_schedule_trip_detail" AS "Bus Schedule Trip Detail - Route" ON "public"."bus_route"."route_id" = "Bus Schedule Trip Detail - Route"."route_number_id"
+              INNER JOIN "public"."waybills"  ON "public"."waybills"."schedule_trip_id" = "Bus Schedule Trip Detail - Route"."schedule_trip_id"
+              INNER JOIN "public"."bus_schedule_trip" AS "bus_schedule_trip__via__schedule_trip_id" ON "Bus Schedule Trip Detail - Route"."schedule_trip_id" = "bus_schedule_trip__via__schedule_trip_id"."schedule_trip_id"
+            WHERE
+              ("public"."bus_route"."status" = 'Active')
+              AND ("public"."bus_route"."deleted" = FALSE)
+              AND ("Bus Schedule Trip Detail - Route"."deleted" = FALSE)
+              AND ("bus_schedule_trip__via__schedule_trip_id"."deleted" = FALSE)
+              AND ("bus_schedule_trip__via__schedule_trip_id"."status" = 'Active')
+              AND "public"."waybills"."duty_date" = TO_CHAR(CURRENT_DATE, 'YYYY-MM-DD')
+            """
+            
+            cursor.execute(today_trips_query)
+            today_trips = cursor.fetchall()
+            logger.info(f"Fetched {len(today_trips)} trips happening today from database")
+            
+            # Convert to sets for comparison
+            all_trip_ids = {trip['trip_uniq_identifier'] for trip in all_trips}
+            today_trip_ids = {trip['trip_uniq_identifier'] for trip in today_trips}
+            
+            # Find cancelled trips (trips in all_trips but not in today_trips)
+            cancelled_trip_ids = all_trip_ids - today_trip_ids
+            logger.info(f"Found {len(cancelled_trip_ids)} cancelled trips")
+            
+            # Create the response data structure
+            response_data = {
+                'all_trips': [dict(trip) for trip in all_trips],
+                'today_trips': [dict(trip) for trip in today_trips],
+                'cancelled_trip_ids': list(cancelled_trip_ids)
+            }
+            
+            logger.info(f"Successfully fetched bus data from PostgreSQL")
+            return response_data
+            
+    except psycopg2.Error as e:
+        logger.error(f"PostgreSQL error: {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Unexpected error fetching bus data: {e}")
+        return None
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
 def transform_to_gtfs_rt(data):
     """Transform railway API data to GTFS-RT format"""
     if not data:
@@ -384,6 +497,113 @@ def transform_to_gtfs_rt(data):
 
     return gtfs_rt, trains_data
 
+def transform_bus_to_gtfs_rt(data):
+    """Transform bus database data to GTFS-RT format"""
+    if not data:
+        return None
+
+    # Check if data is a string (error message or HTML)
+    if isinstance(data, str):
+        logger.error(f"Bus data returned string instead of dict: {data[:200]}...")
+        return None
+    
+    # Handle database response structure
+    if not isinstance(data, dict):
+        logger.error(f"Bus data returned unexpected data type: {type(data)}. Data: {str(data)[:200]}...")
+        return None
+
+    # Extract data from database response
+    all_trips = data.get('all_trips', [])
+    today_trips = data.get('today_trips', [])
+    cancelled_trip_ids = set(data.get('cancelled_trip_ids', []))
+
+    logger.info(f"Processing {len(all_trips)} total trips, {len(today_trips)} today trips, {len(cancelled_trip_ids)} cancelled trips")
+    
+    current_timestamp = int(time.time())
+    
+    gtfs_rt = {
+        "header": {
+            "gtfsRealtimeVersion": "2.0",
+            "incrementality": "FULL_DATASET",
+            "timestamp": str(current_timestamp)
+        },
+        "entity": []
+    }
+
+    # Process all trips to create GTFS-RT entities
+    for i, trip in enumerate(all_trips):
+        logger.info(f"Processing bus trip {i}: {trip.get('trip_uniq_identifier', 'unknown')}")
+        
+        # Check if trip is a dictionary
+        if not isinstance(trip, dict):
+            logger.warning(f"Skipping non-dict trip data at index {i}: {type(trip)}")
+            continue
+            
+        # Extract trip information from database
+        trip_id = trip.get('trip_uniq_identifier')
+        route_id = trip.get('route_id')
+        route_name = trip.get('route_name')
+        schedule_route_code = trip.get('schedule_route_code')
+        route_direction = trip.get('route_direction', 0)
+        schedule_number = trip.get('schedule_number')
+        start_time = trip.get('schedule_trip_start_time')
+        service_type_code = trip.get('service_type_code')
+        
+        if not trip_id:
+            logger.warning(f"No trip ID found in bus trip at index {i}")
+            continue
+
+        # Check if this trip is cancelled
+        is_cancelled = trip_id in cancelled_trip_ids
+        
+        # Create trip update entity
+        trip_update = {
+            "id": f"bus_{trip_id}",
+            "tripUpdate": {
+                "trip": {
+                    "tripId": f"bus_{trip_id}",
+                    "routeId": str(route_id) if route_id else f"route_{trip_id}",
+                    "directionId": int(route_direction) if route_direction else 0
+                },
+                "stopTimeUpdate": [],
+                "vehicle": {
+                    "id": f"bus_vehicle_{trip_id}",
+                    "label": schedule_number or trip_id
+                },
+                "timestamp": str(current_timestamp)
+            }
+        }
+
+        # Add start time if available
+        if start_time:
+            try:
+                if isinstance(start_time, str):
+                    # Parse time string if needed
+                    start_dt = datetime.strptime(start_time, "%H:%M:%S")
+                    trip_update["tripUpdate"]["trip"]["startTime"] = start_dt.strftime("%H:%M:%S")
+                else:
+                    trip_update["tripUpdate"]["trip"]["startTime"] = str(start_time)
+            except Exception as e:
+                logger.warning(f"Could not parse start time for trip {trip_id}: {start_time}, error: {e}")
+
+        # Add start date (today's date)
+        today = datetime.now()
+        trip_update["tripUpdate"]["trip"]["startDate"] = today.strftime("%Y%m%d")
+
+        # If trip is cancelled, mark it as CANCELED
+        if is_cancelled:
+            trip_update["tripUpdate"]["trip"]["scheduleRelationship"] = "CANCELED"
+            logger.info(f"Marked bus trip {trip_id} as CANCELLED")
+        else:
+            # For active trips, we can add additional processing here if needed
+            # For now, we'll just mark them as SCHEDULED (default)
+            trip_update["tripUpdate"]["trip"]["scheduleRelationship"] = "SCHEDULED"
+
+        gtfs_rt["entity"].append(trip_update)
+
+    logger.info(f"Successfully transformed {len(gtfs_rt['entity'])} bus trips to GTFS-RT format")
+    return gtfs_rt
+
 def store_gtfs_rt_in_redis(gtfs_rt_data):
     """Store the GTFS-RT data in Redis"""
     if not gtfs_rt_data:
@@ -432,35 +652,85 @@ def store_grouped_train_data_in_redis(trains_data):
         logger.error(f"Unexpected error while storing grouped data: {e}")
         raise
 
-def main():
-    """Main function to fetch and store train status data"""
-    logger.info("Starting train status data fetch")
-    
-    try:
-        status_data = get_train_status()
-        
-        # Log the type and content of status_data for debugging
-        if status_data is not None:
-            logger.info(f"Received status_data type: {type(status_data)}")
-            if isinstance(status_data, list):
-                logger.info(f"Received {len(status_data)} stations")
-            elif isinstance(status_data, dict):
-                logger.info(f"Received dict with keys: {list(status_data.keys())}")
-            else:
-                logger.info(f"Received data: {str(status_data)[:200]}...")
-        else:
-            logger.warning("No status data received")
-        
-        gtfs_rt_data, grouped_trains_data = transform_to_gtfs_rt(status_data)
+def store_bus_gtfs_rt_in_redis(gtfs_rt_data):
+    """Store the bus GTFS-RT data in Redis"""
+    if not gtfs_rt_data:
+        logger.warning("No bus GTFS-RT data to store")
+        return
 
-        store_gtfs_rt_in_redis(gtfs_rt_data)
+    try:
+        redis_client.set(BUS_REDIS_KEY, json.dumps(gtfs_rt_data))
+        
+        redis_client.expire(BUS_REDIS_KEY, 86400)  # 24 hours expiry
+        
+        logger.info(f"Successfully stored bus GTFS-RT feed with {len(gtfs_rt_data['entity'])} trip updates")
+
+    except redis.RedisError as e:
+        logger.error(f"Error storing bus data in Redis: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error while storing bus data: {e}")
+        raise
+
+def main():
+    """Main function to fetch and store train and bus status data"""
+    logger.info("Starting train and bus status data fetch")
+    
+    # Process train data
+    try:
+        logger.info("Processing train data...")
+        train_status_data = get_train_status()
+        
+        # Log the type and content of train_status_data for debugging
+        if train_status_data is not None:
+            logger.info(f"Received train status_data type: {type(train_status_data)}")
+            if isinstance(train_status_data, list):
+                logger.info(f"Received {len(train_status_data)} train stations")
+            elif isinstance(train_status_data, dict):
+                logger.info(f"Received train dict with keys: {list(train_status_data.keys())}")
+            else:
+                logger.info(f"Received train data: {str(train_status_data)[:200]}...")
+        else:
+            logger.warning("No train status data received")
+        
+        train_gtfs_rt_data, grouped_trains_data = transform_to_gtfs_rt(train_status_data)
+
+        store_gtfs_rt_in_redis(train_gtfs_rt_data)
         # store_grouped_train_data_in_redis(grouped_trains_data) # This caused time table issues so disabling it for now
         
         logger.info("Successfully completed train status data fetch and storage")
             
     except Exception as e:
-        logger.error(f"Unexpected error: {e}")
-        raise
+        logger.error(f"Unexpected error in train processing: {e}")
+        # Don't raise here - continue with bus processing
+    
+    # Process bus data
+    try:
+        logger.info("Processing bus data...")
+        bus_status_data = get_bus_status()
+        
+        # Log the type and content of bus_status_data for debugging
+        if bus_status_data is not None:
+            logger.info(f"Received bus status_data type: {type(bus_status_data)}")
+            if isinstance(bus_status_data, list):
+                logger.info(f"Received {len(bus_status_data)} bus trips")
+            elif isinstance(bus_status_data, dict):
+                logger.info(f"Received bus dict with keys: {list(bus_status_data.keys())}")
+            else:
+                logger.info(f"Received bus data: {str(bus_status_data)[:200]}...")
+        else:
+            logger.warning("No bus status data received")
+        
+        bus_gtfs_rt_data = transform_bus_to_gtfs_rt(bus_status_data)
+        store_bus_gtfs_rt_in_redis(bus_gtfs_rt_data)
+        
+        logger.info("Successfully completed bus status data fetch and storage")
+            
+    except Exception as e:
+        logger.error(f"Unexpected error in bus processing: {e}")
+        # Don't raise here - bus processing failure shouldn't affect train processing
+    
+    logger.info("Completed train and bus status data processing")
 
 if __name__ == "__main__":
     main()

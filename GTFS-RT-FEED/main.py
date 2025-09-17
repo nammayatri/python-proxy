@@ -30,8 +30,8 @@ REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
 REDIS_DB = int(os.getenv("REDIS_DB", 0))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", None)
 APP_PORT = int(os.getenv("APP_PORT", 8004))
-REDIS_KEY = os.getenv("REDIS_KEY", "gtfs-rt-tripupdates:bus")
-TRAIN_REDIS_KEY = os.getenv("TRAIN_REDIS_KEY", "gtfs-rt-tripupdates:bus")
+BUS_REDIS_KEY = os.getenv("BUS_REDIS_KEY", "trip_updates:bus")
+TRAIN_REDIS_KEY = os.getenv("TRAIN_REDIS_KEY", "gtfs-rt-tripupdates:train")
 
 DEV_MODE = os.getenv("DEV_MODE", "false").lower() == "true"
 
@@ -58,9 +58,10 @@ except Exception as e:
     logger.error(f"Unexpected error connecting to Redis: {str(e)}")
     raise
 
-def get_trip_updates_from_redis(redis_key):
+def get_train_trip_updates_from_redis(redis_key):
+    """Get train trip updates from Redis (unchanged for train data)"""
     try:
-        logger.info(f"Fetching trip updates from Redis key: {redis_key}")
+        logger.info(f"Fetching train trip updates from Redis key: {redis_key}")
         trip_updates_str = redis_client.get(redis_key)
         trip_updates = json.loads(trip_updates_str)
         if not trip_updates:
@@ -121,15 +122,119 @@ def get_trip_updates_from_redis(redis_key):
                     timestamp = int(timestamp)
                 entity.trip_update.timestamp = timestamp or int(time.time())
         
-        logger.info(f"Successfully generated feed with {len(feed.entity)} entities")
+        logger.info(f"Successfully generated train feed with {len(feed.entity)} entities")
         return feed
         
     except redis.RedisError as e:
         logger.error(f"Redis error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Redis error: {str(e)}")
     except Exception as e:
-        logger.error(f"Error processing trip updates: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Error processing trip updates: {str(e)}")
+        logger.error(f"Error processing train trip updates: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error processing train trip updates: {str(e)}")
+
+def get_bus_trip_updates_from_redis(redis_key):
+    """Get bus trip updates from Redis with proper transformation for bus data"""
+    try:
+        logger.info(f"Fetching bus trip updates from Redis key: {redis_key}")
+        trip_updates_str = redis_client.get(redis_key)
+        trip_updates = json.loads(trip_updates_str)
+        if not trip_updates:
+            logger.warning(f"No bus trip updates found in Redis key {redis_key}")
+            raise HTTPException(status_code=404, detail=f"No bus trip updates found in Redis")
+        
+        logger.debug(f"Retrieved bus trip data: {trip_updates}")
+        
+        feed = gtfs_realtime_pb2.FeedMessage()
+        
+        header_timestamp = trip_updates.get('header', {}).get('timestamp')
+        if isinstance(header_timestamp, str):
+            header_timestamp = int(header_timestamp)
+        
+        feed.header.gtfs_realtime_version = trip_updates.get('header', {}).get('gtfsRealtimeVersion', '2.0')
+        feed.header.incrementality = gtfs_realtime_pb2.FeedHeader.FULL_DATASET
+        feed.header.timestamp = header_timestamp or int(time.time())
+        
+        for entity_data in trip_updates.get('entity', []):
+            entity = feed.entity.add()
+            entity.id = entity_data.get('id', '1')
+            
+            if 'tripUpdate' in entity_data:
+                trip_update_data = entity_data['tripUpdate']
+                
+                if 'trip' in trip_update_data:
+                    trip_data = trip_update_data['trip']
+                    entity.trip_update.trip.trip_id = trip_data.get('tripId', '')
+                    entity.trip_update.trip.start_time = trip_data.get('startTime', '')
+                    entity.trip_update.trip.start_date = trip_data.get('startDate', '')
+                    entity.trip_update.trip.route_id = trip_data.get('routeId', '')
+                    entity.trip_update.trip.direction_id = trip_data.get('directionId', 0)
+                    
+                    # Handle schedule relationship for bus trips (cancelled trips)
+                    if 'scheduleRelationship' in trip_data:
+                        schedule_rel = trip_data['scheduleRelationship']
+                        if schedule_rel == 'CANCELED':
+                            entity.trip_update.trip.schedule_relationship = gtfs_realtime_pb2.TripDescriptor.CANCELED
+                        elif schedule_rel == 'ADDED':
+                            entity.trip_update.trip.schedule_relationship = gtfs_realtime_pb2.TripDescriptor.ADDED
+                        elif schedule_rel == 'UNSCHEDULED':
+                            entity.trip_update.trip.schedule_relationship = gtfs_realtime_pb2.TripDescriptor.UNSCHEDULED
+                        else:
+                            entity.trip_update.trip.schedule_relationship = gtfs_realtime_pb2.TripDescriptor.SCHEDULED
+                
+                if 'vehicle' in trip_update_data:
+                    vehicle_data = trip_update_data['vehicle']
+                    entity.trip_update.vehicle.id = vehicle_data.get('id', '')
+                    entity.trip_update.vehicle.label = vehicle_data.get('label', '')
+                
+                for stop_time_update in trip_update_data.get('stopTimeUpdate', []):
+                    update = entity.trip_update.stop_time_update.add()
+                    update.stop_sequence = stop_time_update.get('stopSequence', 0)
+                    update.stop_id = stop_time_update.get('stopId', '')
+                    
+                    # Handle schedule relationship for stop time updates
+                    if 'scheduleRelationship' in stop_time_update:
+                        schedule_rel = stop_time_update['scheduleRelationship']
+                        if schedule_rel == 'SKIPPED':
+                            update.schedule_relationship = gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.SKIPPED
+                        elif schedule_rel == 'NO_DATA':
+                            update.schedule_relationship = gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.NO_DATA
+                        else:
+                            update.schedule_relationship = gtfs_realtime_pb2.TripUpdate.StopTimeUpdate.SCHEDULED
+                    
+                    if 'arrival' in stop_time_update:
+                        arrival_time = stop_time_update['arrival'].get('time', 0)
+                        if isinstance(arrival_time, str):
+                            arrival_time = int(arrival_time)
+                        update.arrival.time = arrival_time
+                        
+                        # Handle delay if present
+                        if 'delay' in stop_time_update['arrival']:
+                            update.arrival.delay = int(stop_time_update['arrival']['delay'])
+                    
+                    if 'departure' in stop_time_update:
+                        departure_time = stop_time_update['departure'].get('time', 0)
+                        if isinstance(departure_time, str):
+                            departure_time = int(departure_time)
+                        update.departure.time = departure_time
+                        
+                        # Handle delay if present
+                        if 'delay' in stop_time_update['departure']:
+                            update.departure.delay = int(stop_time_update['departure']['delay'])
+                
+                timestamp = trip_update_data.get('timestamp')
+                if isinstance(timestamp, str):
+                    timestamp = int(timestamp)
+                entity.trip_update.timestamp = timestamp or int(time.time())
+        
+        logger.info(f"Successfully generated bus feed with {len(feed.entity)} entities")
+        return feed
+        
+    except redis.RedisError as e:
+        logger.error(f"Redis error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Redis error: {str(e)}")
+    except Exception as e:
+        logger.error(f"Error processing bus trip updates: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error processing bus trip updates: {str(e)}")
 
 
 @app.get("/")
@@ -143,6 +248,10 @@ async def root():
             "train_trip_updates": "/gtfs-rt-tripupdates/train",
             "vehicle_positions": "/gtfs-rt/vehicle-positions (coming soon)",
             "service_alerts": "/gtfs-rt/service-alerts (coming soon)"
+        },
+        "redis_keys": {
+            "bus": BUS_REDIS_KEY,
+            "train": TRAIN_REDIS_KEY
         }
     }
 
@@ -162,7 +271,7 @@ async def bus_trip_updates_info():
 async def get_bus_trip_updates_protobuf():
     """Get bus trip updates in protobuf format"""
     logger.info("Received request for protobuf bus trip updates")
-    feed = get_trip_updates_from_redis(REDIS_KEY)
+    feed = get_bus_trip_updates_from_redis(BUS_REDIS_KEY)
     return Response(
         content=feed.SerializeToString(),
         media_type="application/x-protobuf"
@@ -172,7 +281,7 @@ async def get_bus_trip_updates_protobuf():
 async def get_bus_trip_updates_json():
     """Get bus trip updates in JSON format"""
     logger.info("Received request for JSON bus trip updates")
-    feed = get_trip_updates_from_redis(REDIS_KEY)
+    feed = get_bus_trip_updates_from_redis(BUS_REDIS_KEY)
     return json_format.MessageToDict(feed)
 
 @app.get("/gtfs-rt-tripupdates/train", tags=["Train Trip Updates"])
@@ -190,7 +299,7 @@ async def train_trip_updates_info():
 async def get_train_trip_updates_protobuf():
     """Get train trip updates in protobuf format"""
     logger.info("Received request for protobuf train trip updates")
-    feed = get_trip_updates_from_redis(TRAIN_REDIS_KEY)
+    feed = get_train_trip_updates_from_redis(TRAIN_REDIS_KEY)
     return Response(
         content=feed.SerializeToString(),
         media_type="application/x-protobuf"
@@ -200,7 +309,7 @@ async def get_train_trip_updates_protobuf():
 async def get_train_trip_updates_json():
     """Get train trip updates in JSON format"""
     logger.info("Received request for JSON train trip updates")
-    feed = get_trip_updates_from_redis(TRAIN_REDIS_KEY)
+    feed = get_train_trip_updates_from_redis(TRAIN_REDIS_KEY)
     return json_format.MessageToDict(feed)
 
 # Placeholder endpoints for future implementation
