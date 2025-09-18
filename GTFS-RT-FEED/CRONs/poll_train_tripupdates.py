@@ -470,13 +470,16 @@ def transform_to_gtfs_rt(data):
         
         train_start_date = datetime.strptime(first_station['trainStartDate'], "%Y/%m/%d %H:%M:%S")
         
+        # Get today's date in IST for start_date
+        today_ist = datetime.now(ist).strftime("%Y%m%d")
+        
         trip_update = {
             "id": f"{train_no}_T1",
             "tripUpdate": {
                 "trip": {
                     "tripId": f"{train_no}_T1",
                     "startTime": train_start_date.strftime("%H:%M:%S"),
-                    "startDate": train_start_date.strftime("%Y%m%d"),
+                    "startDate": today_ist,
                     "routeId": train_no,
                     "directionId": 0
                 },
@@ -600,12 +603,16 @@ def transform_bus_to_gtfs_rt(data):
         # Check if this trip is cancelled
         is_cancelled = trip_id in cancelled_trip_ids
         
+        # Get today's date in IST for start_date
+        today_ist = datetime.now(ist).strftime("%Y%m%d")
+        
         # Create trip update entity
         trip_update = {
             "id": f"{trip_id}",
             "tripUpdate": {
                 "trip": {
                     "tripId": f"{trip_id}",
+                    "startDate": today_ist
                 },
                 "timestamp": str(current_timestamp)
             }

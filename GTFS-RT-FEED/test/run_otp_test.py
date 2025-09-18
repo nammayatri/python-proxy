@@ -6,17 +6,29 @@ Simple test runner for OTP cancelled trips test using the exact parameters from 
 import subprocess
 import sys
 import os
+from datetime import datetime
+import pytz
 
 def main():
     """Run the OTP test with the exact parameters from the curl request"""
     
+    # Get current IST date and time
+    ist = pytz.timezone("Asia/Kolkata")
+    now_ist = datetime.now(ist)
+    
+    # Format time as "H:MMam/pm" (e.g., "2:10pm")
+    time_str = now_ist.strftime("%I:%M%p").lower()
+    
+    # Format date as "MM-DD-YYYY" (e.g., "09-18-2025")
+    date_str = now_ist.strftime("%m-%d-%Y")
+    
     # Parameters from the curl request
-    from_place = "NANDANAM METRO (bfcf9b7b9d25bf3659a12a14cc9e9362)::13.0309,80.23999"
-    to_place = "Alandur Metro (SAL|0231)::13.003722,80.2015436"
-    time_str = "9:03pm"
-    date_str = "09-17-2025"
+    # from_place = "NANDANAM METRO (bfcf9b7b9d25bf3659a12a14cc9e9362)::13.0309,80.23999"
+    # to_place = "Alandur Metro (SAL|0231)::13.003722,80.2015436"
+    from_place = "CENTRAL DENTAL COLLEGE (neNWquOh)::13.08293,80.28209"
+    to_place = "LIC (SLI|0111)::13.0654037,80.2665774"
     mode = "BUS,WALK"
-    num_itineraries = 100
+    num_itineraries = 500
     
     # Default URL (can be overridden with environment variables)
     otp_url = os.getenv('OTP_URL', 'http://0.0.0.0:8080')

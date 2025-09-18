@@ -172,6 +172,7 @@ def get_bus_trip_updates_from_redis(redis_key):
                 if 'trip' in trip_update_data:
                     trip_data = trip_update_data['trip']
                     entity.trip_update.trip.trip_id = trip_data.get('tripId', '')
+                    entity.trip_update.trip.start_date = trip_data.get('startDate', '')
                     
                     # Handle schedule relationship for bus trips (cancelled trips)
                     if 'scheduleRelationship' in trip_data:
