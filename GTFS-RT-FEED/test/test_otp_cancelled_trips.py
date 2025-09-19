@@ -54,6 +54,9 @@ class OTPTripInfo:
     agency_name: str
     start_time: int
     end_time: int
+    page_number: int = 0
+    itinerary_index: int = 0
+    full_leg_object: Dict = None
 
 class OTPCancelledTripsTester:
     """Test class for checking if OTP removes cancelled trips"""
@@ -284,6 +287,9 @@ class OTPCancelledTripsTester:
                 # Extract itineraries from this page
                 if 'plan' in page_data and 'itineraries' in page_data['plan']:
                     page_itineraries = page_data['plan']['itineraries']
+                    # Add page number to each itinerary for tracking
+                    for itinerary in page_itineraries:
+                        itinerary['_page_number'] = page_count
                     all_itineraries.extend(page_itineraries)
                     logger.info(f"Page {page_count}: Found {len(page_itineraries)} itineraries")
                 else:
@@ -328,9 +334,12 @@ class OTPCancelledTripsTester:
             logger.warning("No itineraries found in OTP plan")
             return otp_trips
         
-        for itinerary in plan['itineraries']:
+        for itinerary_index, itinerary in enumerate(plan['itineraries']):
             if 'legs' not in itinerary:
                 continue
+                
+            # Get page number from itinerary metadata
+            page_number = itinerary.get('_page_number', 1)
                 
             for leg in itinerary['legs']:
                 if leg.get('mode') == 'BUS' and leg.get('transitLeg', False):
@@ -341,22 +350,26 @@ class OTPCancelledTripsTester:
                         route_long_name=leg.get('routeLongName', ''),
                         agency_name=leg.get('agencyName', ''),
                         start_time=leg.get('startTime', 0),
-                        end_time=leg.get('endTime', 0)
+                        end_time=leg.get('endTime', 0),
+                        page_number=page_number,
+                        itinerary_index=itinerary_index,
+                        full_leg_object=leg.copy()
                     )
                     otp_trips.append(otp_trip)
-                    logger.debug(f"Found OTP trip: {otp_trip.trip_id} (Route: {otp_trip.route_id})")
+                    logger.debug(f"Found OTP trip: {otp_trip.trip_id} (Route: {otp_trip.route_id}) on page {otp_trip.page_number}, itinerary {otp_trip.itinerary_index}")
         
         logger.info(f"Total OTP trips found: {len(otp_trips)}")
         return otp_trips
     
     def check_cancelled_trips_in_otp(self, cancelled_trips: List[CancelledTripInfo], 
-                                   otp_trips: List[OTPTripInfo]) -> Tuple[List[str], List[str]]:
+                                   otp_trips: List[OTPTripInfo]) -> Tuple[List[str], List[str], List[OTPTripInfo]]:
         """Check if any cancelled trips appear in OTP response"""
         cancelled_trip_ids = {trip.trip_id for trip in cancelled_trips}
         cancelled_route_ids = {trip.route_id for trip in cancelled_trips}
         
         found_cancelled_trip_ids = []
         found_cancelled_route_ids = []
+        found_cancelled_trip_details = []
         
         for otp_trip in otp_trips:
             # Remove "chennai_bus:" prefix from OTP trip ID for comparison
@@ -367,19 +380,22 @@ class OTPCancelledTripsTester:
             # Check by trip ID (with and without prefix)
             if otp_trip.trip_id in cancelled_trip_ids or clean_trip_id in cancelled_trip_ids:
                 found_cancelled_trip_ids.append(otp_trip.trip_id)
-                logger.warning(f"FOUND CANCELLED TRIP BY ID: {otp_trip.trip_id} (clean: {clean_trip_id})")
+                found_cancelled_trip_details.append(otp_trip)
+                logger.warning(f"FOUND CANCELLED TRIP BY ID: {otp_trip.trip_id} (clean: {clean_trip_id}) on page {otp_trip.page_number}, itinerary {otp_trip.itinerary_index}")
             
             # Check by route ID (less precise but still relevant)
             if otp_trip.route_id in cancelled_route_ids:
                 found_cancelled_route_ids.append(otp_trip.route_id)
-                logger.warning(f"FOUND CANCELLED ROUTE: {otp_trip.route_id}")
+                found_cancelled_trip_details.append(otp_trip)
+                logger.warning(f"FOUND CANCELLED ROUTE: {otp_trip.route_id} on page {otp_trip.page_number}, itinerary {otp_trip.itinerary_index}")
         
-        return found_cancelled_trip_ids, found_cancelled_route_ids
+        return found_cancelled_trip_ids, found_cancelled_route_ids, found_cancelled_trip_details
     
     def generate_report(self, cancelled_trips: List[CancelledTripInfo], 
                        otp_trips: List[OTPTripInfo],
                        found_cancelled_trip_ids: List[str],
                        found_cancelled_route_ids: List[str],
+                       found_cancelled_trip_details: List[OTPTripInfo] = None,
                        otp_data: Optional[Dict] = None) -> str:
         """Generate a detailed test report"""
         report = []
@@ -408,6 +424,25 @@ class OTPCancelledTripsTester:
                 report.append(f"  Cancelled trip IDs found in OTP: {found_cancelled_trip_ids}")
             if found_cancelled_route_ids:
                 report.append(f"  Cancelled route IDs found in OTP: {found_cancelled_route_ids}")
+            
+            # Add detailed information about cancelled trips
+            if found_cancelled_trip_details:
+                report.append("")
+                report.append("DETAILED CANCELLED TRIP INFORMATION:")
+                report.append("=" * 50)
+                for i, trip_detail in enumerate(found_cancelled_trip_details, 1):
+                    report.append(f"")
+                    report.append(f"Cancelled Trip #{i}:")
+                    report.append(f"  Trip ID: {trip_detail.trip_id}")
+                    report.append(f"  Route ID: {trip_detail.route_id}")
+                    report.append(f"  Route Name: {trip_detail.route_short_name} - {trip_detail.route_long_name}")
+                    report.append(f"  Agency: {trip_detail.agency_name}")
+                    report.append(f"  Found on Page: {trip_detail.page_number}")
+                    report.append(f"  Found in Itinerary: {trip_detail.itinerary_index}")
+                    report.append(f"  Start Time: {trip_detail.start_time}")
+                    report.append(f"  End Time: {trip_detail.end_time}")
+                    report.append(f"  Full Leg Object:")
+                    report.append(f"    {json.dumps(trip_detail.full_leg_object, indent=4)}")
         else:
             report.append("✅ TEST RESULT: PASSED - OTP is properly removing cancelled trips")
         
@@ -462,7 +497,7 @@ class OTPCancelledTripsTester:
         
         # Step 4: Check for cancelled trips in OTP response
         logger.info("Step 4: Checking for cancelled trips in OTP response...")
-        found_cancelled_trip_ids, found_cancelled_route_ids = self.check_cancelled_trips_in_otp(
+        found_cancelled_trip_ids, found_cancelled_route_ids, found_cancelled_trip_details = self.check_cancelled_trips_in_otp(
             cancelled_trips, otp_trips
         )
         
@@ -470,7 +505,7 @@ class OTPCancelledTripsTester:
         logger.info("Step 5: Generating test report...")
         report = self.generate_report(
             cancelled_trips, otp_trips, 
-            found_cancelled_trip_ids, found_cancelled_route_ids, otp_data
+            found_cancelled_trip_ids, found_cancelled_route_ids, found_cancelled_trip_details, otp_data
         )
         
         print(report)
