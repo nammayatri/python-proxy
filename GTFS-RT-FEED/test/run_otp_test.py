@@ -32,6 +32,7 @@ def main():
     
     # Default URL (can be overridden with environment variables)
     otp_url = os.getenv('OTP_URL', 'http://0.0.0.0:8080')
+    # otp_url = os.getenv('OTP_URL', 'https://api.sandbox.moving.tech/nandi')
     
     print("=" * 80)
     print("OTP CANCELLED TRIPS TEST RUNNER")
