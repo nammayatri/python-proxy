@@ -515,6 +515,10 @@ def transform_to_gtfs_rt(data):
             actual_arrival = sched_arrival_ist.timestamp() + station['delayArrival']
             actual_departure = sched_departure_ist.timestamp() + station['delayDeparture']
             
+            # Ensure departure time is not less than arrival time
+            if actual_departure < actual_arrival:
+                logger.warning(f"Departure time ({actual_departure}) is less than arrival time ({actual_arrival}) for train {train_no} at station {station['stationCode']}. Setting departure time to arrival time.")
+                actual_departure = actual_arrival
 
             stop_update = {
                 "stopSequence": station['sequence'],
