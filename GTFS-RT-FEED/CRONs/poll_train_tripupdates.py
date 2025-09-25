@@ -392,12 +392,12 @@ def get_bus_status():
 def transform_to_gtfs_rt(data):
     """Transform railway API data to GTFS-RT format"""
     if not data:
-        return None, None
+        return None, None, []
 
     # Check if data is a string (error message or HTML)
     if isinstance(data, str):
         logger.error(f"API returned string instead of JSON object: {data[:200]}...")
-        return None, None
+        return None, None, []
     
     # Handle the new API response structure
     if isinstance(data, dict):
@@ -407,10 +407,10 @@ def transform_to_gtfs_rt(data):
             data = train_list
         else:
             logger.error(f"API returned dict but no vTrainRunningList found. Keys: {list(data.keys())}")
-            return None, None
+            return None, None, []
     elif not isinstance(data, list):
         logger.error(f"API returned unexpected data type: {type(data)}. Data: {str(data)[:200]}...")
-        return None, None
+        return None, None, []
 
     logger.info(f"Processing {len(data)} items from API response")
     
@@ -426,6 +426,7 @@ def transform_to_gtfs_rt(data):
     }
 
     trains_data = {}
+    cancelled_train_ids = []
     for i, station in enumerate(data):
         logger.info(f"Processing item {i}: type={type(station)}, value={str(station)[:100]}...")
         
@@ -465,7 +466,8 @@ def transform_to_gtfs_rt(data):
                 }
             }
             gtfs_rt["entity"].append(trip_update)
-            logger.info(f"Successfully cancelled train {train_no}")
+            cancelled_train_ids.append(f"{train_no}_T1")
+            logger.info(f"Successfully cancelled train {train_no}_T1")
             continue
         
         train_start_date = datetime.strptime(first_station['trainStartDate'], "%Y/%m/%d %H:%M:%S")
@@ -543,7 +545,7 @@ def transform_to_gtfs_rt(data):
 
         gtfs_rt["entity"].append(trip_update)
 
-    return gtfs_rt, trains_data
+    return gtfs_rt, trains_data, cancelled_train_ids
 
 def transform_bus_to_gtfs_rt(data):
     """Transform bus database data to GTFS-RT format"""
@@ -634,7 +636,7 @@ def transform_bus_to_gtfs_rt(data):
     logger.info(f"Successfully transformed {len(gtfs_rt['entity'])} bus trips to GTFS-RT format")
     return gtfs_rt
 
-def store_gtfs_rt_in_redis(gtfs_rt_data):
+def store_gtfs_rt_in_redis(gtfs_rt_data, cancelled_train_ids=None):
     """Store the GTFS-RT data in Redis"""
     if not gtfs_rt_data:
         logger.warning("No GTFS-RT data to store")
@@ -646,6 +648,14 @@ def store_gtfs_rt_in_redis(gtfs_rt_data):
         redis_client.expire(TRAIN_REDIS_KEY, 86400)
         
         logger.info(f"Successfully stored GTFS-RT feed with {len(gtfs_rt_data['entity'])} trip updates")
+        
+        # Store cancelled train IDs if provided
+        if cancelled_train_ids:
+            redis_client.set("trains:cancelled", json.dumps(cancelled_train_ids))
+            redis_client.expire("trains:cancelled", 43200)
+            logger.info(f"Successfully stored {len(cancelled_train_ids)} cancelled train IDs: {cancelled_train_ids}")
+        else:
+            logger.info("No cancelled trains to store")
 
     except redis.RedisError as e:
         logger.error(f"Error storing data in Redis: {e}")
@@ -769,9 +779,9 @@ def main():
         else:
             logger.warning("No train status data received")
         
-        train_gtfs_rt_data, grouped_trains_data = transform_to_gtfs_rt(train_status_data)
+        train_gtfs_rt_data, grouped_trains_data, cancelled_train_ids = transform_to_gtfs_rt(train_status_data)
 
-        store_gtfs_rt_in_redis(train_gtfs_rt_data)
+        store_gtfs_rt_in_redis(train_gtfs_rt_data, cancelled_train_ids)
         store_grouped_train_data_in_redis(grouped_trains_data) # This caused time table issues so disabling it for now
         
         # Store platform codes in Redis hashmap for Haskell code
