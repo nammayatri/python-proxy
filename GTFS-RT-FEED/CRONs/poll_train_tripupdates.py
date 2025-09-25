@@ -702,6 +702,49 @@ def store_bus_gtfs_rt_in_redis(gtfs_rt_data):
         logger.error(f"Unexpected error while storing bus data: {e}")
         raise
 
+def store_platform_codes_in_redis(trains_data):
+    """Store platform codes in Redis hashmap for Haskell code to consume"""
+    if not trains_data:
+        logger.warning("No train data to extract platform codes from")
+        return
+
+    try:
+        platform_hash_key = "platform-codes-hashmap"
+        platform_codes = {}
+        
+        # Extract platform codes from train data
+        for train_no, stations in trains_data.items():
+            trip_id = f"{train_no}_T1"  # Match the trip ID format used in GTFS-RT
+            
+            # Find the first station with a platform code
+            for station in stations:
+                platform_code = station.get('platformNo', '')
+                if platform_code and platform_code.strip():
+                    platform_codes[trip_id] = platform_code
+                    logger.info(f"Found platform code {platform_code} for trip {trip_id} at station {station.get('stationCode', 'unknown')}")
+                    break  # Use the first platform code found for this train
+        
+        # Store platform codes in Redis hashmap
+        if platform_codes:
+            # Clear existing hashmap and set new values
+            redis_client.delete(platform_hash_key)
+            redis_client.hset(platform_hash_key, mapping=platform_codes)
+            
+            # Set expiry for the hashmap (same as train data)
+            redis_client.expire(platform_hash_key, 86400)  # 24 hours expiry
+            
+            logger.info(f"Successfully stored {len(platform_codes)} platform codes in Redis hashmap '{platform_hash_key}'")
+            logger.info(f"Platform codes stored: {platform_codes}")
+        else:
+            logger.info("No platform codes found to store")
+            
+    except redis.RedisError as e:
+        logger.error(f"Error storing platform codes in Redis: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error while storing platform codes: {e}")
+        raise
+
 def main():
     """Main function to fetch and store train and bus status data"""
     logger.info("Starting train and bus status data fetch")
@@ -727,6 +770,9 @@ def main():
 
         store_gtfs_rt_in_redis(train_gtfs_rt_data)
         # store_grouped_train_data_in_redis(grouped_trains_data) # This caused time table issues so disabling it for now
+        
+        # Store platform codes in Redis hashmap for Haskell code
+        store_platform_codes_in_redis(grouped_trains_data)
         
         logger.info("Successfully completed train status data fetch and storage")
             
