@@ -772,7 +772,7 @@ def main():
         train_gtfs_rt_data, grouped_trains_data = transform_to_gtfs_rt(train_status_data)
 
         store_gtfs_rt_in_redis(train_gtfs_rt_data)
-        # store_grouped_train_data_in_redis(grouped_trains_data) # This caused time table issues so disabling it for now
+        store_grouped_train_data_in_redis(grouped_trains_data) # This caused time table issues so disabling it for now
         
         # Store platform codes in Redis hashmap for Haskell code
         store_platform_codes_in_redis(grouped_trains_data)
