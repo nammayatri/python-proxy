@@ -716,13 +716,16 @@ def store_platform_codes_in_redis(trains_data):
         for train_no, stations in trains_data.items():
             trip_id = f"{train_no}_T1"  # Match the trip ID format used in GTFS-RT
             
-            # Find the first station with a platform code
+            # Extract platform codes for all stations with platform information
             for station in stations:
+                station_code = station.get('stationCode', '')
                 platform_code = station.get('platformNo', '')
-                if platform_code and platform_code.strip():
-                    platform_codes[trip_id] = platform_code
-                    logger.info(f"Found platform code {platform_code} for trip {trip_id} at station {station.get('stationCode', 'unknown')}")
-                    break  # Use the first platform code found for this train
+                
+                if station_code and platform_code and platform_code.strip():
+                    # Use the format: tripId:stopCode -> platformCode
+                    redis_key = f"{trip_id}:{station_code}"
+                    platform_codes[redis_key] = platform_code
+                    logger.info(f"Found platform code {platform_code} for trip {trip_id} at station {station_code}")
         
         # Store platform codes in Redis hashmap
         if platform_codes:
@@ -734,7 +737,7 @@ def store_platform_codes_in_redis(trains_data):
             redis_client.expire(platform_hash_key, 86400)  # 24 hours expiry
             
             logger.info(f"Successfully stored {len(platform_codes)} platform codes in Redis hashmap '{platform_hash_key}'")
-            logger.info(f"Platform codes stored: {platform_codes}")
+            logger.info(f"Platform codes stored: {list(platform_codes.keys())[:10]}...")  # Show first 10 keys
         else:
             logger.info("No platform codes found to store")
             
