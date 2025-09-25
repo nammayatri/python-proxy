@@ -724,7 +724,8 @@ def store_platform_codes_in_redis(trains_data):
                 if station_code and platform_code and platform_code.strip():
                     # Use the format: tripId:stopCode -> platformCode
                     redis_key = f"{trip_id}:{station_code}"
-                    platform_codes[redis_key] = platform_code
+                    # JSON encode the platform code to make it work with hmGet
+                    platform_codes[redis_key] = json.dumps(platform_code)
                     logger.info(f"Found platform code {platform_code} for trip {trip_id} at station {station_code}")
         
         # Store platform codes in Redis hashmap
@@ -747,7 +748,6 @@ def store_platform_codes_in_redis(trains_data):
     except Exception as e:
         logger.error(f"Unexpected error while storing platform codes: {e}")
         raise
-
 def main():
     """Main function to fetch and store train and bus status data"""
     logger.info("Starting train and bus status data fetch")
