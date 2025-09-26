@@ -665,13 +665,29 @@ def store_gtfs_rt_in_redis(gtfs_rt_data, cancelled_train_ids=None):
         raise
 
 def store_grouped_train_data_in_redis(trains_data):
-    """Store grouped train data in the second Redis instance"""
+    """Store grouped train data in the second Redis instance, filtering out cancelled trains"""
     if not trains_data:
         logger.warning("No grouped train data to store")
         return
 
     try:
+        running_trains_count = 0
+        cancelled_trains_count = 0
+        
         for train_no, stations in trains_data.items():
+            # Check if train is cancelled by examining the first station
+            if not stations:
+                logger.warning(f"No stations data for train {train_no}, skipping")
+                continue
+                
+            first_station = stations[0]
+            
+            # Filter out cancelled trains (exceptionFlag == 1 and trainRunStatus == 0)
+            if first_station.get('exceptionFlag') == 1 and first_station.get('trainRunStatus') == 0:
+                cancelled_trains_count += 1
+                logger.info(f"Skipping cancelled train {train_no} - not storing in Redis")
+                continue
+            
             # Create key name in format "suburban:<train_no>"
             key_name = f"suburban:{train_no}"
             
@@ -681,9 +697,10 @@ def store_grouped_train_data_in_redis(trains_data):
             # Set expiry using environment variable
             grouped_redis_client.expire(key_name, GROUPED_REDIS_EXPIRY)
             
-            logger.info(f"Successfully stored grouped data for train {train_no} with {len(stations)} stations")
+            running_trains_count += 1
+            logger.info(f"Successfully stored grouped data for running train {train_no} with {len(stations)} stations")
         
-        logger.info(f"Successfully stored grouped data for {len(trains_data)} trains")
+        logger.info(f"Successfully stored grouped data for {running_trains_count} running trains, filtered out {cancelled_trains_count} cancelled trains")
 
     except redis.RedisError as e:
         logger.error(f"Error storing grouped data in Redis: {e}")
