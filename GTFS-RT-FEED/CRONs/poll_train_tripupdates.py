@@ -3,7 +3,7 @@ import redis
 import json
 import time
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
 from dotenv import load_dotenv
 from pathlib import Path
@@ -665,7 +665,7 @@ def store_gtfs_rt_in_redis(gtfs_rt_data, cancelled_train_ids=None):
         raise
 
 def store_grouped_train_data_in_redis(trains_data):
-    """Store grouped train data in the second Redis instance, filtering out cancelled trains and processing delays"""
+    """Store grouped train data in the second Redis instance, filtering out cancelled trains and updating scheduled times with delays"""
     if not trains_data:
         logger.warning("No grouped train data to store")
         return
@@ -696,46 +696,30 @@ def store_grouped_train_data_in_redis(trains_data):
                 # Create a copy of the station data to avoid modifying the original
                 processed_station = station.copy()
                 
-                # Initialize actual times
-                actual_arrival = None
-                actual_departure = None
-                
-                # Process arrival time with delay
+                # Update scheduled arrival time with delay
                 if 'schedArrivalTime' in station and 'delayArrival' in station:
                     sched_arrival_time = datetime.strptime(station['schedArrivalTime'], "%H:%M:%S").time()
                     sched_arrival = datetime.combine(train_start_date.date(), sched_arrival_time)
                     sched_arrival_ist = ist.localize(sched_arrival)
-                    actual_arrival = sched_arrival_ist.timestamp() + station['delayArrival']
+                    updated_arrival = sched_arrival_ist + timedelta(seconds=station['delayArrival'])
+                    processed_station['schedArrivalTime'] = updated_arrival.strftime("%H:%M:%S")
                 
-                # Process departure time with delay
+                # Update scheduled departure time with delay
                 if 'schedDepartureTime' in station and 'delayDeparture' in station:
                     sched_departure_time = datetime.strptime(station['schedDepartureTime'], "%H:%M:%S").time()
                     sched_departure = datetime.combine(train_start_date.date(), sched_departure_time)
                     sched_departure_ist = ist.localize(sched_departure)
-                    actual_departure = sched_departure_ist.timestamp() + station['delayDeparture']
+                    updated_departure = sched_departure_ist + timedelta(seconds=station['delayDeparture'])
+                    processed_station['schedDepartureTime'] = updated_departure.strftime("%H:%M:%S")
                 
                 # Ensure departure time is always >= arrival time
-                if actual_arrival is not None and actual_departure is not None:
-                    if actual_departure < actual_arrival:
-                        logger.warning(f"Departure time ({actual_departure}) is less than arrival time ({actual_arrival}) for train {train_no} at station {station['stationCode']}. Setting departure time to arrival time.")
-                        actual_departure = actual_arrival
-                elif actual_arrival is not None and actual_departure is None:
-                    # If we have arrival but no departure, set departure to arrival
-                    actual_departure = actual_arrival
-                    logger.info(f"No departure time for train {train_no} at station {station['stationCode']}, setting departure to arrival time.")
-                elif actual_departure is not None and actual_arrival is None:
-                    # If we have departure but no arrival, set arrival to departure
-                    actual_arrival = actual_departure
-                    logger.info(f"No arrival time for train {train_no} at station {station['stationCode']}, setting arrival to departure time.")
-                
-                # Add actual times to the processed station data
-                if actual_arrival is not None:
-                    processed_station['actualArrivalTime'] = int(actual_arrival)
-                    processed_station['actualArrivalTimeFormatted'] = datetime.fromtimestamp(actual_arrival, ist).strftime("%H:%M:%S")
-                
-                if actual_departure is not None:
-                    processed_station['actualDepartureTime'] = int(actual_departure)
-                    processed_station['actualDepartureTimeFormatted'] = datetime.fromtimestamp(actual_departure, ist).strftime("%H:%M:%S")
+                if 'schedArrivalTime' in processed_station and 'schedDepartureTime' in processed_station:
+                    arrival_time = datetime.strptime(processed_station['schedArrivalTime'], "%H:%M:%S").time()
+                    departure_time = datetime.strptime(processed_station['schedDepartureTime'], "%H:%M:%S").time()
+                    
+                    if departure_time < arrival_time:
+                        logger.warning(f"Departure time ({departure_time}) is less than arrival time ({arrival_time}) for train {train_no} at station {station['stationCode']}. Setting departure time to arrival time.")
+                        processed_station['schedDepartureTime'] = processed_station['schedArrivalTime']
                 
                 processed_stations.append(processed_station)
             
@@ -749,7 +733,7 @@ def store_grouped_train_data_in_redis(trains_data):
             grouped_redis_client.expire(key_name, GROUPED_REDIS_EXPIRY)
             
             running_trains_count += 1
-            logger.info(f"Successfully stored grouped data for running train {train_no} with {len(processed_stations)} stations (with processed delays)")
+            logger.info(f"Successfully stored grouped data for running train {train_no} with {len(processed_stations)} stations (with updated scheduled times)")
         
         logger.info(f"Successfully stored grouped data for {running_trains_count} running trains, filtered out {cancelled_trains_count} cancelled trains")
 
